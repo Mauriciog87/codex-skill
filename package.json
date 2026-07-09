@@ -1,0 +1,12 @@
+{
+  "name": "sol-terra-orchestration",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "install:skill": "node scripts/install-global-skill.mjs",
+    "executor": "node .agents/skills/sol-terra-orchestration/scripts/invoke-terra-executor.mjs",
+    "test": "node --test",
+    "verify:live": "node scripts/verify-routing.mjs"
+  }
+}
