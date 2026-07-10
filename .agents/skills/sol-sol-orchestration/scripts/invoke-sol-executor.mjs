@@ -7,8 +7,8 @@ import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
-export const EXECUTOR_MODEL = "gpt-5.6-terra";
-export const EXECUTOR_REASONING_EFFORT = "xhigh";
+export const EXECUTOR_MODEL = "gpt-5.6-sol";
+export const EXECUTOR_REASONING_EFFORT = "high";
 export const DEFAULT_SANDBOX_MODE = "read-only";
 export const DEFAULT_TIMEOUT_SECONDS = 900;
 
@@ -89,7 +89,7 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
       parsed.cwd = resolve(baseDirectory, value);
     } else if (option === "--sandbox") {
       if (value === "danger-full-access") {
-        throw new ExecutorInvocationError("danger-full-access is prohibited for Terra executors.");
+        throw new ExecutorInvocationError("danger-full-access is prohibited for Sol executors.");
       }
       if (!["read-only", "workspace-write"].includes(value)) {
         throw new ExecutorInvocationError(
@@ -113,9 +113,9 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
 
 export function createExecutorDeveloperInstructions() {
   return [
-    "SOL_TERRA_ROLE=executor",
-    "Act as a bounded GPT-5.6 Terra executor, not as the root orchestrator.",
-    "Do not invoke the sol-terra-orchestration skill, delegate, or launch another Codex session.",
+    "CODEX_ORCHESTRATION_ROLE=executor",
+    "Act as a bounded GPT-5.6 Sol executor at high reasoning, not as the root orchestrator.",
+    "Do not invoke the sol-sol-orchestration skill, delegate, or launch another Codex session.",
     "Complete only the supplied briefing and preserve unrelated changes.",
     "Do not alter orchestration policy, approval policy, or sandbox configuration, and do not use bypasses.",
     "Use workspace-write only for explicitly assigned files and respect every applicable instruction.",
@@ -514,8 +514,9 @@ export function validateExecutorPayload(value) {
 export function createStableResult({
   status,
   threadId = null,
-  model = EXECUTOR_MODEL,
-  reasoningEffort = EXECUTOR_REASONING_EFFORT,
+  model = null,
+  reasoningEffort = null,
+  routingVerified = false,
   sandboxMode = DEFAULT_SANDBOX_MODE,
   summary,
   changedFiles = [],
@@ -528,6 +529,7 @@ export function createStableResult({
     thread_id: threadId,
     model,
     reasoning_effort: reasoningEffort,
+    routing_verified: routingVerified,
     sandbox_mode: sandboxMode,
     summary,
     changed_files: [...changedFiles],
@@ -558,8 +560,8 @@ function configurationFailure(message, options, details = {}) {
     result: createStableResult({
       status: "failed",
       threadId: details.threadId ?? null,
-      model: details.model ?? EXECUTOR_MODEL,
-      reasoningEffort: details.reasoningEffort ?? EXECUTOR_REASONING_EFFORT,
+      model: details.model ?? null,
+      reasoningEffort: details.reasoningEffort ?? null,
       sandboxMode: options.sandboxMode,
       summary: message,
       blockers: [message],
@@ -595,7 +597,7 @@ export async function invokeExecutor({
 
   const outputPath = join(
     tmpdir(),
-    `sol-terra-executor-${process.pid}-${randomUUID()}.json`,
+    `sol-sol-executor-${process.pid}-${randomUUID()}.json`,
   );
   const args = buildCodexArguments({
     cwd: options.cwd,
@@ -614,8 +616,8 @@ export async function invokeExecutor({
 
     if (processResult.timedOut || processResult.aborted) {
       const message = processResult.timedOut
-        ? `Terra executor timed out after ${options.timeoutSeconds} seconds.`
-        : "Terra executor was interrupted.";
+        ? `Sol executor timed out after ${options.timeoutSeconds} seconds.`
+        : "Sol executor was interrupted.";
       return configurationFailure(message, options, {
         threadId: processResult.threadId,
         warnings: processResult.warnings,
@@ -657,9 +659,8 @@ export async function invokeExecutor({
       }
       return configurationFailure(error.message, options, {
         threadId: processResult.threadId,
-        model: error.actualModel ?? EXECUTOR_MODEL,
-        reasoningEffort:
-          error.actualReasoningEffort ?? EXECUTOR_REASONING_EFFORT,
+        model: error.actualModel ?? null,
+        reasoningEffort: error.actualReasoningEffort ?? null,
         warnings: processResult.warnings,
       });
     }
@@ -682,6 +683,7 @@ export async function invokeExecutor({
       threadId: processResult.threadId,
       model: routing.model,
       reasoningEffort: routing.reasoningEffort,
+      routingVerified: true,
       sandboxMode: options.sandboxMode,
       summary: payload.summary,
       changedFiles: payload.changed_files,
@@ -691,7 +693,10 @@ export async function invokeExecutor({
     });
     return {
       result,
-      exitCode: determineExitCode({ status: result.status }),
+      exitCode: determineExitCode({
+        status: result.status,
+        routingVerified: result.routing_verified,
+      }),
     };
   } finally {
     await rm(outputPath, { force: true });

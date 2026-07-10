@@ -1,0 +1,6 @@
+interface:
+  display_name: "Sol-Sol Orchestration"
+  short_description: "Coordinate verified Sol orchestrator and executors"
+  default_prompt: "Use $sol-sol-orchestration to coordinate this task."
+policy:
+  allow_implicit_invocation: false

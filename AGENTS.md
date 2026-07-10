@@ -1,13 +1,13 @@
-# Sol-Terra orchestration
+# Sol-Sol orchestration
 
-The root Codex session is the orchestrator. At the beginning of every new substantive task, it must explicitly invoke `$sol-terra-orchestration` before planning, delegating, or editing. A session whose developer instructions contain `SOL_TERRA_ROLE=executor` is an executor and must not invoke the skill or apply the orchestrator workflow.
+The root Codex session is the orchestrator. At the beginning of every new substantive task, it must explicitly invoke `$sol-sol-orchestration` before planning, delegating, or editing. A session whose developer instructions contain `CODEX_ORCHESTRATION_ROLE=executor` is an executor and must not invoke the skill or apply the orchestrator workflow.
 
 ## Model roles
 
 - Orchestrator: GPT-5.6 Sol, configured as `gpt-5.6-sol` with `xhigh` reasoning.
-- Executors: GPT-5.6 Terra, configured as `gpt-5.6-terra` with `xhigh` reasoning.
+- Executors: GPT-5.6 Sol, configured as `gpt-5.6-sol` with `high` reasoning.
 
-All work that must run on Terra must be launched through `node .agents/skills/sol-terra-orchestration/scripts/invoke-terra-executor.mjs [options]` with the bounded briefing supplied on stdin. Use the direct Node command when exit-code fidelity matters; npm 11 normalizes failed lifecycle scripts and consumes forwarded options unless given an additional separator. Do not use native `spawn_agent` or a custom agent TOML for Terra routing. Native spawning may be reconsidered only after the exposed tool accepts `agent_role` and a live routing test proves Terra with `xhigh` in the executor rollout.
+All executor work must be launched through `node .agents/skills/sol-sol-orchestration/scripts/invoke-sol-executor.mjs [options]` with the bounded briefing supplied on stdin. Use the direct Node command when exit-code fidelity matters; npm 11 normalizes failed lifecycle scripts and consumes forwarded options unless given an additional separator. Do not use native `spawn_agent` or a custom agent TOML for executor routing. Native spawning may be reconsidered only after the exposed tool accepts `agent_role` and a live routing test proves Sol with `high` reasoning in the executor rollout.
 
 ## Orchestrator responsibilities
 
@@ -26,4 +26,4 @@ All work that must run on Terra must be launched through `node .agents/skills/so
 3. Do not re-delegate, launch another Codex session, alter orchestration policy, request approval-policy changes, or use sandbox bypasses.
 4. Return the required structured result with changed files, checks, blockers, and warnings.
 
-The launcher disables the executor's multi-agent feature and verifies its recorded `turn_context` before accepting its result. An unverified model, a model other than `gpt-5.6-terra`, or reasoning other than `xhigh` is a routing failure. System, developer, user, security, and more-specific project instructions take precedence over this policy.
+The launcher disables the executor's multi-agent feature and verifies its recorded `turn_context` before accepting its result. An unverified model, a model other than `gpt-5.6-sol`, or reasoning other than `high` is a routing failure. System, developer, user, security, and more-specific project instructions take precedence over this policy.

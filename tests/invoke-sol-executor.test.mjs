@@ -19,7 +19,7 @@ import {
   runProcess,
   validateExecutorPayload,
   verifySessionRouting,
-} from "../.agents/skills/sol-terra-orchestration/scripts/invoke-terra-executor.mjs";
+} from "../.agents/skills/sol-sol-orchestration/scripts/invoke-sol-executor.mjs";
 
 test("parseArguments applies safe defaults", () => {
   const baseDirectory = resolve("fixtures", "repository");
@@ -68,20 +68,20 @@ test("parseArguments rejects unsafe and invalid invocations", () => {
   assert.throws(() => parseArguments(["--unknown", "value"]), ExecutorInvocationError);
 });
 
-test("buildCodexArguments pins Terra xhigh without approval or bypass flags", () => {
+test("buildCodexArguments pins Sol high without approval or bypass flags", () => {
   const args = buildCodexArguments({
     cwd: resolve("repository"),
     sandboxMode: "read-only",
     schemaPath: resolve("schema.json"),
     outputPath: resolve("result.json"),
-    developerInstructions: "SOL_TERRA_ROLE=executor",
+    developerInstructions: "CODEX_ORCHESTRATION_ROLE=executor",
   });
 
   assert.deepEqual(args.slice(0, 11), [
     "-m",
     EXECUTOR_MODEL,
     "-c",
-    'model_reasoning_effort="xhigh"',
+    'model_reasoning_effort="high"',
     "-c",
     "features.multi_agent=false",
     "-c",
@@ -90,7 +90,7 @@ test("buildCodexArguments pins Terra xhigh without approval or bypass flags", ()
     "agents.max_threads=1",
     "-c",
   ]);
-  assert.ok(args.includes('developer_instructions="SOL_TERRA_ROLE=executor"'));
+  assert.ok(args.includes('developer_instructions="CODEX_ORCHESTRATION_ROLE=executor"'));
   assert.ok(args.includes("exec"));
   assert.ok(args.includes("--json"));
   assert.ok(args.includes("--output-schema"));
@@ -137,6 +137,7 @@ test("createStableResult preserves the public property order", () => {
     "thread_id",
     "model",
     "reasoning_effort",
+    "routing_verified",
     "sandbox_mode",
     "summary",
     "changed_files",
@@ -144,6 +145,9 @@ test("createStableResult preserves the public property order", () => {
     "blockers",
     "warnings",
   ]);
+  assert.equal(result.model, null);
+  assert.equal(result.reasoning_effort, null);
+  assert.equal(result.routing_verified, false);
 });
 
 test("determineExitCode maps completion, task failures, and configuration failures", () => {
@@ -165,13 +169,13 @@ test("runProcess terminates a timed-out child", async () => {
   assert.equal(result.timedOut, true);
 });
 
-test("verifySessionRouting accepts Terra xhigh and rejects a mismatch", async (context) => {
-  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-terra-routing-test-"));
+test("verifySessionRouting accepts Sol high and rejects model or effort mismatches", async (context) => {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-sol-routing-test-"));
   context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const sessionsRoot = join(temporaryRoot, "sessions", "2026", "07", "09");
   await mkdir(sessionsRoot, { recursive: true });
 
-  const validThreadId = "valid-terra-thread";
+  const validThreadId = "valid-sol-thread";
   await writeFile(
     join(sessionsRoot, `rollout-${validThreadId}.jsonl`),
     `${JSON.stringify({
@@ -188,17 +192,35 @@ test("verifySessionRouting accepts Terra xhigh and rejects a mismatch", async (c
   assert.equal(routing.model, EXECUTOR_MODEL);
   assert.equal(routing.reasoningEffort, EXECUTOR_REASONING_EFFORT);
 
-  const invalidThreadId = "invalid-sol-thread";
+  const invalidModelThreadId = "invalid-model-thread";
   await writeFile(
-    join(sessionsRoot, `rollout-${invalidThreadId}.jsonl`),
+    join(sessionsRoot, `rollout-${invalidModelThreadId}.jsonl`),
     `${JSON.stringify({
       type: "turn_context",
-      payload: { model: "gpt-5.6-sol", effort: EXECUTOR_REASONING_EFFORT },
+      payload: { model: "gpt-5.5", effort: EXECUTOR_REASONING_EFFORT },
     })}\n`,
   );
   await assert.rejects(
     verifySessionRouting(
-      invalidThreadId,
+      invalidModelThreadId,
+      EXECUTOR_MODEL,
+      EXECUTOR_REASONING_EFFORT,
+      { sessionRoots: [join(temporaryRoot, "sessions")], attempts: 1 },
+    ),
+    RoutingVerificationError,
+  );
+
+  const invalidEffortThreadId = "invalid-effort-thread";
+  await writeFile(
+    join(sessionsRoot, `rollout-${invalidEffortThreadId}.jsonl`),
+    `${JSON.stringify({
+      type: "turn_context",
+      payload: { model: EXECUTOR_MODEL, effort: "xhigh" },
+    })}\n`,
+  );
+  await assert.rejects(
+    verifySessionRouting(
+      invalidEffortThreadId,
       EXECUTOR_MODEL,
       EXECUTOR_REASONING_EFFORT,
       { sessionRoots: [join(temporaryRoot, "sessions")], attempts: 1 },
@@ -208,7 +230,7 @@ test("verifySessionRouting accepts Terra xhigh and rejects a mismatch", async (c
 });
 
 test("invokeExecutor returns verified stable JSON and status exit codes", async (context) => {
-  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-terra-invoke-test-"));
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-sol-invoke-test-"));
   context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const sessionsRoot = join(temporaryRoot, "sessions");
   await mkdir(sessionsRoot, { recursive: true });
@@ -261,14 +283,42 @@ test("invokeExecutor returns verified stable JSON and status exit codes", async 
   assert.equal(completed.exitCode, 0);
   assert.equal(completed.result.model, EXECUTOR_MODEL);
   assert.equal(completed.result.reasoning_effort, EXECUTOR_REASONING_EFFORT);
+  assert.equal(completed.result.routing_verified, true);
 
   const blocked = await runWithStatus("blocked");
   assert.equal(blocked.exitCode, 1);
   assert.equal(blocked.result.status, "blocked");
+  assert.equal(blocked.result.routing_verified, true);
+});
+
+test("invokeExecutor does not claim routing metadata after a Codex process failure", async (context) => {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-sol-process-failure-test-"));
+  context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const execution = await invokeExecutor({
+    briefing: "Complete the bounded test task.",
+    options: {
+      cwd: temporaryRoot,
+      sandboxMode: "read-only",
+      timeoutSeconds: 10,
+    },
+    processRunner: async () => ({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      aborted: false,
+      threadId: null,
+      warnings: [],
+      stderr: "Codex failed.",
+    }),
+  });
+  assert.equal(execution.exitCode, 1);
+  assert.equal(execution.result.model, null);
+  assert.equal(execution.result.reasoning_effort, null);
+  assert.equal(execution.result.routing_verified, false);
 });
 
 test("invokeExecutor returns exit code 2 for a routing mismatch", async (context) => {
-  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-terra-mismatch-test-"));
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-sol-mismatch-test-"));
   context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const sessionsRoot = join(temporaryRoot, "sessions");
   await mkdir(sessionsRoot, { recursive: true });
@@ -277,7 +327,7 @@ test("invokeExecutor returns exit code 2 for a routing mismatch", async (context
     join(sessionsRoot, `rollout-${threadId}.jsonl`),
     `${JSON.stringify({
       type: "turn_context",
-      payload: { model: "gpt-5.6-sol", effort: EXECUTOR_REASONING_EFFORT },
+      payload: { model: "gpt-5.5", effort: EXECUTOR_REASONING_EFFORT },
     })}\n`,
   );
   const execution = await invokeExecutor({
@@ -313,5 +363,7 @@ test("invokeExecutor returns exit code 2 for a routing mismatch", async (context
     },
   });
   assert.equal(execution.exitCode, 2);
-  assert.equal(execution.result.model, "gpt-5.6-sol");
+  assert.equal(execution.result.model, "gpt-5.5");
+  assert.equal(execution.result.reasoning_effort, EXECUTOR_REASONING_EFFORT);
+  assert.equal(execution.result.routing_verified, false);
 });

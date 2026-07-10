@@ -1,6 +1,0 @@
-interface:
-  display_name: "Sol-Terra Orchestration"
-  short_description: "Coordinate verified Sol and Terra work"
-  default_prompt: "Use $sol-terra-orchestration to coordinate this task."
-policy:
-  allow_implicit_invocation: false
