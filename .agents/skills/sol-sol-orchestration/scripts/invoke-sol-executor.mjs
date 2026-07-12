@@ -6,9 +6,18 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import {
+  EXECUTOR_PROFILE_NAMES,
+  getExecutorProfile,
+} from "./executor-profiles.mjs";
+import {
+  ORCHESTRATION_ROLE_ENV,
+  abandonExecutorRun,
+  beginExecutorRun,
+  finishExecutorRun,
+} from "./orchestration-state.mjs";
 
 export const EXECUTOR_MODEL = "gpt-5.6-sol";
-export const EXECUTOR_REASONING_EFFORT = "high";
 export const DEFAULT_SANDBOX_MODE = "read-only";
 export const DEFAULT_TIMEOUT_SECONDS = 900;
 
@@ -67,6 +76,7 @@ function requireOptionValue(argv, index, option) {
 
 export function parseArguments(argv, baseDirectory = process.cwd()) {
   const parsed = {
+    profile: null,
     cwd: resolve(baseDirectory),
     sandboxMode: DEFAULT_SANDBOX_MODE,
     timeoutSeconds: DEFAULT_TIMEOUT_SECONDS,
@@ -75,7 +85,7 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
 
   for (let index = 0; index < argv.length; index += 1) {
     const option = argv[index];
-    if (!["--cwd", "--sandbox", "--timeout-seconds"].includes(option)) {
+    if (!["--profile", "--cwd", "--sandbox", "--timeout-seconds"].includes(option)) {
       throw new ExecutorInvocationError(`Unknown option: ${option}`);
     }
     if (seen.has(option)) {
@@ -85,7 +95,14 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
     const value = requireOptionValue(argv, index, option);
     index += 1;
 
-    if (option === "--cwd") {
+    if (option === "--profile") {
+      if (!EXECUTOR_PROFILE_NAMES.includes(value)) {
+        throw new ExecutorInvocationError(
+          `--profile must be one of: ${EXECUTOR_PROFILE_NAMES.join(", ")}.`,
+        );
+      }
+      parsed.profile = value;
+    } else if (option === "--cwd") {
       parsed.cwd = resolve(baseDirectory, value);
     } else if (option === "--sandbox") {
       if (value === "danger-full-access") {
@@ -108,34 +125,70 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
     }
   }
 
+  if (parsed.profile === null) {
+    throw new ExecutorInvocationError("--profile is required.");
+  }
+  const profile = getExecutorProfile(parsed.profile);
+  if (parsed.sandboxMode !== profile.sandboxMode) {
+    throw new ExecutorInvocationError(
+      `Profile ${profile.name} requires --sandbox ${profile.sandboxMode}.`,
+    );
+  }
+
   return parsed;
 }
 
-export function createExecutorDeveloperInstructions() {
+function requireExecutorProfile(name, sandboxMode) {
+  const profile = getExecutorProfile(name);
+  if (profile === null) {
+    throw new ExecutorInvocationError(
+      `Executor profile must be one of: ${EXECUTOR_PROFILE_NAMES.join(", ")}.`,
+    );
+  }
+  if (sandboxMode !== profile.sandboxMode) {
+    throw new ExecutorInvocationError(
+      `Profile ${profile.name} requires --sandbox ${profile.sandboxMode}.`,
+    );
+  }
+  return profile;
+}
+
+export function createExecutorDeveloperInstructions(profileName) {
+  const profile = getExecutorProfile(profileName);
+  if (profile === null) {
+    throw new ExecutorInvocationError(
+      `Executor profile must be one of: ${EXECUTOR_PROFILE_NAMES.join(", ")}.`,
+    );
+  }
   return [
     "CODEX_ORCHESTRATION_ROLE=executor",
-    "Act as a bounded GPT-5.6 Sol executor at high reasoning, not as the root orchestrator.",
+    `CODEX_EXECUTOR_PROFILE=${profile.name}`,
+    `Act as a bounded GPT-5.6 Sol ${profile.name} executor at ${profile.reasoningEffort} reasoning, not as the root orchestrator.`,
     "Do not invoke the sol-sol-orchestration skill, delegate, or launch another Codex session.",
     "Complete only the supplied briefing and preserve unrelated changes.",
     "Do not alter orchestration policy, approval policy, or sandbox configuration, and do not use bypasses.",
-    "Use workspace-write only for explicitly assigned files and respect every applicable instruction.",
     "Return only the result required by the supplied JSON schema.",
     "Use completed only when the assigned work and requested checks succeeded; otherwise use blocked or failed.",
+    ...profile.instructions,
   ].join("\n");
 }
 
 export function buildCodexArguments({
+  profile: profileName,
   cwd,
   sandboxMode,
   schemaPath = RESULT_SCHEMA_PATH,
   outputPath,
-  developerInstructions = createExecutorDeveloperInstructions(),
+  developerInstructions,
 }) {
+  const profile = requireExecutorProfile(profileName, sandboxMode);
+  const resolvedDeveloperInstructions =
+    developerInstructions ?? createExecutorDeveloperInstructions(profile.name);
   return [
     "-m",
     EXECUTOR_MODEL,
     "-c",
-    `model_reasoning_effort=${JSON.stringify(EXECUTOR_REASONING_EFFORT)}`,
+    `model_reasoning_effort=${JSON.stringify(profile.reasoningEffort)}`,
     "-c",
     "features.multi_agent=false",
     "-c",
@@ -143,7 +196,7 @@ export function buildCodexArguments({
     "-c",
     "agents.max_threads=1",
     "-c",
-    `developer_instructions=${JSON.stringify(developerInstructions)}`,
+    `developer_instructions=${JSON.stringify(resolvedDeveloperInstructions)}`,
     "-C",
     cwd,
     "-s",
@@ -224,6 +277,7 @@ export async function runProcess(
     }
 
     const state = { threadId: null, warnings: [] };
+    let stdout = "";
     let stderr = "";
     let timedOut = false;
     let aborted = false;
@@ -231,7 +285,10 @@ export async function runProcess(
     let forceKillTimer;
 
     const lineReader = createInterface({ input: child.stdout, crlfDelay: Infinity });
-    lineReader.on("line", (line) => recordCodexEvent(line, state));
+    lineReader.on("line", (line) => {
+      stdout = appendLimited(stdout, `${line}\n`);
+      recordCodexEvent(line, state);
+    });
     child.stderr.on("data", (chunk) => {
       stderr = appendLimited(stderr, chunk.toString("utf8"));
     });
@@ -292,6 +349,7 @@ export async function runProcess(
         aborted,
         threadId: state.threadId,
         warnings: uniqueStrings(state.warnings),
+        stdout: stdout.trim(),
         stderr: stderr.trim(),
       });
     });
@@ -511,8 +569,41 @@ export function validateExecutorPayload(value) {
   };
 }
 
+function validateProfilePayload(profileName, payload) {
+  if (["explore", "review"].includes(profileName) && payload.changed_files.length > 0) {
+    throw new ExecutorConfigurationError(
+      `Profile ${profileName} must return an empty changed_files array.`,
+    );
+  }
+  if (profileName !== "review") {
+    return payload;
+  }
+
+  const verdict = /^(APPROVE|COMMENT|REQUEST_CHANGES)(?=$|[\s:—–-])/.exec(
+    payload.summary,
+  )?.[1];
+  if (verdict === undefined) {
+    throw new ExecutorConfigurationError(
+      "Review summary must begin with APPROVE, COMMENT, or REQUEST_CHANGES.",
+    );
+  }
+  if (verdict === "REQUEST_CHANGES") {
+    if (payload.status !== "blocked" || payload.blockers.length === 0) {
+      throw new ExecutorConfigurationError(
+        "REQUEST_CHANGES requires blocked status and at least one blocker.",
+      );
+    }
+  } else if (payload.status !== "completed" || payload.blockers.length > 0) {
+    throw new ExecutorConfigurationError(
+      `${verdict} requires completed status and no blockers.`,
+    );
+  }
+  return payload;
+}
+
 export function createStableResult({
   status,
+  profile = null,
   threadId = null,
   model = null,
   reasoningEffort = null,
@@ -526,6 +617,7 @@ export function createStableResult({
 }) {
   return {
     status,
+    profile,
     thread_id: threadId,
     model,
     reasoning_effort: reasoningEffort,
@@ -559,6 +651,7 @@ function configurationFailure(message, options, details = {}) {
   return {
     result: createStableResult({
       status: "failed",
+      profile: options.profile ?? null,
       threadId: details.threadId ?? null,
       model: details.model ?? null,
       reasoningEffort: details.reasoningEffort ?? null,
@@ -571,7 +664,7 @@ function configurationFailure(message, options, details = {}) {
   };
 }
 
-export async function invokeExecutor({
+async function runExecutor({
   briefing,
   options,
   command = "codex",
@@ -583,6 +676,7 @@ export async function invokeExecutor({
   if (typeof briefing !== "string" || briefing.trim().length === 0) {
     throw new ExecutorInvocationError("An executor briefing is required.");
   }
+  const profile = requireExecutorProfile(options.profile, options.sandboxMode);
 
   let workingDirectory;
   try {
@@ -600,6 +694,7 @@ export async function invokeExecutor({
     `sol-sol-executor-${process.pid}-${randomUUID()}.json`,
   );
   const args = buildCodexArguments({
+    profile: profile.name,
     cwd: options.cwd,
     sandboxMode: options.sandboxMode,
     outputPath,
@@ -610,7 +705,11 @@ export async function invokeExecutor({
       input: `${briefing.trim()}\n`,
       timeoutMs: options.timeoutSeconds * 1000,
       cwd: options.cwd,
-      environment,
+      environment: {
+        ...environment,
+        [ORCHESTRATION_ROLE_ENV]: "executor",
+        CODEX_EXECUTOR_PROFILE: profile.name,
+      },
       signal,
     });
 
@@ -629,6 +728,7 @@ export async function invokeExecutor({
       return {
         result: createStableResult({
           status: "failed",
+          profile: profile.name,
           threadId: processResult.threadId,
           sandboxMode: options.sandboxMode,
           summary: diagnostic,
@@ -650,7 +750,7 @@ export async function invokeExecutor({
       routing = await verifySessionRouting(
         processResult.threadId,
         EXECUTOR_MODEL,
-        EXECUTOR_REASONING_EFFORT,
+        profile.reasoningEffort,
         { sessionRoots },
       );
     } catch (error) {
@@ -667,7 +767,10 @@ export async function invokeExecutor({
 
     let payload;
     try {
-      payload = validateExecutorPayload(JSON.parse(await readFile(outputPath, "utf8")));
+      payload = validateProfilePayload(
+        profile.name,
+        validateExecutorPayload(JSON.parse(await readFile(outputPath, "utf8"))),
+      );
     } catch (error) {
       const message = `Invalid structured executor result: ${error.message}`;
       return configurationFailure(message, options, {
@@ -680,6 +783,7 @@ export async function invokeExecutor({
 
     const result = createStableResult({
       status: payload.status,
+      profile: profile.name,
       threadId: processResult.threadId,
       model: routing.model,
       reasoningEffort: routing.reasoningEffort,
@@ -703,8 +807,37 @@ export async function invokeExecutor({
   }
 }
 
+export async function invokeExecutor(input) {
+  const environment = input.environment ?? process.env;
+  const profile = requireExecutorProfile(
+    input.options.profile,
+    input.options.sandboxMode,
+  );
+  let lease;
+  try {
+    lease = await beginExecutorRun({
+      cwd: input.options.cwd,
+      profile: profile.name,
+      environment,
+      ...(input.coordinationOptions ?? {}),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return configurationFailure(message, input.options);
+  }
+  try {
+    const execution = await runExecutor({ ...input, environment });
+    await finishExecutorRun(lease, execution);
+    return execution;
+  } catch (error) {
+    await abandonExecutorRun(lease, error);
+    throw error;
+  }
+}
+
 export async function main(argv = process.argv.slice(2)) {
   let options = {
+    profile: null,
     cwd: process.cwd(),
     sandboxMode: DEFAULT_SANDBOX_MODE,
     timeoutSeconds: DEFAULT_TIMEOUT_SECONDS,

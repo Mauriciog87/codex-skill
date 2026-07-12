@@ -16,6 +16,8 @@ import {
   LEGACY_SKILL_NAME,
   MANAGED_BLOCK_END,
   MANAGED_BLOCK_START,
+  MANAGED_HOOKS_END,
+  MANAGED_HOOKS_START,
   SKILL_NAME,
   installGlobalOrchestration,
   updateGlobalConfig,
@@ -30,6 +32,7 @@ async function createSkill(
   { name = SKILL_NAME, displayName = NEW_DISPLAY_NAME } = {},
 ) {
   await mkdir(join(skillDirectory, "agents"), { recursive: true });
+  await mkdir(join(skillDirectory, "scripts"), { recursive: true });
   await writeFile(
     join(skillDirectory, "SKILL.md"),
     `---\nname: ${name}\ndescription: Test skill.\n---\n\n# Test\n`,
@@ -38,6 +41,7 @@ async function createSkill(
     join(skillDirectory, "agents", "openai.yaml"),
     `interface:\n  display_name: ${JSON.stringify(displayName)}\n`,
   );
+  await writeFile(join(skillDirectory, "scripts", "orchestration-gate.mjs"), "export {};\n");
 }
 
 async function createFixture(context, prefix) {
@@ -49,6 +53,7 @@ async function createFixture(context, prefix) {
   const canonicalSkill = join(repositoryRoot, ".agents", "skills", SKILL_NAME);
   const configPath = join(codexHome, "config.toml");
   const agentsPath = join(codexHome, "AGENTS.md");
+  const hooksPath = join(codexHome, "hooks.json");
   await createSkill(canonicalSkill);
   await mkdir(codexHome, { recursive: true });
   await writeFile(
@@ -65,6 +70,7 @@ async function createFixture(context, prefix) {
     ].join("\n"),
   );
   await writeFile(agentsPath, "# Existing global guidance\n\nPreserve this text.\n");
+  await writeFile(hooksPath, '{\r\n  "context-mode": true\r\n}\r\n');
   return {
     root,
     repositoryRoot,
@@ -73,6 +79,7 @@ async function createFixture(context, prefix) {
     canonicalSkill,
     configPath,
     agentsPath,
+    hooksPath,
   };
 }
 
@@ -99,6 +106,31 @@ test("updateGlobalConfig preserves unrelated values and is idempotent", () => {
   assert.throws(
     () => updateGlobalConfig('model = "one"\nmodel = "two"\n'),
     /duplicate top-level model/,
+  );
+});
+
+test("updateGlobalConfig manages hooks without replacing unrelated hook sources", () => {
+  const hookScriptPath = join("C:\\global-skill", "scripts", "orchestration-gate.mjs");
+  const original = [
+    "[features]",
+    "codex_hooks = true",
+    "",
+    "[[hooks.PostToolUse]]",
+    'matcher = "Bash"',
+    "",
+  ].join("\n");
+  const first = updateGlobalConfig(original, { hookScriptPath });
+  assert.match(first.content, /^hooks = true$/m);
+  assert.match(first.content, new RegExp(MANAGED_HOOKS_START));
+  assert.match(first.content, new RegExp(MANAGED_HOOKS_END));
+  assert.match(first.content, /^\[\[hooks\.SessionStart\]\]$/m);
+  assert.match(first.content, /^\[\[hooks\.PreToolUse\]\]$/m);
+  assert.match(first.content, /^\[\[hooks\.PostToolUse\]\]$/m);
+  assert.match(first.content, /orchestration-gate\.mjs/);
+  assert.equal(updateGlobalConfig(first.content, { hookScriptPath }).changed, false);
+  assert.throws(
+    () => updateGlobalConfig(`${MANAGED_HOOKS_START}\n`, { hookScriptPath }),
+    /malformed Sol-Sol hook markers/,
   );
 });
 
@@ -140,7 +172,12 @@ test("installGlobalOrchestration is idempotent and removes a validated legacy co
   await assert.rejects(lstat(legacySkill), { code: "ENOENT" });
   assert.match(await readFile(fixture.configPath, "utf8"), /^model = "gpt-5\.6-sol"$/m);
   assert.match(await readFile(fixture.configPath, "utf8"), /^codex_hooks = true$/m);
+  assert.match(await readFile(fixture.configPath, "utf8"), /^\[\[hooks\.PreToolUse\]\]$/m);
   assert.match(await readFile(fixture.agentsPath, "utf8"), /Preserve this text/);
+  assert.equal(
+    await readFile(fixture.hooksPath, "utf8"),
+    '{\r\n  "context-mode": true\r\n}\r\n',
+  );
 
   const second = await installGlobalOrchestration({
     repositoryRoot: fixture.repositoryRoot,
@@ -151,6 +188,29 @@ test("installGlobalOrchestration is idempotent and removes a validated legacy co
   assert.equal(second.configuration_changed, false);
   assert.equal(second.instructions_changed, false);
   assert.deepEqual(second.legacy_removed, []);
+});
+
+test("installGlobalOrchestration rejects damaged hook markers without partial changes", async (context) => {
+  const fixture = await createFixture(context, "sol-sol-install-hook-conflict-");
+  const originalAgents = await readFile(fixture.agentsPath, "utf8");
+  const originalHooks = await readFile(fixture.hooksPath, "utf8");
+  await writeFile(fixture.configPath, `${MANAGED_HOOKS_END}\n`);
+
+  await assert.rejects(
+    installGlobalOrchestration({
+      repositoryRoot: fixture.repositoryRoot,
+      homeDirectory: fixture.homeDirectory,
+      codexHome: fixture.codexHome,
+    }),
+    /malformed Sol-Sol hook markers/,
+  );
+  await assert.rejects(
+    lstat(join(fixture.homeDirectory, ".agents", "skills", SKILL_NAME)),
+    { code: "ENOENT" },
+  );
+  assert.equal(await readFile(fixture.configPath, "utf8"), `${MANAGED_HOOKS_END}\n`);
+  assert.equal(await readFile(fixture.agentsPath, "utf8"), originalAgents);
+  assert.equal(await readFile(fixture.hooksPath, "utf8"), originalHooks);
 });
 
 test("installGlobalOrchestration updates a nonempty AGENTS.override.md", async (context) => {

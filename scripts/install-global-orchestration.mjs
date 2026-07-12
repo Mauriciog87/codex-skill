@@ -21,6 +21,8 @@ export const SKILL_NAME = "sol-sol-orchestration";
 export const LEGACY_SKILL_NAME = "sol-terra-orchestration";
 export const MANAGED_BLOCK_START = "<!-- sol-sol-orchestration:start -->";
 export const MANAGED_BLOCK_END = "<!-- sol-sol-orchestration:end -->";
+export const MANAGED_HOOKS_START = "# sol-sol-orchestration:hooks:start";
+export const MANAGED_HOOKS_END = "# sol-sol-orchestration:hooks:end";
 
 const SKILL_DISPLAY_NAME = "Sol-Sol Orchestration";
 const LEGACY_SKILL_DISPLAY_NAME = "Sol-Terra Orchestration";
@@ -253,7 +255,113 @@ function setAgentsValues(lines, values) {
   }
 }
 
-export function updateGlobalConfig(content) {
+function setFeaturesValues(lines, values) {
+  const sectionHeaders = lines
+    .map((line, index) => ({ line, index }))
+    .filter(({ line }) => /^\s*\[features\]\s*(?:#.*)?$/.test(line));
+  if (sectionHeaders.length > 1) {
+    throw new Error("Global config contains duplicate [features] sections.");
+  }
+  if (sectionHeaders.length === 0) {
+    if (lines.length > 0 && lines.at(-1).trim() !== "") {
+      lines.push("");
+    }
+    lines.push("[features]");
+    for (const [key, value] of Object.entries(values)) {
+      lines.push(`${key} = ${value}`);
+    }
+    return;
+  }
+
+  const start = sectionHeaders[0].index + 1;
+  let end = lines.length;
+  for (let index = start; index < lines.length; index += 1) {
+    if (isTableHeader(lines[index])) {
+      end = index;
+      break;
+    }
+  }
+  for (const [key, value] of Object.entries(values)) {
+    const matcher = keyMatcher(key);
+    const matches = [];
+    for (let index = start; index < end; index += 1) {
+      if (matcher.test(lines[index])) {
+        matches.push(index);
+      }
+    }
+    if (matches.length > 1) {
+      throw new Error(`Global config contains duplicate [features].${key} entries.`);
+    }
+    if (matches.length === 1) {
+      lines[matches[0]] = `${key} = ${value}`;
+    } else {
+      lines.splice(end, 0, `${key} = ${value}`);
+      end += 1;
+    }
+  }
+}
+
+function managedHooksLines(hookScriptPath) {
+  const command = `node ${JSON.stringify(resolve(hookScriptPath))} hook`;
+  const serializedCommand = JSON.stringify(command);
+  return [
+    MANAGED_HOOKS_START,
+    "[[hooks.SessionStart]]",
+    'matcher = "startup|resume|clear|compact"',
+    "",
+    "[[hooks.SessionStart.hooks]]",
+    'type = "command"',
+    `command = ${serializedCommand}`,
+    `command_windows = ${serializedCommand}`,
+    "timeout = 10",
+    'statusMessage = "Checking exclusive Sol Ultra state"',
+    "",
+    "[[hooks.PreToolUse]]",
+    'matcher = "^(Bash|Shell|shell|local_shell|shell_command|exec_command|unified_exec|apply_patch|Edit|Write|mcp__.*)$"',
+    "",
+    "[[hooks.PreToolUse.hooks]]",
+    'type = "command"',
+    `command = ${serializedCommand}`,
+    `command_windows = ${serializedCommand}`,
+    "timeout = 10",
+    'statusMessage = "Enforcing exclusive Sol Ultra state"',
+    MANAGED_HOOKS_END,
+  ];
+}
+
+function updateManagedHooks(lines, hookScriptPath) {
+  const starts = [];
+  const ends = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim();
+    if (line === MANAGED_HOOKS_START) {
+      starts.push(index);
+    }
+    if (line === MANAGED_HOOKS_END) {
+      ends.push(index);
+    }
+  }
+  if (starts.length !== ends.length || starts.length > 1) {
+    throw new Error("Global config contains malformed Sol-Sol hook markers.");
+  }
+  if (starts.length === 1 && starts[0] >= ends[0]) {
+    throw new Error("Global config contains malformed Sol-Sol hook markers.");
+  }
+  const block = managedHooksLines(hookScriptPath);
+  if (starts.length === 1) {
+    lines.splice(starts[0], ends[0] - starts[0] + 1, ...block);
+    return;
+  }
+  while (lines.length > 0 && lines.at(-1).trim() === "") {
+    lines.pop();
+  }
+  if (lines.length > 0) {
+    lines.push("");
+  }
+  lines.push(...block);
+}
+
+export function updateGlobalConfig(content, { hookScriptPath = null } = {}) {
   const original = content ?? "";
   const shape = textShape(content);
   setTopLevelValues(shape.lines, {
@@ -262,6 +370,10 @@ export function updateGlobalConfig(content) {
     plan_mode_reasoning_effort: "xhigh",
   });
   setAgentsValues(shape.lines, { max_depth: 1, max_threads: 4 });
+  if (hookScriptPath !== null) {
+    setFeaturesValues(shape.lines, { hooks: true });
+    updateManagedHooks(shape.lines, hookScriptPath);
+  }
   shape.trailingNewline = true;
   const updated = renderText(shape);
   return { content: updated, changed: updated !== original };
@@ -273,6 +385,8 @@ function managedBlockLines() {
     "# Global Sol-Sol orchestration",
     "",
     "For every new substantive root task, explicitly invoke `$sol-sol-orchestration` before planning, delegating, or editing. A session whose developer instructions contain `CODEX_ORCHESTRATION_ROLE=executor` is an executor and must not invoke the skill or apply the root workflow.",
+    "",
+    "A human-confirmed Sol Ultra takeover owns its repository exclusively while its lock is active. Other root sessions must pause, and only executors carrying the matching `CODEX_ORCHESTRATION_LOCK_ID` may run. Never remove lock state manually; inspect or recover it through the orchestration gate.",
     MANAGED_BLOCK_END,
   ];
 }
@@ -403,10 +517,16 @@ export async function installGlobalOrchestration({
   );
   const globalSkillsDirectory = resolve(homeDirectory, ".agents", "skills");
   const destination = join(globalSkillsDirectory, SKILL_NAME);
+  const canonicalHookScript = join(canonicalDirectory, "scripts", "orchestration-gate.mjs");
+  const globalHookScript = join(destination, "scripts", "orchestration-gate.mjs");
   const defaultCodexHome = resolve(homeDirectory, ".codex");
   const configPath = join(codexHome, "config.toml");
 
   await validateSkillIdentity(canonicalDirectory);
+  const hookScriptMetadata = await stat(canonicalHookScript);
+  if (!hookScriptMetadata.isFile()) {
+    throw new Error(`Orchestration hook script is not a file: ${canonicalHookScript}`);
+  }
   if (samePath(canonicalDirectory, destination, platform)) {
     throw new Error("The canonical and global skill directories must be different paths.");
   }
@@ -449,7 +569,7 @@ export async function installGlobalOrchestration({
   }
 
   const originalConfig = await readOptional(configPath);
-  const configUpdate = updateGlobalConfig(originalConfig);
+  const configUpdate = updateGlobalConfig(originalConfig, { hookScriptPath: globalHookScript });
   const globalInstructions = await selectGlobalInstructions(codexHome);
   const instructionsUpdate = updateGlobalInstructions(globalInstructions.content);
 
