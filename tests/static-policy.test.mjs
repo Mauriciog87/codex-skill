@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import test from "node:test";
 import { EXECUTOR_PROFILES } from "../.agents/skills/sol-sol-orchestration/scripts/executor-profiles.mjs";
+import { SOL_MODEL_VERBOSITY } from "../.agents/skills/sol-sol-orchestration/scripts/orchestration-state.mjs";
 
 const execFileAsync = promisify(execFile);
 const migrationFiles = new Set([
@@ -57,6 +58,7 @@ test("package scripts and skill policy expose the supported interfaces", async (
   const config = await readFile(".codex/config.toml", "utf8");
   assert.match(config, /^model = "gpt-5\.6-sol"$/m);
   assert.match(config, /^model_reasoning_effort = "xhigh"$/m);
+  assert.match(config, new RegExp(`^model_verbosity = "${SOL_MODEL_VERBOSITY}"$`, "m"));
   assert.match(config, /^plan_mode_reasoning_effort = "xhigh"$/m);
 });
 
@@ -81,6 +83,7 @@ test("profile registry and operational guidance stay aligned", async () => {
   );
   assert.match(launcher, /--profile/);
   assert.match(launcher, /CODEX_EXECUTOR_PROFILE/);
+  assert.match(launcher, /model_verbosity/);
   assert.doesNotMatch(launcher, /EXECUTOR_REASONING_EFFORT/);
   const registry = await readFile(
     ".agents/skills/sol-sol-orchestration/scripts/executor-profiles.mjs",
@@ -93,6 +96,7 @@ test("profile registry and operational guidance stay aligned", async () => {
     "utf8",
   );
   assert.match(ultraLauncher, /ULTRA_REASONING_EFFORT/);
+  assert.match(ultraLauncher, /model_verbosity/);
   assert.match(ultraLauncher, /--confirm-exclusive-takeover/);
   assert.match(ultraLauncher, /features\.multi_agent=false/);
   assert.match(ultraLauncher, /CODEX_ORCHESTRATION_LOCK_ID/);
@@ -109,6 +113,7 @@ test("profile registry and operational guidance stay aligned", async () => {
     assert.match(content, /medium/);
     assert.match(content, /high/);
     assert.match(content, /xhigh/);
+    assert.match(content, /model_verbosity.*low/);
     assert.match(content, /ultra/i);
     assert.match(content, /recovery-required/);
   }

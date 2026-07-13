@@ -19,6 +19,7 @@ export const ORCHESTRATION_ROLE_ENV = "CODEX_ORCHESTRATION_ROLE";
 export const ULTRA_ORCHESTRATOR_ROLE = "ultra-orchestrator";
 export const ULTRA_MODEL = "gpt-5.6-sol";
 export const ULTRA_REASONING_EFFORT = "ultra";
+export const SOL_MODEL_VERBOSITY = "low";
 
 const STATE_VERSION = 1;
 const MUTEX_TIMEOUT_MS = 5_000;

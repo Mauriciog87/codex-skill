@@ -10,6 +10,8 @@ The root Codex session is the orchestrator. At the beginning of every new substa
 - `review` executor: `gpt-5.6-sol` with `high` reasoning and `read-only` sandbox.
 - Exceptional takeover: `gpt-5.6-sol` with `ultra` reasoning and a human-confirmed repository lock.
 
+Every role uses `model_verbosity = "low"`. Verbosity controls response length and remains independent from each role's reasoning effort.
+
 All executor work must use `node .agents/skills/sol-sol-orchestration/scripts/invoke-sol-executor.mjs --profile explore|implement|review [options]` with a bounded briefing on stdin. The profile is mandatory and fixes the reasoning effort and sandbox policy. Use the direct Node command when exit-code fidelity matters; npm 11 normalizes failed lifecycle scripts and can consume forwarded options unless given an additional separator.
 
 Do not use native `spawn_agent` or a custom agent TOML for executor routing. Reconsider native spawning only after the tool exposes `agent_role` and live routing tests prove every required Sol profile and effort.

@@ -12,6 +12,7 @@ import {
 } from "./executor-profiles.mjs";
 import {
   ORCHESTRATION_ROLE_ENV,
+  SOL_MODEL_VERBOSITY,
   abandonExecutorRun,
   beginExecutorRun,
   finishExecutorRun,
@@ -189,6 +190,8 @@ export function buildCodexArguments({
     EXECUTOR_MODEL,
     "-c",
     `model_reasoning_effort=${JSON.stringify(profile.reasoningEffort)}`,
+    "-c",
+    `model_verbosity=${JSON.stringify(SOL_MODEL_VERBOSITY)}`,
     "-c",
     "features.multi_agent=false",
     "-c",

@@ -61,6 +61,7 @@ async function createFixture(context, prefix) {
     [
       'model = "gpt-5.6-terra"',
       'model_reasoning_effort = "ultra"',
+      'model_verbosity = "high"',
       'plan_mode_reasoning_effort = "xhigh"',
       "",
       "[features]",
@@ -87,6 +88,7 @@ test("updateGlobalConfig preserves unrelated values and is idempotent", () => {
   const original = [
     'model = "gpt-5.6-terra"',
     'model_reasoning_effort = "ultra"',
+    'model_verbosity = "high"',
     "",
     "[features]",
     "hooks = true",
@@ -97,6 +99,7 @@ test("updateGlobalConfig preserves unrelated values and is idempotent", () => {
   assert.equal(first.changed, true);
   assert.match(first.content, /^model = "gpt-5\.6-sol"\r$/m);
   assert.match(first.content, /^model_reasoning_effort = "xhigh"\r$/m);
+  assert.match(first.content, /^model_verbosity = "low"\r$/m);
   assert.match(first.content, /^plan_mode_reasoning_effort = "xhigh"\r$/m);
   assert.match(first.content, /^\[agents\]\r$/m);
   assert.match(first.content, /^max_depth = 1\r$/m);
@@ -171,6 +174,7 @@ test("installGlobalOrchestration is idempotent and removes a validated legacy co
   assert.equal(await realpath(first.global_skill), await realpath(fixture.canonicalSkill));
   await assert.rejects(lstat(legacySkill), { code: "ENOENT" });
   assert.match(await readFile(fixture.configPath, "utf8"), /^model = "gpt-5\.6-sol"$/m);
+  assert.match(await readFile(fixture.configPath, "utf8"), /^model_verbosity = "low"$/m);
   assert.match(await readFile(fixture.configPath, "utf8"), /^codex_hooks = true$/m);
   assert.match(await readFile(fixture.configPath, "utf8"), /^\[\[hooks\.PreToolUse\]\]$/m);
   assert.match(await readFile(fixture.agentsPath, "utf8"), /Preserve this text/);

@@ -16,6 +16,7 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { SOL_MODEL_VERBOSITY } from "../.agents/skills/sol-sol-orchestration/scripts/orchestration-state.mjs";
 
 export const SKILL_NAME = "sol-sol-orchestration";
 export const LEGACY_SKILL_NAME = "sol-terra-orchestration";
@@ -367,6 +368,7 @@ export function updateGlobalConfig(content, { hookScriptPath = null } = {}) {
   setTopLevelValues(shape.lines, {
     model: "gpt-5.6-sol",
     model_reasoning_effort: "xhigh",
+    model_verbosity: SOL_MODEL_VERBOSITY,
     plan_mode_reasoning_effort: "xhigh",
   });
   setAgentsValues(shape.lines, { max_depth: 1, max_threads: 4 });

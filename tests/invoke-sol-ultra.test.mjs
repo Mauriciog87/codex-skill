@@ -15,6 +15,7 @@ import {
 } from "../.agents/skills/sol-sol-orchestration/scripts/invoke-sol-ultra.mjs";
 import {
   ORCHESTRATION_LOCK_ENV,
+  SOL_MODEL_VERBOSITY,
   beginExecutorRun,
   finishExecutorRun,
   readUltraLock,
@@ -138,11 +139,13 @@ test("Ultra command and instructions pin the exclusive Sol runtime", () => {
     lockId: "lock-123",
     outputPath: resolve("result.json"),
   });
-  assert.deepEqual(args.slice(0, 11), [
+  assert.deepEqual(args.slice(0, 13), [
     "-m",
     "gpt-5.6-sol",
     "-c",
     'model_reasoning_effort="ultra"',
+    "-c",
+    `model_verbosity=${JSON.stringify(SOL_MODEL_VERBOSITY)}`,
     "-c",
     "features.multi_agent=false",
     "-c",

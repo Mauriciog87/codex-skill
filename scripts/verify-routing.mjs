@@ -126,13 +126,15 @@ async function verifySkillDiscovery(repositoryRoot) {
 
   const projectConfig = await readFile(join(repositoryRoot, ".codex", "config.toml"), "utf8");
   if (updateGlobalConfig(projectConfig).changed) {
-    throw new Error("The repository Codex configuration does not enforce Sol xhigh.");
+    throw new Error("The repository Codex configuration does not enforce Sol xhigh with low verbosity.");
   }
   const globalConfigPath = join(codexHome, "config.toml");
   const globalConfig = await readFile(globalConfigPath, "utf8");
   const globalHookScript = join(globalSkill, "scripts", "orchestration-gate.mjs");
   if (updateGlobalConfig(globalConfig, { hookScriptPath: globalHookScript }).changed) {
-    throw new Error("The global Codex configuration does not enforce Sol xhigh and hooks.");
+    throw new Error(
+      "The global Codex configuration does not enforce Sol xhigh, low verbosity, and hooks.",
+    );
   }
   const globalInstructions = await activeGlobalInstructions(codexHome);
   if (updateGlobalInstructions(globalInstructions.content).changed) {

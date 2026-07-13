@@ -2,15 +2,17 @@
 
 This repository configures Codex to use GPT-5.6 Sol as one orchestrator and three verified executor profiles:
 
-| Role | Model | Reasoning | Sandbox |
-| --- | --- | --- | --- |
-| Root orchestrator and planner | `gpt-5.6-sol` | `xhigh` | Task-specific |
-| `explore` | `gpt-5.6-sol` | `medium` | `read-only` |
-| `implement` | `gpt-5.6-sol` | `high` | Explicit `workspace-write` |
-| `review` | `gpt-5.6-sol` | `high` | `read-only` |
-| Exceptional Ultra takeover | `gpt-5.6-sol` | `ultra` | Explicit per takeover |
+| Role | Model | Reasoning | Verbosity | Sandbox |
+| --- | --- | --- | --- | --- |
+| Root orchestrator and planner | `gpt-5.6-sol` | `xhigh` | `low` | Task-specific |
+| `explore` | `gpt-5.6-sol` | `medium` | `low` | `read-only` |
+| `implement` | `gpt-5.6-sol` | `high` | `low` | Explicit `workspace-write` |
+| `review` | `gpt-5.6-sol` | `high` | `low` | `read-only` |
+| Exceptional Ultra takeover | `gpt-5.6-sol` | `ultra` | `low` | Explicit per takeover |
 
 The launcher does not trust configuration or model self-reporting. It starts `codex exec`, captures the thread ID, reads the session rollout, and rejects the run unless `turn_context` records the model and reasoning effort fixed by the selected profile.
+
+All roles pin `model_verbosity = "low"` for concise output without reducing their configured reasoning effort.
 
 ```text
 Root Codex session: Sol / xhigh

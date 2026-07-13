@@ -1,6 +1,6 @@
 ---
 name: sol-sol-orchestration
-description: Coordinate substantive software work with GPT-5.6 Sol at xhigh reasoning as the root orchestrator, verified Sol executor profiles, and an exceptional human-confirmed Sol Ultra takeover. Invoke explicitly at the start of every new substantive root task and when planning, delegating, coordinating, or validating independent work.
+description: Coordinate substantive software work with GPT-5.6 Sol at low output verbosity, xhigh reasoning as the root orchestrator, verified Sol executor profiles, and an exceptional human-confirmed Sol Ultra takeover. Invoke explicitly at the start of every new substantive root task and when planning, delegating, coordinating, or validating independent work.
 ---
 
 # Sol Sol Orchestration
@@ -9,7 +9,7 @@ Run this workflow once before planning the first substantive request in a root t
 
 ## Workflow
 
-1. Confirm that the root session uses `gpt-5.6-sol` with `xhigh` reasoning.
+1. Confirm that the root session uses `gpt-5.6-sol` with `xhigh` reasoning and `model_verbosity = "low"`.
 2. Define the outcome, acceptance criteria, risks, ownership boundaries, and final verification.
 3. Keep planning, integration, small tasks, tightly coupled work, and sensitive decisions in the root session.
 4. Delegate only independent scopes whose lower context cost or parallelism materially improves the work.

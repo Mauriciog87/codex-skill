@@ -16,6 +16,7 @@ import {
 import {
   ORCHESTRATION_LOCK_ENV,
   ORCHESTRATION_ROLE_ENV,
+  SOL_MODEL_VERBOSITY,
   ULTRA_MODEL,
   ULTRA_ORCHESTRATOR_ROLE,
   ULTRA_REASONING_EFFORT,
@@ -149,6 +150,8 @@ export function buildUltraCodexArguments({
     ULTRA_MODEL,
     "-c",
     `model_reasoning_effort=${JSON.stringify(ULTRA_REASONING_EFFORT)}`,
+    "-c",
+    `model_verbosity=${JSON.stringify(SOL_MODEL_VERBOSITY)}`,
     "-c",
     "features.multi_agent=false",
     "-c",

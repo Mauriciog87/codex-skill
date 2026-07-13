@@ -26,6 +26,7 @@ import {
   verifySessionRouting,
 } from "../.agents/skills/sol-sol-orchestration/scripts/invoke-sol-executor.mjs";
 import {
+  SOL_MODEL_VERBOSITY,
   acquireUltraLock,
   releaseUltraLock,
 } from "../.agents/skills/sol-sol-orchestration/scripts/orchestration-state.mjs";
@@ -169,11 +170,13 @@ test("buildCodexArguments pins the selected Sol profile without bypass flags", (
       schemaPath: resolve("schema.json"),
       outputPath: resolve("result.json"),
     });
-    assert.deepEqual(args.slice(0, 11), [
+    assert.deepEqual(args.slice(0, 13), [
       "-m",
       EXECUTOR_MODEL,
       "-c",
       `model_reasoning_effort=${JSON.stringify(profile.reasoningEffort)}`,
+      "-c",
+      `model_verbosity=${JSON.stringify(SOL_MODEL_VERBOSITY)}`,
       "-c",
       "features.multi_agent=false",
       "-c",
