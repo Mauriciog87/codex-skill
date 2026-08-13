@@ -17,6 +17,11 @@ import {
   beginExecutorRun,
   finishExecutorRun,
 } from "./orchestration-state.mjs";
+import {
+  executorLaunchMessage,
+  executorResultMessage,
+  writeStatusMessage,
+} from "./orchestration-messages.mjs";
 
 export const EXECUTOR_MODEL = "gpt-5.6-sol";
 export const DEFAULT_SANDBOX_MODE = "read-only";
@@ -853,16 +858,27 @@ export async function main(argv = process.argv.slice(2)) {
   try {
     options = parseArguments(argv);
     const briefing = await readBriefing();
+    const profile = requireExecutorProfile(options.profile, options.sandboxMode);
+    writeStatusMessage(
+      executorLaunchMessage({
+        profile: profile.name,
+        model: EXECUTOR_MODEL,
+        reasoningEffort: profile.reasoningEffort,
+        sandboxMode: options.sandboxMode,
+      }),
+    );
     const execution = await invokeExecutor({
       briefing,
       options,
       signal: abortController.signal,
     });
+    writeStatusMessage(executorResultMessage(execution.result));
     process.stdout.write(`${JSON.stringify(execution.result)}\n`);
     return execution.exitCode;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const failure = configurationFailure(message, options);
+    writeStatusMessage(executorResultMessage(failure.result));
     process.stdout.write(`${JSON.stringify(failure.result)}\n`);
     return failure.exitCode;
   } finally {

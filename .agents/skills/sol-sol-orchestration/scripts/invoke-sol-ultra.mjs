@@ -25,6 +25,11 @@ import {
   releaseUltraLock,
   updateUltraLock,
 } from "./orchestration-state.mjs";
+import {
+  ultraLaunchMessage,
+  ultraResultMessage,
+  writeStatusMessage,
+} from "./orchestration-messages.mjs";
 
 export const DEFAULT_ULTRA_SANDBOX_MODE = "read-only";
 export const DEFAULT_ULTRA_TIMEOUT_SECONDS = 1_800;
@@ -421,16 +426,25 @@ export async function main(argv = process.argv.slice(2)) {
   process.once("SIGTERM", interrupt);
   try {
     options = parseUltraArguments(argv);
+    writeStatusMessage(
+      ultraLaunchMessage({
+        model: ULTRA_MODEL,
+        reasoningEffort: ULTRA_REASONING_EFFORT,
+        sandboxMode: options.sandboxMode,
+      }),
+    );
     const execution = await invokeUltra({
       briefing: await readBriefing(),
       options,
       signal: abortController.signal,
     });
+    writeStatusMessage(ultraResultMessage(execution.result));
     process.stdout.write(`${JSON.stringify(execution.result)}\n`);
     return execution.exitCode;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const failure = failureResult(message, options);
+    writeStatusMessage(ultraResultMessage(failure.result));
     process.stdout.write(`${JSON.stringify(failure.result)}\n`);
     return failure.exitCode;
   } finally {

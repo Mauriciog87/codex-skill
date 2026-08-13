@@ -22,6 +22,25 @@ Run this workflow once before planning the first substantive request in a root t
 8. Accept a result only when the launcher verifies Sol with the profile's fixed reasoning effort and reports `routing_verified: true`.
 9. Inspect and integrate results, resolve conflicts, run final checks, and own the user-facing result.
 
+## User-visible routing messages
+
+Treat routing messages as part of the orchestration contract. Write them in concise, natural technical US English. State what the orchestrator is doing without claiming that the root session changed models.
+
+- Before launching an executor, tell the user that a separate executor is starting and include its profile, model, reasoning effort, and sandbox mode.
+- After the launcher returns, report the recorded model and reasoning effort only when `routing_verified: true`.
+- When routing is not verified, say so directly. Never infer model selection from configuration or executor prose.
+- For Ultra, state that it is an exclusive takeover and report whether the repository lock was released or requires recovery.
+- Avoid hype, filler, sycophancy, generic conclusions, and vague wording such as "switching models."
+
+The launchers emit the same lifecycle messages on stderr so stdout remains a single machine-readable JSON result. Root agents must surface the relevant message in commentary when the launcher runs through a tool whose stderr is not directly visible to the user.
+
+Examples:
+
+```text
+Sol orchestrator: Launching a separate explore executor with gpt-5.6-sol at medium reasoning in read-only mode.
+Sol orchestrator: Executor routing verified for explore: gpt-5.6-sol at medium reasoning (routing_verified=true). Status: completed.
+```
+
 Do not create a planner executor. The root Sol/xhigh session owns planning and may use `review` for an independent critique.
 
 ## Launcher

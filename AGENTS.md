@@ -47,3 +47,9 @@ Global SessionStart and PreToolUse hooks surface and enforce the lock where Code
 `explore` must return no changed files and must block rather than make architecture, security, concurrency, distributed-invariant, or contradictory-contract decisions. `implement` must not self-approve. `review` must return `APPROVE` or `COMMENT` with completed status, or `REQUEST_CHANGES` with blocked status and at least one blocker.
 
 The launcher disables multi-agent execution and verifies `turn_context`. An unverified model, a model other than `gpt-5.6-sol`, or an effort different from the selected profile is a routing failure. System, developer, user, security, and more-specific project instructions take precedence over this policy.
+
+## User-visible routing messages
+
+Routing messages are part of the orchestrator interface. Write them in concise, natural technical US English. Before a launch, identify the separate executor or exclusive Ultra takeover and state the requested model, reasoning effort, and sandbox. After completion, report the recorded model and reasoning effort only when rollout verification returns `routing_verified: true`. If verification fails, say so without claiming a route. Do not describe executor creation as switching the root session's model.
+
+The launchers write lifecycle messages to stderr and reserve stdout for the single JSON result. Root sessions must surface the corresponding message in commentary when the tool path does not expose stderr directly. Avoid hype, filler, sycophancy, generic conclusions, and vague status language.
