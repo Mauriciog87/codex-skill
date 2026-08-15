@@ -1,13 +1,13 @@
 {
-  "name": "sol-sol-orchestration",
+  "name": "sol-luna-orchestration",
   "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "install:global": "node scripts/install-global-orchestration.mjs",
-    "executor": "node .agents/skills/sol-sol-orchestration/scripts/invoke-sol-executor.mjs",
-    "ultra": "node .agents/skills/sol-sol-orchestration/scripts/invoke-sol-ultra.mjs",
-    "ultra:gate": "node .agents/skills/sol-sol-orchestration/scripts/orchestration-gate.mjs",
+    "executor": "node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs",
+    "ultra": "node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs",
+    "ultra:gate": "node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs",
     "test": "node --test",
     "verify:live": "node scripts/verify-routing.mjs"
   }

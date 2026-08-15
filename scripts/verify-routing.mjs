@@ -1,35 +1,41 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
+import { once } from "node:events";
 import { lstat, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import {
-  EXECUTOR_MODEL,
   getSessionRoots,
   invokeExecutor,
   runProcess,
   verifySessionRouting,
-} from "../.agents/skills/sol-sol-orchestration/scripts/invoke-sol-executor.mjs";
-import { EXECUTOR_PROFILES } from "../.agents/skills/sol-sol-orchestration/scripts/executor-profiles.mjs";
+} from "../.agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs";
+import { EXECUTOR_PROFILES } from "../.agents/skills/sol-luna-orchestration/scripts/executor-profiles.mjs";
 import {
   invokeUltra,
-} from "../.agents/skills/sol-sol-orchestration/scripts/invoke-sol-ultra.mjs";
+} from "../.agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs";
 import {
   acquireUltraLock,
+  beginExecutorRun,
+  EXECUTOR_CAPACITY_LIMITS,
+  finishExecutorRun,
   getOrchestrationStatus,
   releaseUltraLock,
-} from "../.agents/skills/sol-sol-orchestration/scripts/orchestration-state.mjs";
+} from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
 import {
   LEGACY_SKILL_NAME,
   SKILL_NAME,
+  TERRA_LEGACY_SKILL_NAME,
   updateGlobalConfig,
   updateGlobalInstructions,
 } from "./install-global-orchestration.mjs";
 
 export const ORCHESTRATOR_MODEL = "gpt-5.6-sol";
 export const ORCHESTRATOR_REASONING_EFFORT = "xhigh";
+export const ORCHESTRATOR_SERVICE_TIER = "standard";
 
 const execFileAsync = promisify(execFile);
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
@@ -138,12 +144,14 @@ async function verifySkillDiscovery(repositoryRoot) {
   }
   const globalInstructions = await activeGlobalInstructions(codexHome);
   if (updateGlobalInstructions(globalInstructions.content).changed) {
-    throw new Error("The active global instructions do not contain the managed Sol-Sol block.");
+    throw new Error("The active global instructions do not contain the managed Sol-Luna block.");
   }
 
   const legacyPaths = [
     join(homeDirectory, ".agents", "skills", LEGACY_SKILL_NAME),
+    join(homeDirectory, ".agents", "skills", TERRA_LEGACY_SKILL_NAME),
     join(codexHome, "skills", LEGACY_SKILL_NAME),
+    join(codexHome, "skills", TERRA_LEGACY_SKILL_NAME),
     join(codexHome, "skills", SKILL_NAME),
   ];
   for (const legacyPath of legacyPaths) {
@@ -169,6 +177,7 @@ function verifyExecutorResultSchema(result) {
     "thread_id",
     "model",
     "reasoning_effort",
+    "service_tier",
     "routing_verified",
     "sandbox_mode",
     "summary",
@@ -202,6 +211,7 @@ function verifyUltraResultSchema(result) {
     "thread_id",
     "model",
     "reasoning_effort",
+    "service_tier",
     "routing_verified",
     "sandbox_mode",
     "summary",
@@ -235,6 +245,7 @@ function verifyUltraRouting(result, sandboxMode) {
   if (
     result.model !== ORCHESTRATOR_MODEL ||
     result.reasoning_effort !== "ultra" ||
+    result.service_tier !== "standard" ||
     result.routing_verified !== true ||
     result.sandbox_mode !== sandboxMode
   ) {
@@ -246,8 +257,9 @@ function verifyProfileRouting(result, profileName) {
   const profile = EXECUTOR_PROFILES[profileName];
   if (
     result.profile !== profileName ||
-    result.model !== EXECUTOR_MODEL ||
+    result.model !== profile.model ||
     result.reasoning_effort !== profile.reasoningEffort ||
+    result.service_tier !== profile.serviceTier ||
     result.routing_verified !== true ||
     result.sandbox_mode !== profile.sandboxMode
   ) {
@@ -256,7 +268,7 @@ function verifyProfileRouting(result, profileName) {
 }
 
 async function runGlobalRootProbe(sessionRoots) {
-  const temporaryRepository = await mkdtemp(join(tmpdir(), "sol-sol-global-probe-"));
+  const temporaryRepository = await mkdtemp(join(tmpdir(), "sol-luna-global-probe-"));
   try {
     await execFileAsync("git", ["init", "--quiet"], {
       cwd: temporaryRepository,
@@ -306,6 +318,7 @@ async function runGlobalRootProbe(sessionRoots) {
       rootProcess.threadId,
       ORCHESTRATOR_MODEL,
       ORCHESTRATOR_REASONING_EFFORT,
+      ORCHESTRATOR_SERVICE_TIER,
       { sessionRoots },
     );
     return { threadId: rootProcess.threadId, routing };
@@ -348,7 +361,7 @@ async function runExploreProbe(repositoryRoot, sessionRoots) {
 }
 
 async function createWriteProbeRepository() {
-  const repository = await mkdtemp(join(tmpdir(), "sol-sol-write-probe-"));
+  const repository = await mkdtemp(join(tmpdir(), "sol-luna-write-probe-"));
   await execFileAsync("git", ["init", "--quiet"], {
     cwd: repository,
     windowsHide: true,
@@ -364,7 +377,7 @@ async function createWriteProbeRepository() {
       "-c",
       "user.name=Sol-Sol Probe",
       "-c",
-      "user.email=sol-sol-probe@example.invalid",
+        "user.email=sol-luna-probe@example.invalid",
       "commit",
       "--quiet",
       "-m",
@@ -375,16 +388,17 @@ async function createWriteProbeRepository() {
   return repository;
 }
 
-async function runImplementProbe(repository, sessionRoots) {
+async function runWriteProfileProbe(repository, sessionRoots, profileName) {
+  const expectedContent = `verified ${profileName} profile\n`;
   const executor = await invokeExecutor({
     briefing: [
       "Own only executor-probe.txt in this temporary repository.",
-      "Replace its complete contents with exactly: verified implement profile",
+      `Replace its complete contents with exactly: verified ${profileName} profile`,
       "Keep one trailing newline, run git diff --check, and do not modify any other file.",
-      "Return status completed, summary Sol implement workspace probe completed, changed_files containing exactly executor-probe.txt, checks containing exactly git_diff_check:passed, and no blockers or warnings.",
+      `Return status completed, summary ${profileName} workspace probe completed, changed_files containing exactly executor-probe.txt, checks containing exactly git_diff_check:passed, and no blockers or warnings.`,
     ].join("\n"),
     options: {
-      profile: "implement",
+      profile: profileName,
       cwd: repository,
       sandboxMode: "workspace-write",
       timeoutSeconds: 300,
@@ -393,21 +407,29 @@ async function runImplementProbe(repository, sessionRoots) {
   });
   verifyExecutorResultSchema(executor.result);
   if (executor.exitCode !== 0) {
-    throw new Error(`The Sol implement probe failed: ${executor.result.summary}`);
+    throw new Error(`The ${profileName} probe failed: ${executor.result.summary}`);
   }
-  verifyProfileRouting(executor.result, "implement");
+  verifyProfileRouting(executor.result, profileName);
   const probeContent = (await readFile(join(repository, "executor-probe.txt"), "utf8")).replace(
     /\r\n/g,
     "\n",
   );
   if (
-    probeContent !== "verified implement profile\n" ||
+    probeContent !== expectedContent ||
     JSON.stringify(executor.result.changed_files) !== JSON.stringify(["executor-probe.txt"]) ||
     JSON.stringify(executor.result.checks) !== JSON.stringify(["git_diff_check:passed"])
   ) {
-    throw new Error("The Sol implement probe did not prove bounded workspace-write access.");
+    throw new Error(`The ${profileName} probe did not prove bounded workspace-write access.`);
   }
   return executor.result;
+}
+
+async function runImplementLiteProbe(repository, sessionRoots) {
+  return runWriteProfileProbe(repository, sessionRoots, "implement-lite");
+}
+
+async function runImplementProbe(repository, sessionRoots) {
+  return runWriteProfileProbe(repository, sessionRoots, "implement");
 }
 
 async function runReviewProbe(repository, sessionRoots) {
@@ -443,14 +465,65 @@ async function runReviewProbe(repository, sessionRoots) {
   return executor.result;
 }
 
+async function runPlaywrightProbe(repositoryRoot, sessionRoots) {
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end(
+      "<!doctype html><html><body><h1>Sol-Luna Playwright probe</h1><button id=action onclick=\"document.querySelector('#status').textContent='verified'\">Run check</button><p id=status>pending</p></body></html>",
+    );
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  const url = `http://127.0.0.1:${address.port}/`;
+  const beforeStatus = await gitStatus(repositoryRoot);
+  try {
+    const executor = await invokeExecutor({
+      briefing: [
+        `Use the Playwright MCP to open ${url}`,
+        "Verify the h1 text is Sol-Luna Playwright probe, click #action, verify #status becomes verified, and take one screenshot.",
+        "Do not modify repository files. Return completed, no changed files, at least two concise evidence checks, and no blockers or warnings.",
+      ].join("\n"),
+      options: {
+        profile: "playwright",
+        cwd: repositoryRoot,
+        sandboxMode: "read-only",
+        timeoutSeconds: 300,
+      },
+      sessionRoots,
+    });
+    verifyExecutorResultSchema(executor.result);
+    if (executor.exitCode !== 0) {
+      throw new Error(`The Playwright probe failed: ${executor.result.summary}`);
+    }
+    verifyProfileRouting(executor.result, "playwright");
+    if (
+      executor.result.changed_files.length !== 0 ||
+      !executor.result.checks.includes("playwright_mcp:verified") ||
+      executor.result.checks.length < 3 ||
+      (await gitStatus(repositoryRoot)) !== beforeStatus
+    ) {
+      throw new Error("The Playwright probe did not prove isolated MCP browser access.");
+    }
+    return executor.result;
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
+}
+
 async function runExecutorProbes(repositoryRoot, sessionRoots) {
+  const liteRepository = await createWriteProbeRepository();
   const writeRepository = await createWriteProbeRepository();
   try {
     const explore = await runExploreProbe(repositoryRoot, sessionRoots);
+    const implementLite = await runImplementLiteProbe(liteRepository, sessionRoots);
+    const playwright = await runPlaywrightProbe(repositoryRoot, sessionRoots);
     const implement = await runImplementProbe(writeRepository, sessionRoots);
     const review = await runReviewProbe(writeRepository, sessionRoots);
-    return { explore, implement, review };
+    return { explore, implement_lite: implementLite, playwright, implement, review };
   } finally {
+    await rm(liteRepository, { recursive: true, force: true });
     await rm(writeRepository, { recursive: true, force: true });
   }
 }
@@ -655,6 +728,101 @@ async function runRepositoryIsolationProbe() {
   }
 }
 
+function capacityExecution(lease) {
+  const profile = EXECUTOR_PROFILES[lease.profile];
+  return {
+    exitCode: 0,
+    result: {
+      status: "completed",
+      profile: profile.name,
+      thread_id: `capacity-${lease.run_id}`,
+      model: profile.model,
+      reasoning_effort: profile.reasoningEffort,
+      service_tier: profile.serviceTier,
+      routing_verified: true,
+    },
+  };
+}
+
+async function runCapacityProbe() {
+  const repository = await mkdtemp(join(tmpdir(), "sol-luna-capacity-probe-"));
+  await execFileAsync("git", ["init", "--quiet"], { cwd: repository, windowsHide: true });
+  const leases = [];
+  try {
+    const initial = await getOrchestrationStatus(repository);
+    if (initial.capacity.machine.total !== 0) {
+      throw new Error("The machine executor pool is already in use; capacity verification requires an idle pool.");
+    }
+
+    for (let index = 0; index < EXECUTOR_CAPACITY_LIMITS.playwright; index += 1) {
+      leases.push(
+        await beginExecutorRun({
+          cwd: repository,
+          profile: "playwright",
+          model: EXECUTOR_PROFILES.playwright.model,
+        }),
+      );
+    }
+    let thirdPlaywrightRejected = false;
+    try {
+      await beginExecutorRun({
+        cwd: repository,
+        profile: "playwright",
+        model: EXECUTOR_PROFILES.playwright.model,
+      });
+    } catch (error) {
+      thirdPlaywrightRejected = /Playwright executor capacity is full/.test(error.message);
+    }
+    if (!thirdPlaywrightRejected) {
+      throw new Error("The third concurrent Playwright lease was not rejected.");
+    }
+    while (leases.length > 0) {
+      const lease = leases.pop();
+      await finishExecutorRun(lease, capacityExecution(lease));
+    }
+
+    for (let index = 0; index < EXECUTOR_CAPACITY_LIMITS.luna; index += 1) {
+      leases.push(
+        await beginExecutorRun({
+          cwd: repository,
+          profile: "explore",
+          model: EXECUTOR_PROFILES.explore.model,
+        }),
+      );
+    }
+    for (let index = 0; index < EXECUTOR_CAPACITY_LIMITS.sol; index += 1) {
+      leases.push(
+        await beginExecutorRun({
+          cwd: repository,
+          profile: "review",
+          model: EXECUTOR_PROFILES.review.model,
+        }),
+      );
+    }
+    const saturated = await getOrchestrationStatus(repository);
+    if (
+      saturated.capacity.repository.luna !== EXECUTOR_CAPACITY_LIMITS.luna ||
+      saturated.capacity.repository.sol !== EXECUTOR_CAPACITY_LIMITS.sol ||
+      saturated.capacity.machine.total !== EXECUTOR_CAPACITY_LIMITS.total
+    ) {
+      throw new Error("Executor capacity did not reach the configured Luna, Sol, and total limits.");
+    }
+    return {
+      luna_limit: EXECUTOR_CAPACITY_LIMITS.luna,
+      sol_limit: EXECUTOR_CAPACITY_LIMITS.sol,
+      total_limit: EXECUTOR_CAPACITY_LIMITS.total,
+      playwright_limit: EXECUTOR_CAPACITY_LIMITS.playwright,
+      third_playwright_rejected: true,
+    };
+  } finally {
+    while (leases.length > 0) {
+      const lease = leases.pop();
+      await finishExecutorRun(lease, capacityExecution(lease));
+    }
+    await rm(repository, { recursive: true, force: true });
+  }
+}
+
 export async function verifyRouting(repositoryRoot = REPOSITORY_ROOT) {
   const beforeStatus = await gitStatus(repositoryRoot);
   const codexHome = process.env.CODEX_HOME
@@ -671,6 +839,7 @@ export async function verifyRouting(repositoryRoot = REPOSITORY_ROOT) {
   const ultraWorkspaceWrite = await runUltraWriteProbe(sessionRoots);
   const timeoutRecovery = await runTimeoutRecoveryProbe();
   const repositoryIsolation = await runRepositoryIsolationProbe();
+  const capacity = await runCapacityProbe();
 
   const afterStatus = await gitStatus(repositoryRoot);
   if (afterStatus !== beforeStatus) {
@@ -686,6 +855,7 @@ export async function verifyRouting(repositoryRoot = REPOSITORY_ROOT) {
       thread_id: rootProbe.threadId,
       model: rootProbe.routing.model,
       reasoning_effort: rootProbe.routing.reasoningEffort,
+      service_tier: rootProbe.routing.serviceTier,
     },
     executors,
     blocked_executor: blockedExecutor,
@@ -695,6 +865,7 @@ export async function verifyRouting(repositoryRoot = REPOSITORY_ROOT) {
       timeout_recovery: timeoutRecovery,
       repository_isolation: repositoryIsolation,
     },
+    capacity,
     skill,
     git_unchanged: true,
     hooks_json_unchanged: true,

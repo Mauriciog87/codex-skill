@@ -118,7 +118,7 @@ export async function evaluateHook(
   try {
     lock = await readLock(input.cwd, { environment });
   } catch (error) {
-    const reason = `Sol Ultra orchestration state is invalid and requires manual recovery: ${error.message}`;
+    const reason = `Sol-Luna Ultra orchestration state is invalid and requires manual recovery: ${error.message}`;
     return input.hook_event_name === "PreToolUse"
       ? blockedPreToolUse(reason)
       : sessionContext(reason);

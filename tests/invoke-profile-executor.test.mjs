@@ -1,17 +1,17 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   EXECUTOR_PROFILE_NAMES,
   EXECUTOR_PROFILES,
+  MODEL_VERBOSITY,
   getExecutorProfile,
-} from "../.agents/skills/sol-sol-orchestration/scripts/executor-profiles.mjs";
+} from "../.agents/skills/sol-luna-orchestration/scripts/executor-profiles.mjs";
 import {
   DEFAULT_SANDBOX_MODE,
   DEFAULT_TIMEOUT_SECONDS,
-  EXECUTOR_MODEL,
   ExecutorConfigurationError,
   ExecutorInvocationError,
   RoutingVerificationError,
@@ -23,27 +23,32 @@ import {
   parseArguments,
   runProcess,
   validateExecutorPayload,
+  verifyPlaywrightMcp,
   verifySessionRouting,
-} from "../.agents/skills/sol-sol-orchestration/scripts/invoke-sol-executor.mjs";
-import {
-  SOL_MODEL_VERBOSITY,
-  acquireUltraLock,
-  releaseUltraLock,
-} from "../.agents/skills/sol-sol-orchestration/scripts/orchestration-state.mjs";
+} from "../.agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs";
+import { acquireUltraLock, releaseUltraLock } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
 
 async function writeRoutingMetadata(
   sessionsRoot,
   threadId,
   effort,
-  model = EXECUTOR_MODEL,
+  model = "gpt-5.6-sol",
+  serviceTier = "default",
 ) {
   await mkdir(sessionsRoot, { recursive: true });
   await writeFile(
     join(sessionsRoot, `rollout-${threadId}.jsonl`),
-    `${JSON.stringify({
-      type: "turn_context",
-      payload: { model, effort },
-    })}\n`,
+    [
+      JSON.stringify({ type: "turn_context", payload: { model, effort } }),
+      JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "thread_settings_applied",
+          thread_settings: { model, reasoning_effort: effort, service_tier: serviceTier },
+        },
+      }),
+      "",
+    ].join("\n"),
   );
 }
 
@@ -59,6 +64,8 @@ function createProcessRunner(threadId, payload) {
       threadId,
       warnings: [],
       stderr: "",
+      playwrightMcpUsed: true,
+      unsafePlaywrightToolUsed: false,
     };
   };
 }
@@ -72,22 +79,33 @@ function profileOptions(cwd, profile) {
   };
 }
 
-test("executor profiles define the fixed effort and sandbox matrix", () => {
-  assert.deepEqual(EXECUTOR_PROFILE_NAMES, ["explore", "implement", "review"]);
+test("executor profiles define the fixed model, effort, tier, and sandbox matrix", () => {
+  assert.deepEqual(EXECUTOR_PROFILE_NAMES, [
+    "explore",
+    "implement-lite",
+    "playwright",
+    "implement",
+    "review",
+  ]);
   assert.deepEqual(
     Object.fromEntries(
       Object.entries(EXECUTOR_PROFILES).map(([name, profile]) => [
         name,
         {
           reasoningEffort: profile.reasoningEffort,
+          model: profile.model,
+          serviceTier: profile.serviceTier,
           sandboxMode: profile.sandboxMode,
+          fastMode: profile.fastMode,
         },
       ]),
     ),
     {
-      explore: { reasoningEffort: "medium", sandboxMode: "read-only" },
-      implement: { reasoningEffort: "high", sandboxMode: "workspace-write" },
-      review: { reasoningEffort: "high", sandboxMode: "read-only" },
+      explore: { reasoningEffort: "max", model: "gpt-5.6-luna", serviceTier: "fast", sandboxMode: "read-only", fastMode: true },
+      "implement-lite": { reasoningEffort: "max", model: "gpt-5.6-luna", serviceTier: "fast", sandboxMode: "workspace-write", fastMode: true },
+      playwright: { reasoningEffort: "max", model: "gpt-5.6-luna", serviceTier: "standard", sandboxMode: "read-only", fastMode: false },
+      implement: { reasoningEffort: "high", model: "gpt-5.6-sol", serviceTier: "standard", sandboxMode: "workspace-write", fastMode: false },
+      review: { reasoningEffort: "high", model: "gpt-5.6-sol", serviceTier: "standard", sandboxMode: "read-only", fastMode: false },
     },
   );
   assert.equal(getExecutorProfile("__proto__"), null);
@@ -138,6 +156,8 @@ test("parseArguments rejects unsafe, ambiguous, and mismatched invocations", () 
     ["--profile", "explore", "--sandbox", "unsupported"],
     ["--profile", "explore", "--sandbox", "workspace-write"],
     ["--profile", "review", "--sandbox", "workspace-write"],
+    ["--profile", "playwright", "--sandbox", "workspace-write"],
+    ["--profile", "implement-lite"],
     ["--profile", "implement"],
     ["--profile", "explore", "--timeout-seconds", "0"],
     ["--profile", "explore", "--unknown", "value"],
@@ -153,14 +173,16 @@ test("developer instructions identify the selected bounded profile", () => {
     assert.match(instructions, /^CODEX_ORCHESTRATION_ROLE=executor$/m);
     assert.match(instructions, new RegExp(`^CODEX_EXECUTOR_PROFILE=${profileName}$`, "m"));
     assert.match(instructions, new RegExp(`${profileName} executor at ${profile.reasoningEffort}`));
-    assert.match(instructions, /Do not invoke the sol-sol-orchestration skill/);
+    assert.match(instructions, /Do not invoke the sol-luna-orchestration skill/);
   }
   assert.match(createExecutorDeveloperInstructions("explore"), /path:line evidence/);
+  assert.match(createExecutorDeveloperInstructions("implement-lite"), /recommend the Sol implement profile/);
+  assert.match(createExecutorDeveloperInstructions("playwright"), /browser_run_code_unsafe/);
   assert.match(createExecutorDeveloperInstructions("implement"), /Do not self-approve/);
   assert.match(createExecutorDeveloperInstructions("review"), /REQUEST_CHANGES/);
 });
 
-test("buildCodexArguments pins the selected Sol profile without bypass flags", () => {
+test("buildCodexArguments pins each selected route without bypass flags", () => {
   for (const profileName of EXECUTOR_PROFILE_NAMES) {
     const profile = EXECUTOR_PROFILES[profileName];
     const args = buildCodexArguments({
@@ -170,21 +192,14 @@ test("buildCodexArguments pins the selected Sol profile without bypass flags", (
       schemaPath: resolve("schema.json"),
       outputPath: resolve("result.json"),
     });
-    assert.deepEqual(args.slice(0, 13), [
-      "-m",
-      EXECUTOR_MODEL,
-      "-c",
-      `model_reasoning_effort=${JSON.stringify(profile.reasoningEffort)}`,
-      "-c",
-      `model_verbosity=${JSON.stringify(SOL_MODEL_VERBOSITY)}`,
-      "-c",
-      "features.multi_agent=false",
-      "-c",
-      "agents.max_depth=1",
-      "-c",
-      "agents.max_threads=1",
-      "-c",
-    ]);
+    assert.deepEqual(args.slice(0, 2), ["-m", profile.model]);
+    assert.ok(args.includes(`model_reasoning_effort=${JSON.stringify(profile.reasoningEffort)}`));
+    assert.ok(args.includes(`model_verbosity=${JSON.stringify(MODEL_VERBOSITY)}`));
+    assert.ok(args.includes(`service_tier=${JSON.stringify(profile.configuredServiceTier)}`));
+    assert.ok(args.includes(`features.fast_mode=${profile.fastMode}`));
+    assert.ok(args.includes("features.multi_agent=false"));
+    assert.ok(args.includes("agents.max_depth=1"));
+    assert.ok(args.includes("agents.max_threads=1"));
     assert.ok(args.some((entry) => entry.includes(`CODEX_EXECUTOR_PROFILE=${profileName}`)));
     assert.ok(args.includes("exec"));
     assert.ok(args.includes("--json"));
@@ -235,6 +250,7 @@ test("createStableResult preserves the public property order and nullable profil
     "thread_id",
     "model",
     "reasoning_effort",
+    "service_tier",
     "routing_verified",
     "sandbox_mode",
     "summary",
@@ -246,6 +262,7 @@ test("createStableResult preserves the public property order and nullable profil
   assert.equal(result.profile, "explore");
   assert.equal(result.model, null);
   assert.equal(result.reasoning_effort, null);
+  assert.equal(result.service_tier, null);
   assert.equal(result.routing_verified, false);
   assert.equal(
     createStableResult({ status: "failed", summary: "Invalid invocation." }).profile,
@@ -273,26 +290,34 @@ test("runProcess terminates a timed-out child", async () => {
 });
 
 test("verifySessionRouting accepts profile efforts and reports mismatches", async (context) => {
-  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-sol-routing-test-"));
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-luna-routing-test-"));
   context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const sessionsRoot = join(temporaryRoot, "sessions");
 
   for (const [profileName, profile] of Object.entries(EXECUTOR_PROFILES)) {
     const threadId = `valid-${profileName}`;
-    await writeRoutingMetadata(sessionsRoot, threadId, profile.reasoningEffort);
+    await writeRoutingMetadata(
+      sessionsRoot,
+      threadId,
+      profile.reasoningEffort,
+      profile.model,
+      profile.configuredServiceTier,
+    );
     const routing = await verifySessionRouting(
       threadId,
-      EXECUTOR_MODEL,
+      profile.model,
       profile.reasoningEffort,
+      profile.serviceTier,
       { sessionRoots: [sessionsRoot], attempts: 1 },
     );
-    assert.equal(routing.model, EXECUTOR_MODEL);
+    assert.equal(routing.model, profile.model);
     assert.equal(routing.reasoningEffort, profile.reasoningEffort);
+    assert.equal(routing.serviceTier, profile.serviceTier);
   }
 
   await writeRoutingMetadata(sessionsRoot, "invalid-model", "medium", "gpt-5.5");
   await assert.rejects(
-    verifySessionRouting("invalid-model", EXECUTOR_MODEL, "medium", {
+    verifySessionRouting("invalid-model", "gpt-5.6-sol", "medium", "standard", {
       sessionRoots: [sessionsRoot],
       attempts: 1,
     }),
@@ -300,39 +325,79 @@ test("verifySessionRouting accepts profile efforts and reports mismatches", asyn
   );
   await writeRoutingMetadata(sessionsRoot, "invalid-effort", "xhigh");
   await assert.rejects(
-    verifySessionRouting("invalid-effort", EXECUTOR_MODEL, "medium", {
+    verifySessionRouting("invalid-effort", "gpt-5.6-sol", "medium", "standard", {
       sessionRoots: [sessionsRoot],
       attempts: 1,
     }),
     RoutingVerificationError,
   );
   await assert.rejects(
-    verifySessionRouting("missing", EXECUTOR_MODEL, "medium", {
+    verifySessionRouting("missing", "gpt-5.6-sol", "medium", "standard", {
       sessionRoots: [sessionsRoot],
       attempts: 1,
     }),
     RoutingVerificationError,
   );
+  await writeFile(
+    join(sessionsRoot, "rollout-missing-tier.jsonl"),
+    `${JSON.stringify({
+      type: "turn_context",
+      payload: { model: "gpt-5.6-sol", effort: "high" },
+    })}\n`,
+  );
+  await assert.rejects(
+    verifySessionRouting("missing-tier", "gpt-5.6-sol", "high", "standard", {
+      sessionRoots: [sessionsRoot],
+      attempts: 1,
+    }),
+    /No thread_settings_applied service tier metadata/,
+  );
+  await writeRoutingMetadata(
+    sessionsRoot,
+    "invalid-tier",
+    "high",
+    "gpt-5.6-sol",
+    "fast",
+  );
+  await assert.rejects(
+    verifySessionRouting("invalid-tier", "gpt-5.6-sol", "high", "standard", {
+      sessionRoots: [sessionsRoot],
+      attempts: 1,
+    }),
+    (error) =>
+      error instanceof RoutingVerificationError && error.actualServiceTier === "fast",
+  );
 });
 
 test("invokeExecutor returns verified profile metadata and status exit codes", async (context) => {
-  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-sol-invoke-test-"));
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-luna-invoke-test-"));
   context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const sessionsRoot = join(temporaryRoot, "sessions");
 
-  for (const profileName of ["explore", "implement"]) {
+  for (const profileName of EXECUTOR_PROFILE_NAMES) {
     const profile = EXECUTOR_PROFILES[profileName];
     const threadId = `${profileName}-completed`;
-    await writeRoutingMetadata(sessionsRoot, threadId, profile.reasoningEffort);
-    const changedFiles = profileName === "implement" ? ["assigned.mjs"] : [];
+    await writeRoutingMetadata(
+      sessionsRoot,
+      threadId,
+      profile.reasoningEffort,
+      profile.model,
+      profile.configuredServiceTier,
+    );
+    const changedFiles = ["implement-lite", "implement"].includes(profileName)
+      ? ["assigned.mjs"]
+      : [];
     const execution = await invokeExecutor({
       briefing: "Complete the bounded test task.",
       options: profileOptions(temporaryRoot, profileName),
       coordinationOptions: { homeDirectory: temporaryRoot },
       sessionRoots: [sessionsRoot],
+      playwrightMcpVerifier: async () => ({ enabled: true }),
       processRunner: createProcessRunner(threadId, {
         status: "completed",
-        summary: `${profileName} completed.`,
+        summary: profileName === "review"
+          ? "APPROVE: Review completed."
+          : `${profileName} completed.`,
         changed_files: changedFiles,
         checks: [],
         blockers: [],
@@ -341,15 +406,16 @@ test("invokeExecutor returns verified profile metadata and status exit codes", a
     });
     assert.equal(execution.exitCode, 0);
     assert.equal(execution.result.profile, profileName);
-    assert.equal(execution.result.model, EXECUTOR_MODEL);
+    assert.equal(execution.result.model, profile.model);
     assert.equal(execution.result.reasoning_effort, profile.reasoningEffort);
+    assert.equal(execution.result.service_tier, profile.serviceTier);
     assert.equal(execution.result.routing_verified, true);
     assert.deepEqual(execution.result.changed_files, changedFiles);
   }
 });
 
 test("review verdicts enforce status, blockers, and exit codes", async (context) => {
-  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-sol-review-test-"));
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-luna-review-test-"));
   context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const sessionsRoot = join(temporaryRoot, "sessions");
   let sequence = 0;
@@ -422,11 +488,17 @@ test("review verdicts enforce status, blockers, and exit codes", async (context)
 });
 
 test("read-only profiles reject reported file changes", async (context) => {
-  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-sol-read-only-test-"));
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-luna-read-only-test-"));
   context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const sessionsRoot = join(temporaryRoot, "sessions");
   const threadId = "explore-reported-change";
-  await writeRoutingMetadata(sessionsRoot, threadId, "medium");
+  await writeRoutingMetadata(
+    sessionsRoot,
+    threadId,
+    "max",
+    "gpt-5.6-luna",
+    "fast",
+  );
   const execution = await invokeExecutor({
     briefing: "Explore the bounded test target.",
     options: profileOptions(temporaryRoot, "explore"),
@@ -446,7 +518,7 @@ test("read-only profiles reject reported file changes", async (context) => {
 });
 
 test("invokeExecutor preserves profile without claiming routing after process failure", async (context) => {
-  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-sol-process-failure-test-"));
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-luna-process-failure-test-"));
   context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const execution = await invokeExecutor({
     briefing: "Complete the bounded test task.",
@@ -466,15 +538,16 @@ test("invokeExecutor preserves profile without claiming routing after process fa
   assert.equal(execution.result.profile, "explore");
   assert.equal(execution.result.model, null);
   assert.equal(execution.result.reasoning_effort, null);
+  assert.equal(execution.result.service_tier, null);
   assert.equal(execution.result.routing_verified, false);
 });
 
 test("invokeExecutor returns actual metadata and exit code 2 for routing mismatch", async (context) => {
-  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-sol-mismatch-test-"));
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-luna-mismatch-test-"));
   context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const sessionsRoot = join(temporaryRoot, "sessions");
   const threadId = "mismatched-thread";
-  await writeRoutingMetadata(sessionsRoot, threadId, "high", "gpt-5.5");
+  await writeRoutingMetadata(sessionsRoot, threadId, "high", "gpt-5.5", "default");
   const execution = await invokeExecutor({
     briefing: "Complete the bounded test task.",
     options: profileOptions(temporaryRoot, "explore"),
@@ -493,11 +566,115 @@ test("invokeExecutor returns actual metadata and exit code 2 for routing mismatc
   assert.equal(execution.result.profile, "explore");
   assert.equal(execution.result.model, "gpt-5.5");
   assert.equal(execution.result.reasoning_effort, "high");
+  assert.equal(execution.result.service_tier, "standard");
   assert.equal(execution.result.routing_verified, false);
 });
 
+test("verifyPlaywrightMcp requires an enabled stdio server", async () => {
+  const valid = await verifyPlaywrightMcp({
+    processRunner: async () => ({
+      exitCode: 0,
+      timedOut: false,
+      aborted: false,
+      stdout: JSON.stringify({
+        name: "playwright",
+        enabled: true,
+        transport: { type: "stdio" },
+      }),
+      stderr: "",
+    }),
+  });
+  assert.equal(valid.enabled, true);
+  await assert.rejects(
+    verifyPlaywrightMcp({
+      processRunner: async () => ({
+        exitCode: 0,
+        timedOut: false,
+        aborted: false,
+        stdout: JSON.stringify({ name: "playwright", enabled: false }),
+        stderr: "",
+      }),
+    }),
+    ExecutorConfigurationError,
+  );
+});
+
+test("playwright profile verifies MCP use and removes its temporary output", async (context) => {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-luna-playwright-test-"));
+  context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const sessionsRoot = join(temporaryRoot, "sessions");
+  const threadId = "playwright-completed";
+  await writeRoutingMetadata(
+    sessionsRoot,
+    threadId,
+    "max",
+    "gpt-5.6-luna",
+    "default",
+  );
+  let outputDirectory;
+  const delegate = createProcessRunner(threadId, {
+    status: "completed",
+    summary: "Browser check completed.",
+    changed_files: [],
+    checks: ["page inspected"],
+    blockers: [],
+    warnings: [],
+  });
+  const execution = await invokeExecutor({
+    briefing: "Inspect the local test page.",
+    options: profileOptions(temporaryRoot, "playwright"),
+    coordinationOptions: { homeDirectory: temporaryRoot },
+    sessionRoots: [sessionsRoot],
+    playwrightMcpVerifier: async () => ({ enabled: true }),
+    processRunner: async (command, args, options) => {
+      outputDirectory = options.environment.PLAYWRIGHT_MCP_OUTPUT_DIR;
+      assert.equal(options.environment.PLAYWRIGHT_MCP_ISOLATED, "true");
+      return delegate(command, args, options);
+    },
+  });
+  assert.equal(execution.exitCode, 0);
+  assert.ok(execution.result.checks.includes("playwright_mcp:verified"));
+  await assert.rejects(access(outputDirectory), { code: "ENOENT" });
+});
+
+test("playwright profile rejects missing or unsafe MCP evidence", async (context) => {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-luna-playwright-evidence-"));
+  context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const sessionsRoot = join(temporaryRoot, "sessions");
+  for (const [threadId, processFields, expected] of [
+    ["playwright-missing", { playwrightMcpUsed: false }, /did not emit/],
+    ["playwright-unsafe", { unsafePlaywrightToolUsed: true }, /browser_run_code_unsafe/],
+  ]) {
+    await writeRoutingMetadata(
+      sessionsRoot,
+      threadId,
+      "max",
+      "gpt-5.6-luna",
+      "default",
+    );
+    const baseRunner = createProcessRunner(threadId, {
+      status: "completed",
+      summary: "Browser check completed.",
+      changed_files: [],
+      checks: [],
+      blockers: [],
+      warnings: [],
+    });
+    const execution = await invokeExecutor({
+      briefing: "Inspect the local test page.",
+      options: profileOptions(temporaryRoot, "playwright"),
+      coordinationOptions: { homeDirectory: temporaryRoot },
+      sessionRoots: [sessionsRoot],
+      playwrightMcpVerifier: async () => ({ enabled: true }),
+      processRunner: async (...args) => ({ ...(await baseRunner(...args)), ...processFields }),
+    });
+    assert.equal(execution.exitCode, 2);
+    assert.match(execution.result.summary, expected);
+  }
+});
+
 test("invokeExecutor returns stable exit code 2 while Ultra owns the repository", async (context) => {
-  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-sol-locked-executor-test-"));
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-luna-locked-executor-test-"));
   context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const lock = await acquireUltraLock({
     cwd: temporaryRoot,

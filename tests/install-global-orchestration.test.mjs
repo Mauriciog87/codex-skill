@@ -19,13 +19,15 @@ import {
   MANAGED_HOOKS_END,
   MANAGED_HOOKS_START,
   SKILL_NAME,
+  TERRA_LEGACY_SKILL_NAME,
   installGlobalOrchestration,
   updateGlobalConfig,
   updateGlobalInstructions,
 } from "../scripts/install-global-orchestration.mjs";
 
-const NEW_DISPLAY_NAME = "Sol-Sol Orchestration";
-const LEGACY_DISPLAY_NAME = "Sol-Terra Orchestration";
+const NEW_DISPLAY_NAME = "Sol-Luna Orchestration";
+const LEGACY_DISPLAY_NAME = "Sol-Sol Orchestration";
+const TERRA_LEGACY_DISPLAY_NAME = "Sol-Terra Orchestration";
 
 async function createSkill(
   skillDirectory,
@@ -100,11 +102,13 @@ test("updateGlobalConfig preserves unrelated values and is idempotent", () => {
   assert.match(first.content, /^model = "gpt-5\.6-sol"\r$/m);
   assert.match(first.content, /^model_reasoning_effort = "xhigh"\r$/m);
   assert.match(first.content, /^model_verbosity = "low"\r$/m);
+  assert.match(first.content, /^service_tier = "default"\r$/m);
   assert.match(first.content, /^plan_mode_reasoning_effort = "xhigh"\r$/m);
   assert.match(first.content, /^\[agents\]\r$/m);
   assert.match(first.content, /^max_depth = 1\r$/m);
   assert.match(first.content, /^max_threads = 4\r$/m);
   assert.match(first.content, /^codex_hooks = true\r$/m);
+  assert.match(first.content, /^fast_mode = false\r$/m);
   assert.equal(updateGlobalConfig(first.content).changed, false);
   assert.throws(
     () => updateGlobalConfig('model = "one"\nmodel = "two"\n'),
@@ -124,6 +128,7 @@ test("updateGlobalConfig manages hooks without replacing unrelated hook sources"
   ].join("\n");
   const first = updateGlobalConfig(original, { hookScriptPath });
   assert.match(first.content, /^hooks = true$/m);
+  assert.match(first.content, /^fast_mode = false$/m);
   assert.match(first.content, new RegExp(MANAGED_HOOKS_START));
   assert.match(first.content, new RegExp(MANAGED_HOOKS_END));
   assert.match(first.content, /^\[\[hooks\.SessionStart\]\]$/m);
@@ -133,7 +138,7 @@ test("updateGlobalConfig manages hooks without replacing unrelated hook sources"
   assert.equal(updateGlobalConfig(first.content, { hookScriptPath }).changed, false);
   assert.throws(
     () => updateGlobalConfig(`${MANAGED_HOOKS_START}\n`, { hookScriptPath }),
-    /malformed Sol-Sol hook markers/,
+    /malformed Sol-Luna hook markers/,
   );
 });
 
@@ -142,7 +147,7 @@ test("updateGlobalInstructions manages one exact block and rejects conflicts", (
   assert.equal(first.changed, true);
   assert.match(first.content, new RegExp(MANAGED_BLOCK_START));
   assert.match(first.content, new RegExp(MANAGED_BLOCK_END));
-  assert.match(first.content, /\$sol-sol-orchestration/);
+  assert.match(first.content, /\$sol-luna-orchestration/);
   assert.equal(updateGlobalInstructions(first.content).changed, false);
   assert.throws(
     () => updateGlobalInstructions(`${MANAGED_BLOCK_START}\nmissing end\n`),
@@ -150,8 +155,13 @@ test("updateGlobalInstructions manages one exact block and rejects conflicts", (
   );
   assert.throws(
     () => updateGlobalInstructions("Use $sol-terra-orchestration globally.\n"),
-    /unmanaged Sol-Terra/,
+    /unmanaged legacy orchestration/,
   );
+  const migrated = updateGlobalInstructions(
+    "<!-- sol-sol-orchestration:start -->\nold block\n<!-- sol-sol-orchestration:end -->\n",
+  );
+  assert.match(migrated.content, new RegExp(MANAGED_BLOCK_START));
+  assert.doesNotMatch(migrated.content, /<!-- sol-sol-orchestration:start -->/);
 });
 
 test("installGlobalOrchestration is idempotent and removes a validated legacy copy", async (context) => {
@@ -160,6 +170,11 @@ test("installGlobalOrchestration is idempotent and removes a validated legacy co
   await createSkill(legacySkill, {
     name: LEGACY_SKILL_NAME,
     displayName: LEGACY_DISPLAY_NAME,
+  });
+  const terraLegacySkill = join(fixture.codexHome, "skills", TERRA_LEGACY_SKILL_NAME);
+  await createSkill(terraLegacySkill, {
+    name: TERRA_LEGACY_SKILL_NAME,
+    displayName: TERRA_LEGACY_DISPLAY_NAME,
   });
 
   const first = await installGlobalOrchestration({
@@ -170,9 +185,10 @@ test("installGlobalOrchestration is idempotent and removes a validated legacy co
   assert.equal(first.already_linked, false);
   assert.equal(first.configuration_changed, true);
   assert.equal(first.instructions_changed, true);
-  assert.deepEqual(first.legacy_removed, [legacySkill]);
+  assert.deepEqual(first.legacy_removed, [legacySkill, terraLegacySkill]);
   assert.equal(await realpath(first.global_skill), await realpath(fixture.canonicalSkill));
   await assert.rejects(lstat(legacySkill), { code: "ENOENT" });
+  await assert.rejects(lstat(terraLegacySkill), { code: "ENOENT" });
   assert.match(await readFile(fixture.configPath, "utf8"), /^model = "gpt-5\.6-sol"$/m);
   assert.match(await readFile(fixture.configPath, "utf8"), /^model_verbosity = "low"$/m);
   assert.match(await readFile(fixture.configPath, "utf8"), /^codex_hooks = true$/m);
@@ -206,7 +222,7 @@ test("installGlobalOrchestration rejects damaged hook markers without partial ch
       homeDirectory: fixture.homeDirectory,
       codexHome: fixture.codexHome,
     }),
-    /malformed Sol-Sol hook markers/,
+    /malformed Sol-Luna hook markers/,
   );
   await assert.rejects(
     lstat(join(fixture.homeDirectory, ".agents", "skills", SKILL_NAME)),
@@ -229,7 +245,7 @@ test("installGlobalOrchestration updates a nonempty AGENTS.override.md", async (
     codexHome: fixture.codexHome,
   });
   assert.equal(result.global_instructions, overridePath);
-  assert.match(await readFile(overridePath, "utf8"), /\$sol-sol-orchestration/);
+  assert.match(await readFile(overridePath, "utf8"), /\$sol-luna-orchestration/);
   assert.equal(await readFile(fixture.agentsPath, "utf8"), originalAgents);
 });
 

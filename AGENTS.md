@@ -1,55 +1,79 @@
-# Sol-Sol orchestration
+# Sol-Luna orchestration
 
-The root Codex session is the orchestrator. At the beginning of every new substantive task, it must explicitly invoke `$sol-sol-orchestration` before planning, delegating, or editing. A session whose developer instructions contain `CODEX_ORCHESTRATION_ROLE=executor` is an executor and must not invoke the skill or apply the orchestrator workflow. A session marked `CODEX_ORCHESTRATION_ROLE=ultra-orchestrator` owns an already authorized exclusive takeover and must not acquire another one.
+The root Codex session is the orchestrator. At the beginning of every new substantive task, explicitly invoke `$sol-luna-orchestration` before planning, delegating, or editing. A session whose developer instructions contain `CODEX_ORCHESTRATION_ROLE=executor` is an executor and must not invoke the skill or apply the root workflow. A session marked `CODEX_ORCHESTRATION_ROLE=ultra-orchestrator` owns an already authorized exclusive takeover and must not acquire another one.
 
 ## Model roles
 
-- Orchestrator and planner: `gpt-5.6-sol` with `xhigh` reasoning.
-- `explore` executor: `gpt-5.6-sol` with `medium` reasoning and `read-only` sandbox.
-- `implement` executor: `gpt-5.6-sol` with `high` reasoning and explicitly requested `workspace-write` sandbox.
-- `review` executor: `gpt-5.6-sol` with `high` reasoning and `read-only` sandbox.
-- Exceptional takeover: `gpt-5.6-sol` with `ultra` reasoning and a human-confirmed repository lock.
+| Role | Model | Effort | Tier | Sandbox |
+|---|---|---|---|---|
+| Root and planner | `gpt-5.6-sol` | `xhigh` | Standard | Current session |
+| `explore` | `gpt-5.6-luna` | `max` | Fast | `read-only` |
+| `implement-lite` | `gpt-5.6-luna` | `max` | Fast | Explicit `workspace-write` |
+| `playwright` | `gpt-5.6-luna` | `max` | Standard | `read-only` for repository files |
+| `implement` | `gpt-5.6-sol` | `high` | Standard | Explicit `workspace-write` |
+| `review` | `gpt-5.6-sol` | `high` | Standard | `read-only` |
+| Exceptional takeover | `gpt-5.6-sol` | `ultra` | Standard | Human-confirmed repository lock |
 
-Every role uses `model_verbosity = "low"`. Verbosity controls response length and remains independent from each role's reasoning effort.
+Every role uses `model_verbosity = "low"`. Fast profiles force `features.fast_mode = true`; Standard roles force it to `false`. Verbosity controls response length independently from reasoning effort.
 
-All executor work must use `node .agents/skills/sol-sol-orchestration/scripts/invoke-sol-executor.mjs --profile explore|implement|review [options]` with a bounded briefing on stdin. The profile is mandatory and fixes the reasoning effort and sandbox policy. Use the direct Node command when exit-code fidelity matters; npm 11 normalizes failed lifecycle scripts and can consume forwarded options unless given an additional separator.
+All executor work must use:
 
-Do not use native `spawn_agent` or a custom agent TOML for executor routing. Reconsider native spawning only after the tool exposes `agent_role` and live routing tests prove every required Sol profile and effort.
+```text
+node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile explore|implement-lite|playwright|implement|review [options]
+```
+
+The briefing is read from stdin. The profile fixes model, reasoning effort, tier, and sandbox. Do not use native `spawn_agent` or custom agent TOML for executor routing. Reconsider native spawning only after it exposes role-specific routing and live tests prove every required model, effort, and tier.
+
+## Concurrency
+
+- Luna profiles share a limit of 10 executors per repository and 10 across the PC.
+- Sol profiles share a limit of 4 executors per repository and 4 across the PC.
+- The machine-wide aggregate limit is 14.
+- Playwright consumes Luna capacity and has a separate machine-wide limit of 2.
+- Root and Ultra are excluded; executors started by Ultra are included.
+- These are maximum capacities, not fan-out targets. Delegate only useful independent scopes.
+- Run overlapping writes sequentially.
+
+The launchers acquire atomic repository and machine leases and fail immediately with code `2` when a pool is full. Inspect utilization through `orchestration-gate.mjs status`. Never manually edit state.
 
 ## Exclusive Ultra takeover
 
-Use Ultra only for a named decision that root Sol/xhigh cannot resolve responsibly. Activation requires a nonempty `--reason` and `--confirm-exclusive-takeover`. The canonical launcher is `node .agents/skills/sol-sol-orchestration/scripts/invoke-sol-ultra.mjs`; `npm run ultra` is only a convenience command.
+Use Ultra only for a named decision that root Sol/xhigh cannot resolve responsibly. Activation requires a nonempty `--reason` and `--confirm-exclusive-takeover`. The canonical launcher is:
 
-The lock is repository-scoped and has no time-based expiry. Normal executors and unrelated sessions must stop while it exists. Ultra may run only verified profile executors that inherit the matching `CODEX_ORCHESTRATION_LOCK_ID`; it must still serialize overlapping writes. A verified terminal result releases the lock. Timeout, interruption, process, contract, or routing failure leaves `recovery-required`.
+```text
+node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs
+```
 
-Inspect state with `node .agents/skills/sol-sol-orchestration/scripts/orchestration-gate.mjs status --cwd <repository>`. Recover only after the owner process stops, using `recover --cwd <repository> --lock-id <exact-lock-id>`. Never remove state manually.
+The repository lock has no time-based expiry. Normal executors and unrelated sessions stop while it exists. Ultra may run only verified profiles carrying the matching `CODEX_ORCHESTRATION_LOCK_ID`; those executors consume the normal capacity pools and still serialize overlapping writes. A verified terminal result releases the lock. Timeout, interruption, process, contract, or routing failure leaves `recovery-required`.
 
-Global SessionStart and PreToolUse hooks surface and enforce the lock where Codex supports interception. They are defense in depth and do not replace the launcher lock or repository policy.
+Inspect or recover only through:
+
+```text
+node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs status --cwd <repository>
+node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs recover --cwd <repository> --lock-id <exact-lock-id>
+```
 
 ## Orchestrator responsibilities
 
-1. Own planning, acceptance criteria, risks, task boundaries, integration, and final verification.
-2. Keep small, tightly coupled, sensitive, or architecture-heavy work in the root session.
-3. Use `explore` for broad discovery or contract tracing that would materially grow root context.
-4. Use `implement` only for explicit, non-overlapping file or subsystem ownership.
-5. Use `review` for an independent critique of a named plan or for high-risk, security-sensitive, architectural, public-API, migration, concurrency, or difficult-to-validate changes.
-6. Run no more than three independent executors concurrently and run overlapping writes sequentially.
-7. Inspect executor evidence instead of repeating discovery unless verification is necessary.
-8. Request human-confirmed Ultra takeover only for an explicit exceptional reason, then pause this root while Ultra owns the repository.
+1. Own planning, acceptance criteria, risk, task boundaries, integration, and final verification.
+2. Keep tightly coupled, sensitive, or architecture-heavy work in the root.
+3. Use `explore` for broad discovery that would materially grow root context.
+4. Use `implement-lite` only for small, explicit, low-risk edits without architecture or security judgment.
+5. Use `playwright` for isolated browser evidence and authorized test interactions.
+6. Use `implement` for bounded changes needing stronger engineering judgment.
+7. Use `review` for independent critique of a named plan or high-risk Git change.
+8. Inspect executor evidence instead of repeating discovery unless verification requires it.
+9. Request Ultra only for an explicit exceptional reason and pause while it owns the repository.
 
 ## Executor responsibilities
 
 1. Complete only the briefing and preserve unrelated changes.
 2. Follow the selected profile, applicable project instructions, and assigned sandbox.
 3. Do not re-delegate, launch another Codex session, alter orchestration or approval policy, use bypasses, commit, or push.
-4. Return the required structured result with profile-appropriate changed files, checks, blockers, and warnings.
+4. Return the required structured result with changed files, checks, blockers, and warnings.
 
-`explore` must return no changed files and must block rather than make architecture, security, concurrency, distributed-invariant, or contradictory-contract decisions. `implement` must not self-approve. `review` must return `APPROVE` or `COMMENT` with completed status, or `REQUEST_CHANGES` with blocked status and at least one blocker.
+`explore` returns no changed files and escalates architectural, security, concurrency, distributed-invariant, or contradictory-contract decisions. `implement-lite` escalates expanded or cross-cutting work to `implement`. Neither implementation profile self-approves. `review` returns `APPROVE` or `COMMENT` with completed status, or `REQUEST_CHANGES` with blocked status and at least one blocker.
 
-The launcher disables multi-agent execution and verifies `turn_context`. An unverified model, a model other than `gpt-5.6-sol`, or an effort different from the selected profile is a routing failure. System, developer, user, security, and more-specific project instructions take precedence over this policy.
+`playwright` keeps repository files unchanged, uses the configured Playwright MCP in an isolated temporary environment, and never calls `browser_run_code_unsafe`. Full interaction is limited to localhost and named dev/test targets. External state changes require explicit destination-specific authorization, and purchases, deletion, publishing, messaging, account/security changes, or production mutation are prohibited.
 
-## User-visible routing messages
-
-Routing messages are part of the orchestrator interface. Write them in concise, natural technical US English. Before a launch, identify the separate executor or exclusive Ultra takeover and state the requested model, reasoning effort, and sandbox. After completion, report the recorded model and reasoning effort only when rollout verification returns `routing_verified: true`. If verification fails, say so without claiming a route. Do not describe executor creation as switching the root session's model.
-
-The launchers write lifecycle messages to stderr and reserve stdout for the single JSON result. Root sessions must surface the corresponding message in commentary when the tool path does not expose stderr directly. Avoid hype, filler, sycophancy, generic conclusions, and vague status language.
+The launcher verifies rollout metadata for model, effort, and service tier. An absent or mismatched value is a routing failure. System, developer, security, user, and more-specific project instructions take precedence over this policy.

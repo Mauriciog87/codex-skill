@@ -1,214 +1,149 @@
-# Verified Sol-Sol orchestration for Codex
+# Verified Sol-Luna orchestration for Codex
 
-This repository configures Codex to use GPT-5.6 Sol as one orchestrator and three verified executor profiles:
+This repository provides a small, dependency-free orchestration layer for Codex. It keeps planning and integration on GPT-5.6 Sol, moves bounded work to verified Sol or Luna profiles, and checks the model, reasoning effort, and service tier recorded by each Codex session before accepting its result.
 
-| Role | Model | Reasoning | Verbosity | Sandbox |
-| --- | --- | --- | --- | --- |
-| Root orchestrator and planner | `gpt-5.6-sol` | `xhigh` | `low` | Task-specific |
-| `explore` | `gpt-5.6-sol` | `medium` | `low` | `read-only` |
-| `implement` | `gpt-5.6-sol` | `high` | `low` | Explicit `workspace-write` |
-| `review` | `gpt-5.6-sol` | `high` | `low` | `read-only` |
-| Exceptional Ultra takeover | `gpt-5.6-sol` | `ultra` | `low` | Explicit per takeover |
+The launchers use separate `codex exec` processes instead of native subagent routing. That keeps each route explicit and independently verifiable while native multi-agent execution remains disabled.
 
-The launcher does not trust configuration or model self-reporting. It starts `codex exec`, captures the thread ID, reads the session rollout, and rejects the run unless `turn_context` records the model and reasoning effort fixed by the selected profile.
+## Roles
 
-All roles pin `model_verbosity = "low"` for concise output without reducing their configured reasoning effort.
+| Role | Model | Effort | Tier | Access | Best use |
+|---|---|---|---|---|---|
+| Root | Sol | xhigh | Standard | Current session | Planning, delegation, integration, final validation |
+| `explore` | Luna | max | Fast | Read-only | Repository discovery, documentation, contract tracing |
+| `implement-lite` | Luna | max | Fast | Explicit workspace write | Small, low-risk, tightly bounded edits |
+| `playwright` | Luna | max | Standard | Read-only repository | Browser inspection and authorized test interaction |
+| `implement` | Sol | high | Standard | Explicit workspace write | Changes that need stronger engineering judgment |
+| `review` | Sol | high | Standard | Read-only | Independent plan and code review |
+| Ultra | Sol | ultra | Standard | Explicit takeover sandbox | Exceptional architecture, security, or concurrency decisions |
+
+Every role uses `model_verbosity = "low"`. Fast profiles force `features.fast_mode = true`, while Standard roles force it to `false`. Reasoning effort and output verbosity are independent settings.
+
+## Installation
+
+The project requires only the Node.js runtime bundled with Codex.
 
 ```text
-Root Codex session: Sol / xhigh
-  |
-  +-- explore:   Sol / medium / read-only
-  +-- implement: Sol / high   / workspace-write
-  +-- review:    Sol / high   / read-only
-           |
-           +-- rollout verification -> stable JSON result
-
-Human-confirmed exception: Sol / ultra
-  +-- exclusive repository lock
-  +-- verified profile executors only
-  +-- verified terminal result or manual recovery
-```
-
-The root owns planning, delegation, integration, and final verification. There is no planner executor.
-
-## Requirements
-
-- Codex CLI with access to `gpt-5.6-sol`
-- Node.js 18 or newer
-- Git
-
-The project has no npm dependencies.
-
-## Install globally
-
-```bash
-git clone https://github.com/Mauriciog87/codex-skill.git
-cd codex-skill
 npm run install:global
 ```
 
-The idempotent installer:
+The installer is idempotent and performs a complete preflight before changing anything. It:
 
-- links the repository skill to `$HOME/.agents/skills/sol-sol-orchestration` using a Windows junction or a macOS/Linux directory symlink;
-- sets Sol/xhigh defaults in `$CODEX_HOME/config.toml`, or `~/.codex/config.toml` when `CODEX_HOME` is unset;
-- adds one managed Sol-Sol block to the active global instruction file;
-- keeps root limits at `agents.max_depth = 1` and `agents.max_threads = 4`;
-- enables hooks and adds separate managed inline SessionStart and PreToolUse definitions for the repository lock;
-- removes legacy Sol-Terra locations only after verifying their identity or link target;
-- preserves unrelated configuration, instruction content, and the existing `$CODEX_HOME/hooks.json` byte for byte.
+- links the canonical skill to `$HOME/.agents/skills/sol-luna-orchestration`;
+- uses a junction on Windows and a directory symlink on macOS or Linux;
+- configures the global root as Sol/xhigh/Standard with low verbosity;
+- preserves unrelated Codex configuration and instructions;
+- installs the Ultra SessionStart and PreToolUse hooks without changing an existing `hooks.json`;
+- migrates validated Sol-Sol and Sol-Terra links and managed blocks;
+- refuses unrelated destinations, malformed managed markers, and ambiguous TOML.
 
-Open a new Codex session after installation so global changes are loaded. User-level command hooks require an explicit trust review in Codex; open `/hooks`, inspect the two Sol-Sol definitions, and trust them before relying on hook enforcement. The lock in the launchers remains authoritative even while hooks await trust.
+Repository-specific Codex instructions still take precedence over the global defaults.
 
-## Run an executor
+## Running an executor
 
-The launcher requires a bounded briefing on stdin and an explicit profile.
+The direct Node command is the canonical interface:
 
-Explore a codebase without modifying it:
-
-```powershell
-'Trace the authentication flow. Return path:line evidence and unresolved contracts.' |
-  node .agents/skills/sol-sol-orchestration/scripts/invoke-sol-executor.mjs `
-    --profile explore `
-    --cwd . `
-    --sandbox read-only `
-    --timeout-seconds 900
+```text
+briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile explore --cwd . --sandbox read-only --timeout-seconds 900
 ```
 
-Implement an explicitly assigned scope:
+Use `workspace-write` explicitly for either implementation profile:
 
-```powershell
-'Own only src/auth.mjs and its focused tests. Implement the assigned validation and run those tests.' |
-  node .agents/skills/sol-sol-orchestration/scripts/invoke-sol-executor.mjs `
-    --profile implement `
-    --cwd . `
-    --sandbox workspace-write `
-    --timeout-seconds 900
+```text
+briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile implement-lite --cwd . --sandbox workspace-write
+briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile implement --cwd . --sandbox workspace-write
 ```
 
-Review an explicit plan or Git change:
+Read-only profiles reject `workspace-write`. Write profiles do not enable it automatically. Every profile rejects `danger-full-access`, approval overrides, and bypass flags.
 
-```powershell
-'Review the current Git diff for the authentication change. Do not modify files.' |
-  node .agents/skills/sol-sol-orchestration/scripts/invoke-sol-executor.mjs `
-    --profile review `
-    --cwd . `
-    --sandbox read-only `
-    --timeout-seconds 900
+`npm run executor -- --profile ...` is available for convenience, but the direct command provides the clearest option forwarding and exit-code behavior.
+
+The launcher prints a colored route banner to stderr when the terminal supports color:
+
+```text
+◆ PLAYWRIGHT · GPT-5.6-LUNA · MAX · STANDARD · READ-ONLY
 ```
 
-The same arguments work in Bash. Use the direct Node command when exact exit codes or option forwarding matter. `npm run executor` remains a convenience entry point.
-
-The launcher rejects missing or unknown profiles, profile/sandbox mismatches, configurable reasoning effort, and `danger-full-access`. Do not run concurrent write tasks against overlapping files. The root may run at most three independent executors at once.
+Machine-readable JSON remains the only stdout output. `NO_COLOR`, `TERM=dumb`, and `FORCE_COLOR` are honored.
 
 ## Result contract
 
-Every invocation prints one JSON object in a stable property order:
-
 ```json
 {
-  "status": "completed",
-  "profile": "explore",
-  "thread_id": "019f...",
-  "model": "gpt-5.6-sol",
-  "reasoning_effort": "medium",
-  "routing_verified": true,
-  "sandbox_mode": "read-only",
-  "summary": "Exploration completed.",
+  "status": "completed | blocked | failed",
+  "profile": "explore | implement-lite | playwright | implement | review | null",
+  "thread_id": "string | null",
+  "model": "string | null",
+  "reasoning_effort": "string | null",
+  "service_tier": "fast | standard | null",
+  "routing_verified": false,
+  "sandbox_mode": "read-only | workspace-write",
+  "summary": "string",
   "changed_files": [],
-  "checks": ["Relevant contracts traced"],
+  "checks": [],
   "blockers": [],
   "warnings": []
 }
 ```
 
-`profile` is added by the launcher rather than echoed by the executor. Invalid invocations report it as `null`. Unknown routing metadata is also reported as `null`; a mismatch reports the actual recorded values.
+The executor supplies only task fields. The launcher adds the profile and observed routing metadata. `routing_verified` becomes true only when rollout metadata confirms the profile's model, effort, and tier.
 
-| Exit code | Meaning |
-| --- | --- |
-| `0` | The task completed with verified routing. |
-| `1` | The task was blocked or failed, Codex failed, or review requested changes. |
-| `2` | The invocation, sandbox, timeout, configuration, output contract, or routing verification was invalid. |
+Exit codes are stable:
 
-For `review`, `APPROVE` and `COMMENT` use completed status. `REQUEST_CHANGES` uses blocked status and includes at least one blocker.
+- `0`: completed with verified routing;
+- `1`: blocked, failed, or Codex returned a task-level error;
+- `2`: invalid invocation, capacity conflict, timeout, configuration, contract, MCP, or routing verification failure.
 
-## Run an exclusive Ultra takeover
+## Concurrency
 
-Ultra is an exceptional replacement for the root orchestrator, not an executor profile. Use it only when a named architectural, security, concurrency, or distributed-invariant decision genuinely requires more reasoning than root Sol/xhigh. A takeover requires a human-readable reason and the explicit confirmation flag.
+Capacity is enforced with atomic leases at repository and machine scope:
 
-Read-only takeover:
+- Luna: 10 active executors per repository and 10 across the PC;
+- Sol: 4 active executors per repository and 4 across the PC;
+- total machine capacity: 14 executors;
+- Playwright: 2 across the PC, counted inside the Luna pool.
 
-```powershell
-'Resolve the named architecture decision, verify the result, and do not modify files.' |
-  node .agents/skills/sol-sol-orchestration/scripts/invoke-sol-ultra.mjs `
-    --cwd . `
-    --reason 'Cross-cutting architecture decision' `
-    --confirm-exclusive-takeover `
-    --sandbox read-only `
-    --timeout-seconds 1800
+The root and Ultra process do not consume executor slots. Executors started by Ultra do. Reaching a limit fails immediately; the launcher does not create a hidden queue.
+
+These numbers are upper bounds, not a target. Parallel work should have independent evidence or ownership. Overlapping writes must remain sequential, and creating redundant executors usually costs more integration time than it saves.
+
+Inspect active leases and capacity with:
+
+```text
+node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs status --cwd .
 ```
 
-Use `--sandbox workspace-write` only when the takeover itself is explicitly authorized to modify the repository. Ultra can delegate to the three existing verified profiles, but native multi-agent spawning remains disabled. No more than three independent executors may run concurrently, and overlapping writes remain sequential.
+Dead leases are removed only after their process is confirmed stopped. Corrupt state fails closed.
 
-The takeover acquires a repository-scoped lock under `$CODEX_HOME/sol-sol-orchestration/state`. Normal executors fail while the lock exists. Ultra executors are accepted only when they inherit its exact `CODEX_ORCHESTRATION_LOCK_ID`.
+## Playwright profile
 
-Inspect a repository lock:
+The `playwright` profile verifies that the `playwright` MCP is installed, enabled, and configured over stdio before Codex starts. Each run receives an isolated browser profile and a unique output directory under the operating system's temporary directory. The launcher removes those artifacts in `finally`, so it does not create `.playwright-mcp` in the repository.
 
-```powershell
-node .agents/skills/sol-sol-orchestration/scripts/orchestration-gate.mjs status --cwd .
+The session must emit an actual Playwright MCP tool call. A successful result includes `playwright_mcp:verified` in `checks`; the executor cannot add that verification itself.
+
+Full interaction is allowed on localhost and explicitly named development or test environments. External sites are observation-only unless the briefing explicitly authorizes a named state-changing action and destination. Purchases, deletion, publishing, messaging, account or security changes, production mutation, and `browser_run_code_unsafe` are always prohibited.
+
+## Exclusive Ultra takeover
+
+Ultra is not an executor profile. It temporarily replaces the root for one repository and requires both a reason and explicit human confirmation:
+
+```text
+briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs --cwd . --reason "Named exceptional decision" --confirm-exclusive-takeover --sandbox read-only
 ```
 
-Timeout, interruption, process failure, invalid output, or routing failure leaves the lock in `recovery-required`. There is no automatic expiry. After confirming that the owner process has stopped, recover with the exact id printed by the launcher or status command:
+The lock blocks normal sessions and has no automatic expiry. Ultra may delegate only through the verified profiles, which inherit its lock id and consume the normal capacity pools.
 
-```powershell
-node .agents/skills/sol-sol-orchestration/scripts/orchestration-gate.mjs recover --cwd . --lock-id <exact-lock-id>
+A verified terminal result releases the lock. Timeout, interruption, process, contract, or routing failure leaves `recovery-required`. Check and recover it only through the gate:
+
+```text
+node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs status --cwd .
+node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs recover --cwd . --lock-id <exact-lock-id>
 ```
 
-Never delete state files manually. SessionStart and PreToolUse hooks add another guardrail, but Codex does not yet intercept every possible tool path, so the launcher lock and repository policy remain required.
+## Verification
 
-Ultra prints a separate stable contract with `mode: "ultra"`, its `lock_id`, verified routing metadata, and an `executors` array reconstructed from registered leases rather than trusted from model output. Exit `0` means Ultra and all recorded executors are verified and the lock was released. Exit `1` means a verified blocked or failed task and a released lock. Exit `2` means an invalid invocation, conflict, timeout, process, contract, or routing failure and requires recovery.
-
-## Verify the setup
-
-```bash
+```text
 npm test
 npm run verify:live
 ```
 
-`npm test` runs unit and static policy checks. `npm run verify:live` makes real model calls and consumes account usage. It verifies:
-
-1. a root session without overrides records Sol/xhigh;
-2. `explore` records Sol/medium and reads `package.json` in read-only mode;
-3. `implement` records Sol/high and performs one bounded write in a temporary Git repository;
-4. `review` records Sol/high, approves the deterministic temporary diff, and does not modify it;
-5. local and global skill discovery use the same canonical content;
-6. a normal executor is blocked during a takeover;
-7. read-only Sol/ultra records verified routing and releases its lock;
-8. workspace-write Sol/ultra can invoke a verified implement executor in a temporary repository;
-9. timeout produces `recovery-required` and exact-id manual recovery succeeds;
-10. independent repositories do not block each other;
-11. the real repository's Git status is identical before and after read-only verification.
-
-## Operating rules
-
-- Executors cannot delegate or launch another Codex session.
-- The launcher disables multi-agent support inside executors.
-- Executors cannot alter approvals, use bypasses, commit, or push.
-- `explore` and `review` are always read-only.
-- `implement` requires explicit file or subsystem ownership and explicit `workspace-write`.
-- Repository-level `AGENTS.md` and `.codex/config.toml` can override global defaults through normal Codex precedence.
-- Ultra requires human confirmation, owns one repository exclusively, and delegates only through verified profiles.
-- Locks never expire automatically; recovery requires the exact id and an inactive owner.
-- Hooks supplement the lock but are not a complete security boundary.
-
-The canonical workflow lives in `.agents/skills/sol-sol-orchestration`. Repository policy lives in `AGENTS.md`.
-
-## Commands
-
-| Command | Purpose |
-| --- | --- |
-| `npm run install:global` | Install or refresh the global skill, root defaults, and managed instructions. |
-| `npm run executor` | Start the profile-aware launcher with a briefing on stdin. |
-| `npm run ultra` | Start a human-confirmed exclusive Ultra takeover with a briefing on stdin. |
-| `npm run ultra:gate` | Inspect or recover repository takeover state. |
-| `npm test` | Run unit tests and static policy checks. |
-| `npm run verify:live` | Verify root routing, all executor profiles, locking, Ultra routing, and recovery. |
+The unit suite covers profile routing, structured results, tiers, terminal colors, capacity races, Ultra locks, Playwright preflight and tool evidence, installer rollback, and migration behavior. Live verification checks the root and every profile against real rollout metadata, uses temporary repositories for write tests, and confirms that read-only checks do not alter this repository.

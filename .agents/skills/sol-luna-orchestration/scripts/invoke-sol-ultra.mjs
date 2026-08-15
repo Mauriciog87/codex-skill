@@ -12,14 +12,16 @@ import {
   runProcess,
   validateExecutorPayload,
   verifySessionRouting,
-} from "./invoke-sol-executor.mjs";
+} from "./invoke-profile-executor.mjs";
 import {
   ORCHESTRATION_LOCK_ENV,
   ORCHESTRATION_ROLE_ENV,
   SOL_MODEL_VERBOSITY,
   ULTRA_MODEL,
+  ULTRA_CONFIGURED_SERVICE_TIER,
   ULTRA_ORCHESTRATOR_ROLE,
   ULTRA_REASONING_EFFORT,
+  ULTRA_SERVICE_TIER,
   acquireUltraLock,
   listUltraExecutorResults,
   releaseUltraLock,
@@ -35,7 +37,7 @@ export const DEFAULT_ULTRA_SANDBOX_MODE = "read-only";
 export const DEFAULT_ULTRA_TIMEOUT_SECONDS = 1_800;
 
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
-const EXECUTOR_LAUNCHER_PATH = join(SCRIPT_DIRECTORY, "invoke-sol-executor.mjs");
+const EXECUTOR_LAUNCHER_PATH = join(SCRIPT_DIRECTORY, "invoke-profile-executor.mjs");
 const MAX_REASON_CHARACTERS = 4_096;
 
 export class UltraInvocationError extends Error {
@@ -132,9 +134,9 @@ export function createUltraDeveloperInstructions(lockId) {
     "Act as the exclusive GPT-5.6 Sol Ultra root orchestrator for the supplied briefing.",
     "Own planning, bounded delegation, integration, verification, and the terminal result while the repository lock is active.",
     "Do not use native spawn_agent or any native multi-agent tool and do not start another Ultra takeover.",
-    `Delegate only through node ${JSON.stringify(EXECUTOR_LAUNCHER_PATH)} --profile explore|implement|review with a bounded briefing on stdin.`,
-    "Run no more than three independent verified executors concurrently and serialize overlapping writes.",
-    "Use read-only executors by default and workspace-write only for explicitly assigned implement scopes.",
+    `Delegate only through node ${JSON.stringify(EXECUTOR_LAUNCHER_PATH)} --profile explore|implement-lite|playwright|implement|review with a bounded briefing on stdin.`,
+    "Use only useful independent executor scopes, respect the verified Luna and Sol capacity pools, and serialize overlapping writes.",
+    "Use read-only executors by default and workspace-write only for explicitly assigned implement-lite or implement scopes.",
     "Do not alter approval policy, sandbox policy, orchestration configuration, or use bypasses.",
     "Preserve unrelated changes and do not exceed the authority granted in the original briefing.",
     "Return only the result required by the supplied JSON schema.",
@@ -157,6 +159,10 @@ export function buildUltraCodexArguments({
     `model_reasoning_effort=${JSON.stringify(ULTRA_REASONING_EFFORT)}`,
     "-c",
     `model_verbosity=${JSON.stringify(SOL_MODEL_VERBOSITY)}`,
+    "-c",
+    `service_tier=${JSON.stringify(ULTRA_CONFIGURED_SERVICE_TIER)}`,
+    "-c",
+    "features.fast_mode=false",
     "-c",
     "features.multi_agent=false",
     "-c",
@@ -185,6 +191,7 @@ export function createStableUltraResult({
   threadId = null,
   model = null,
   reasoningEffort = null,
+  serviceTier = null,
   routingVerified = false,
   sandboxMode = DEFAULT_ULTRA_SANDBOX_MODE,
   summary,
@@ -201,6 +208,7 @@ export function createStableUltraResult({
     thread_id: threadId,
     model,
     reasoning_effort: reasoningEffort,
+    service_tier: serviceTier,
     routing_verified: routingVerified,
     sandbox_mode: sandboxMode,
     summary,
@@ -227,8 +235,9 @@ function validateUltraExecutors(executors) {
       profile === null ||
       !["completed", "blocked", "failed"].includes(executor.status) ||
       typeof executor.thread_id !== "string" ||
-      executor.model !== ULTRA_MODEL ||
+      executor.model !== profile.model ||
       executor.reasoning_effort !== profile.reasoningEffort ||
+      executor.service_tier !== profile.serviceTier ||
       executor.routing_verified !== true
     ) {
       throw new UltraInvocationError("Ultra takeover contains an unverified executor result.");
@@ -245,6 +254,7 @@ function failureResult(message, options, details = {}) {
       threadId: details.threadId ?? null,
       model: details.model ?? null,
       reasoningEffort: details.reasoningEffort ?? null,
+      serviceTier: details.serviceTier ?? null,
       sandboxMode: options.sandboxMode,
       summary: message,
       executors: details.executors ?? [],
@@ -306,6 +316,7 @@ export async function invokeUltra({
   let threadId = null;
   let actualModel = null;
   let actualReasoningEffort = null;
+  let actualServiceTier = null;
   let warnings = [];
   try {
     const processResult = await processRunner(command, args, {
@@ -349,10 +360,12 @@ export async function invokeUltra({
       threadId,
       ULTRA_MODEL,
       ULTRA_REASONING_EFFORT,
+      ULTRA_SERVICE_TIER,
       { sessionRoots },
     );
     actualModel = routing.model;
     actualReasoningEffort = routing.reasoningEffort;
+    actualServiceTier = routing.serviceTier;
     const payload = validateUltraPayload(
       JSON.parse(await readFile(outputPath, "utf8")),
       options.sandboxMode,
@@ -371,6 +384,7 @@ export async function invokeUltra({
       threadId,
       model: actualModel,
       reasoningEffort: actualReasoningEffort,
+      serviceTier: actualServiceTier,
       routingVerified: true,
       sandboxMode: options.sandboxMode,
       summary: payload.summary,
@@ -391,6 +405,7 @@ export async function invokeUltra({
     if (error instanceof RoutingVerificationError) {
       actualModel = error.actualModel ?? null;
       actualReasoningEffort = error.actualReasoningEffort ?? null;
+      actualServiceTier = error.actualServiceTier ?? null;
     }
     const recoveryWarning = await markRecoveryRequired(
       options,
@@ -405,6 +420,7 @@ export async function invokeUltra({
       threadId,
       model: actualModel,
       reasoningEffort: actualReasoningEffort,
+      serviceTier: actualServiceTier,
       warnings: [...warnings, recoveryWarning].filter(Boolean),
     });
   } finally {
@@ -430,15 +446,20 @@ export async function main(argv = process.argv.slice(2)) {
       ultraLaunchMessage({
         model: ULTRA_MODEL,
         reasoningEffort: ULTRA_REASONING_EFFORT,
+        serviceTier: ULTRA_SERVICE_TIER,
         sandboxMode: options.sandboxMode,
       }),
+      process.stderr,
+      { colorCode: 91 },
     );
     const execution = await invokeUltra({
       briefing: await readBriefing(),
       options,
       signal: abortController.signal,
     });
-    writeStatusMessage(ultraResultMessage(execution.result));
+    writeStatusMessage(ultraResultMessage(execution.result), process.stderr, {
+      colorCode: 91,
+    });
     process.stdout.write(`${JSON.stringify(execution.result)}\n`);
     return execution.exitCode;
   } catch (error) {

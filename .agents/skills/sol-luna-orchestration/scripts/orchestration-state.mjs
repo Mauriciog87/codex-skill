@@ -19,11 +19,20 @@ export const ORCHESTRATION_ROLE_ENV = "CODEX_ORCHESTRATION_ROLE";
 export const ULTRA_ORCHESTRATOR_ROLE = "ultra-orchestrator";
 export const ULTRA_MODEL = "gpt-5.6-sol";
 export const ULTRA_REASONING_EFFORT = "ultra";
+export const ULTRA_SERVICE_TIER = "standard";
+export const ULTRA_CONFIGURED_SERVICE_TIER = "default";
 export const SOL_MODEL_VERBOSITY = "low";
 
 const STATE_VERSION = 1;
 const MUTEX_TIMEOUT_MS = 5_000;
 const MUTEX_STALE_MS = 30_000;
+
+export const EXECUTOR_CAPACITY_LIMITS = Object.freeze({
+  luna: 10,
+  sol: 4,
+  total: 14,
+  playwright: 2,
+});
 
 export class OrchestrationStateError extends Error {
   constructor(message, details = {}) {
@@ -137,6 +146,7 @@ export async function getRepositoryState(
     "state",
     key,
   );
+  const globalState = getGlobalCapacityState({ environment, homeDirectory });
   return {
     repository,
     key,
@@ -144,6 +154,26 @@ export async function getRepositoryState(
     mutexDirectory: join(stateDirectory, "state.mutex"),
     lockDirectory: join(stateDirectory, "ultra.lock"),
     lockPath: join(stateDirectory, "ultra.lock", "lock.json"),
+    runsDirectory: join(stateDirectory, "runs"),
+    globalStateDirectory: globalState.stateDirectory,
+    globalMutexDirectory: globalState.mutexDirectory,
+    globalRunsDirectory: globalState.runsDirectory,
+  };
+}
+
+export function getGlobalCapacityState({
+  environment = process.env,
+  homeDirectory = homedir(),
+} = {}) {
+  const stateDirectory = join(
+    getCodexHome(environment, homeDirectory),
+    "sol-sol-orchestration",
+    "state",
+    "global-capacity",
+  );
+  return {
+    stateDirectory,
+    mutexDirectory: join(stateDirectory, "state.mutex"),
     runsDirectory: join(stateDirectory, "runs"),
   };
 }
@@ -245,6 +275,8 @@ async function readRuns(state) {
       typeof run.run_id !== "string" ||
       !Number.isInteger(run.pid) ||
       typeof run.profile !== "string" ||
+      (run.model !== undefined && typeof run.model !== "string") ||
+      (run.pool !== undefined && !["luna", "sol"].includes(run.pool)) ||
       !["active", "completed", "abandoned"].includes(run.state)
     ) {
       throw new OrchestrationStateError(`Executor run ${entry.name} is malformed.`);
@@ -262,6 +294,53 @@ async function removeDeadActiveRuns(state) {
     }
   }
   return (await readRuns(state)).filter((run) => run.state === "active");
+}
+
+function getRunPool(run) {
+  if (["luna", "sol"].includes(run.pool)) {
+    return run.pool;
+  }
+  return "sol";
+}
+
+function capacityUsage(runs) {
+  return {
+    luna: runs.filter((run) => getRunPool(run) === "luna").length,
+    sol: runs.filter((run) => getRunPool(run) === "sol").length,
+    total: runs.length,
+    playwright: runs.filter((run) => run.profile === "playwright").length,
+  };
+}
+
+function requireExecutorPool(model) {
+  if (model === "gpt-5.6-luna") {
+    return "luna";
+  }
+  if (model === "gpt-5.6-sol") {
+    return "sol";
+  }
+  throw new OrchestrationStateError(`Unsupported executor model for capacity routing: ${model}.`);
+}
+
+function assertCapacityAvailable(scope, usage, pool, profile) {
+  if (usage[pool] >= EXECUTOR_CAPACITY_LIMITS[pool]) {
+    throw new OrchestrationStateError(
+      `${scope} ${pool} executor capacity is full (${usage[pool]}/${EXECUTOR_CAPACITY_LIMITS[pool]}).`,
+    );
+  }
+  if (usage.total >= EXECUTOR_CAPACITY_LIMITS.total) {
+    throw new OrchestrationStateError(
+      `${scope} total executor capacity is full (${usage.total}/${EXECUTOR_CAPACITY_LIMITS.total}).`,
+    );
+  }
+  if (
+    profile === "playwright" &&
+    usage.playwright >= EXECUTOR_CAPACITY_LIMITS.playwright
+  ) {
+    throw new OrchestrationStateError(
+      `${scope} Playwright executor capacity is full (${usage.playwright}/${EXECUTOR_CAPACITY_LIMITS.playwright}).`,
+    );
+  }
 }
 
 export async function readUltraLock(cwd, options = {}) {
@@ -309,6 +388,7 @@ export async function acquireUltraLock({
       thread_id: null,
       model: ULTRA_MODEL,
       reasoning_effort: ULTRA_REASONING_EFFORT,
+      service_tier: ULTRA_SERVICE_TIER,
       sandbox_mode: sandboxMode,
       reason: reason.trim(),
       activation: "human-confirmed",
@@ -354,42 +434,71 @@ export async function updateUltraLock({
 export async function beginExecutorRun({
   cwd,
   profile,
+  model,
   environment = process.env,
   homeDirectory = homedir(),
   pid = process.pid,
   runId = randomUUID(),
 }) {
   const state = await getRepositoryState(cwd, { environment, homeDirectory });
-  return withStateMutex(state, async () => {
-    await removeDeadActiveRuns(state);
-    const lock = await readLockFromState(state);
-    const inheritedLockId = environment[ORCHESTRATION_LOCK_ENV] ?? null;
-    if (
-      lock !== null &&
-      (lock.state !== "active" || inheritedLockId !== lock.lock_id)
-    ) {
-      throw new OrchestrationStateError(
-        `Repository is locked by an exclusive Sol Ultra takeover in state ${lock.state}.`,
-        { lockId: lock.lock_id },
-      );
-    }
-    await mkdir(state.runsDirectory, { recursive: true });
-    const timestamp = new Date().toISOString();
-    const run = {
-      version: STATE_VERSION,
-      run_id: runId,
-      repository: state.repository,
-      state: "active",
-      pid,
-      profile,
-      lock_id: lock?.lock_id ?? null,
-      created_at: timestamp,
-      updated_at: timestamp,
-      result: null,
-    };
-    const path = join(state.runsDirectory, `${runId}.json`);
-    await atomicWrite(path, run);
-    return { ...run, path, stateDirectory: state.stateDirectory };
+  const globalState = {
+    stateDirectory: state.globalStateDirectory,
+    mutexDirectory: state.globalMutexDirectory,
+    runsDirectory: state.globalRunsDirectory,
+  };
+  const pool = requireExecutorPool(model);
+  return withStateMutex(globalState, async () => {
+    const globalRuns = await removeDeadActiveRuns(globalState);
+    assertCapacityAvailable("Machine-wide", capacityUsage(globalRuns), pool, profile);
+    return withStateMutex(state, async () => {
+      const repositoryRuns = await removeDeadActiveRuns(state);
+      assertCapacityAvailable("Repository", capacityUsage(repositoryRuns), pool, profile);
+      const lock = await readLockFromState(state);
+      const inheritedLockId = environment[ORCHESTRATION_LOCK_ENV] ?? null;
+      if (
+        lock !== null &&
+        (lock.state !== "active" || inheritedLockId !== lock.lock_id)
+      ) {
+        throw new OrchestrationStateError(
+          `Repository is locked by an exclusive Sol Ultra takeover in state ${lock.state}.`,
+          { lockId: lock.lock_id },
+        );
+      }
+      await mkdir(state.runsDirectory, { recursive: true });
+      await mkdir(globalState.runsDirectory, { recursive: true });
+      const timestamp = new Date().toISOString();
+      const run = {
+        version: STATE_VERSION,
+        run_id: runId,
+        repository: state.repository,
+        repository_key: state.key,
+        state: "active",
+        pid,
+        profile,
+        model,
+        pool,
+        lock_id: lock?.lock_id ?? null,
+        created_at: timestamp,
+        updated_at: timestamp,
+        result: null,
+      };
+      const path = join(state.runsDirectory, `${runId}.json`);
+      const globalPath = join(globalState.runsDirectory, `${runId}.json`);
+      await atomicWrite(globalPath, run);
+      try {
+        await atomicWrite(path, run);
+      } catch (error) {
+        await rm(globalPath, { force: true });
+        throw error;
+      }
+      return {
+        ...run,
+        path,
+        globalPath,
+        stateDirectory: state.stateDirectory,
+        globalStateDirectory: globalState.stateDirectory,
+      };
+    });
   });
 }
 
@@ -400,53 +509,65 @@ function executorDescriptor(execution) {
     thread_id: execution.result.thread_id,
     model: execution.result.model,
     reasoning_effort: execution.result.reasoning_effort,
+    service_tier: execution.result.service_tier,
     routing_verified: execution.result.routing_verified,
   };
 }
 
-export async function finishExecutorRun(lease, execution) {
-  const state = {
-    stateDirectory: lease.stateDirectory,
-    mutexDirectory: join(lease.stateDirectory, "state.mutex"),
-    lockDirectory: join(lease.stateDirectory, "ultra.lock"),
-    lockPath: join(lease.stateDirectory, "ultra.lock", "lock.json"),
-    runsDirectory: join(lease.stateDirectory, "runs"),
+function statesFromLease(lease) {
+  return {
+    repository: {
+      stateDirectory: lease.stateDirectory,
+      mutexDirectory: join(lease.stateDirectory, "state.mutex"),
+      lockDirectory: join(lease.stateDirectory, "ultra.lock"),
+      lockPath: join(lease.stateDirectory, "ultra.lock", "lock.json"),
+      runsDirectory: join(lease.stateDirectory, "runs"),
+    },
+    global: {
+      stateDirectory: lease.globalStateDirectory,
+      mutexDirectory: join(lease.globalStateDirectory, "state.mutex"),
+      runsDirectory: join(lease.globalStateDirectory, "runs"),
+    },
   };
-  return withStateMutex(state, async () => {
-    if (lease.lock_id === null) {
-      await rm(lease.path, { force: true });
-      return;
-    }
-    const run = await readJson(lease.path, `Executor run ${lease.run_id}`);
-    await atomicWrite(lease.path, {
-      ...run,
-      state: "completed",
-      updated_at: new Date().toISOString(),
-      exit_code: execution.exitCode,
-      result: executorDescriptor(execution),
+}
+
+export async function finishExecutorRun(lease, execution) {
+  const states = statesFromLease(lease);
+  return withStateMutex(states.global, async () => {
+    return withStateMutex(states.repository, async () => {
+      if (lease.lock_id === null) {
+        await rm(lease.path, { force: true });
+      } else {
+        const run = await readJson(lease.path, `Executor run ${lease.run_id}`);
+        await atomicWrite(lease.path, {
+          ...run,
+          state: "completed",
+          updated_at: new Date().toISOString(),
+          exit_code: execution.exitCode,
+          result: executorDescriptor(execution),
+        });
+      }
+      await rm(lease.globalPath, { force: true });
     });
   });
 }
 
 export async function abandonExecutorRun(lease, error) {
-  const state = {
-    stateDirectory: lease.stateDirectory,
-    mutexDirectory: join(lease.stateDirectory, "state.mutex"),
-    lockDirectory: join(lease.stateDirectory, "ultra.lock"),
-    lockPath: join(lease.stateDirectory, "ultra.lock", "lock.json"),
-    runsDirectory: join(lease.stateDirectory, "runs"),
-  };
-  return withStateMutex(state, async () => {
-    if (lease.lock_id === null) {
-      await rm(lease.path, { force: true });
-      return;
-    }
-    const run = await readJson(lease.path, `Executor run ${lease.run_id}`);
-    await atomicWrite(lease.path, {
-      ...run,
-      state: "abandoned",
-      updated_at: new Date().toISOString(),
-      error: error instanceof Error ? error.message : String(error),
+  const states = statesFromLease(lease);
+  return withStateMutex(states.global, async () => {
+    return withStateMutex(states.repository, async () => {
+      if (lease.lock_id === null) {
+        await rm(lease.path, { force: true });
+      } else {
+        const run = await readJson(lease.path, `Executor run ${lease.run_id}`);
+        await atomicWrite(lease.path, {
+          ...run,
+          state: "abandoned",
+          updated_at: new Date().toISOString(),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      await rm(lease.globalPath, { force: true });
     });
   });
 }
@@ -523,11 +644,27 @@ export async function recoverUltraLock({
 
 export async function getOrchestrationStatus(cwd, options = {}) {
   const state = await getRepositoryState(cwd, options);
-  return {
-    status: "completed",
-    repository: state.repository,
-    repository_key: state.key,
-    lock: await readLockFromState(state),
-    runs: (await readRuns(state)).map(({ path, ...run }) => run),
+  const globalState = {
+    stateDirectory: state.globalStateDirectory,
+    mutexDirectory: state.globalMutexDirectory,
+    runsDirectory: state.globalRunsDirectory,
   };
+  return withStateMutex(globalState, async () => {
+    const globalRuns = await removeDeadActiveRuns(globalState);
+    return withStateMutex(state, async () => {
+      const repositoryActiveRuns = await removeDeadActiveRuns(state);
+      return {
+        status: "completed",
+        repository: state.repository,
+        repository_key: state.key,
+        lock: await readLockFromState(state),
+        runs: (await readRuns(state)).map(({ path, ...run }) => run),
+        capacity: {
+          limits: { ...EXECUTOR_CAPACITY_LIMITS },
+          repository: capacityUsage(repositoryActiveRuns),
+          machine: capacityUsage(globalRuns),
+        },
+      };
+    });
+  });
 }

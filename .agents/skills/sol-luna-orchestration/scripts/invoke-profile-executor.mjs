@@ -1,18 +1,18 @@
 import { spawn as spawnChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { access, readFile, readdir, rm, stat } from "node:fs/promises";
+import { access, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import {
   EXECUTOR_PROFILE_NAMES,
+  MODEL_VERBOSITY,
   getExecutorProfile,
 } from "./executor-profiles.mjs";
 import {
   ORCHESTRATION_ROLE_ENV,
-  SOL_MODEL_VERBOSITY,
   abandonExecutorRun,
   beginExecutorRun,
   finishExecutorRun,
@@ -23,7 +23,6 @@ import {
   writeStatusMessage,
 } from "./orchestration-messages.mjs";
 
-export const EXECUTOR_MODEL = "gpt-5.6-sol";
 export const DEFAULT_SANDBOX_MODE = "read-only";
 export const DEFAULT_TIMEOUT_SECONDS = 900;
 
@@ -57,6 +56,7 @@ export class RoutingVerificationError extends Error {
     this.name = "RoutingVerificationError";
     this.actualModel = details.actualModel ?? null;
     this.actualReasoningEffort = details.actualReasoningEffort ?? null;
+    this.actualServiceTier = details.actualServiceTier ?? null;
     this.rolloutPath = details.rolloutPath ?? null;
   }
 }
@@ -112,7 +112,7 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
       parsed.cwd = resolve(baseDirectory, value);
     } else if (option === "--sandbox") {
       if (value === "danger-full-access") {
-        throw new ExecutorInvocationError("danger-full-access is prohibited for Sol executors.");
+        throw new ExecutorInvocationError("danger-full-access is prohibited for profile executors.");
       }
       if (!["read-only", "workspace-write"].includes(value)) {
         throw new ExecutorInvocationError(
@@ -169,8 +169,8 @@ export function createExecutorDeveloperInstructions(profileName) {
   return [
     "CODEX_ORCHESTRATION_ROLE=executor",
     `CODEX_EXECUTOR_PROFILE=${profile.name}`,
-    `Act as a bounded GPT-5.6 Sol ${profile.name} executor at ${profile.reasoningEffort} reasoning, not as the root orchestrator.`,
-    "Do not invoke the sol-sol-orchestration skill, delegate, or launch another Codex session.",
+    `Act as a bounded ${profile.model} ${profile.name} executor at ${profile.reasoningEffort} reasoning on the ${profile.serviceTier} service tier, not as the root orchestrator.`,
+    "Do not invoke the sol-luna-orchestration skill, delegate, or launch another Codex session.",
     "Complete only the supplied briefing and preserve unrelated changes.",
     "Do not alter orchestration policy, approval policy, or sandbox configuration, and do not use bypasses.",
     "Return only the result required by the supplied JSON schema.",
@@ -192,11 +192,15 @@ export function buildCodexArguments({
     developerInstructions ?? createExecutorDeveloperInstructions(profile.name);
   return [
     "-m",
-    EXECUTOR_MODEL,
+    profile.model,
     "-c",
     `model_reasoning_effort=${JSON.stringify(profile.reasoningEffort)}`,
     "-c",
-    `model_verbosity=${JSON.stringify(SOL_MODEL_VERBOSITY)}`,
+    `model_verbosity=${JSON.stringify(MODEL_VERBOSITY)}`,
+    "-c",
+    `service_tier=${JSON.stringify(profile.configuredServiceTier)}`,
+    "-c",
+    `features.fast_mode=${profile.fastMode}`,
     "-c",
     "features.multi_agent=false",
     "-c",
@@ -230,6 +234,14 @@ function recordCodexEvent(line, state) {
   } catch {
     state.warnings.push(`Codex emitted non-JSON output: ${line.slice(0, 500)}`);
     return;
+  }
+
+  const serializedEvent = JSON.stringify(event);
+  if (/mcp__playwright__|"server"\s*:\s*"playwright"|"server_name"\s*:\s*"playwright"/i.test(serializedEvent)) {
+    state.playwrightMcpUsed = true;
+  }
+  if (/browser_run_code_unsafe/i.test(serializedEvent)) {
+    state.unsafePlaywrightToolUsed = true;
   }
 
   if (event.type === "thread.started" && typeof event.thread_id === "string") {
@@ -284,7 +296,12 @@ export async function runProcess(
       return;
     }
 
-    const state = { threadId: null, warnings: [] };
+    const state = {
+      threadId: null,
+      warnings: [],
+      playwrightMcpUsed: false,
+      unsafePlaywrightToolUsed: false,
+    };
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -356,6 +373,8 @@ export async function runProcess(
         timedOut,
         aborted,
         threadId: state.threadId,
+        playwrightMcpUsed: state.playwrightMcpUsed,
+        unsafePlaywrightToolUsed: state.unsafePlaywrightToolUsed,
         warnings: uniqueStrings(state.warnings),
         stdout: stdout.trim(),
         stderr: stderr.trim(),
@@ -364,6 +383,42 @@ export async function runProcess(
 
     child.stdin.end(input);
   });
+}
+
+export async function verifyPlaywrightMcp({
+  command = "codex",
+  cwd = process.cwd(),
+  environment = process.env,
+  processRunner = runProcess,
+} = {}) {
+  const result = await processRunner(command, ["mcp", "get", "playwright", "--json"], {
+    cwd,
+    environment,
+    timeoutMs: 10_000,
+  });
+  if (result.timedOut || result.aborted || result.exitCode !== 0) {
+    throw new ExecutorConfigurationError(
+      result.stderr || "The Playwright MCP preflight did not complete successfully.",
+    );
+  }
+  let configuration;
+  try {
+    configuration = JSON.parse(result.stdout);
+  } catch (error) {
+    throw new ExecutorConfigurationError(
+      `The Playwright MCP preflight returned invalid JSON: ${error.message}`,
+    );
+  }
+  if (
+    configuration?.name !== "playwright" ||
+    configuration.enabled !== true ||
+    configuration.transport?.type !== "stdio"
+  ) {
+    throw new ExecutorConfigurationError(
+      "The Playwright MCP must be installed, enabled, and configured with stdio transport.",
+    );
+  }
+  return configuration;
 }
 
 export async function readBriefing(stream = process.stdin) {
@@ -435,15 +490,26 @@ export async function findRolloutFile(threadId, sessionRoots = getSessionRoots()
   return datedCandidates[0].path;
 }
 
-async function readTurnContexts(rolloutPath) {
+export function normalizeServiceTier(value) {
+  if (["fast", "priority"].includes(value)) {
+    return "fast";
+  }
+  if (["default", "standard"].includes(value)) {
+    return "standard";
+  }
+  return value ?? null;
+}
+
+async function readRoutingMetadata(rolloutPath) {
   const contexts = [];
+  const serviceTiers = [];
   const lineReader = createInterface({
     input: createReadStream(rolloutPath),
     crlfDelay: Infinity,
   });
 
   for await (const line of lineReader) {
-    if (!line.includes('"turn_context"')) {
+    if (!line.includes('"turn_context"') && !line.includes('"thread_settings_applied"')) {
       continue;
     }
     let entry;
@@ -460,9 +526,17 @@ async function readTurnContexts(rolloutPath) {
         reasoningEffort: entry.payload?.effort ?? null,
       });
     }
+    if (
+      entry.type === "event_msg" &&
+      entry.payload?.type === "thread_settings_applied"
+    ) {
+      serviceTiers.push(
+        normalizeServiceTier(entry.payload.thread_settings?.service_tier),
+      );
+    }
   }
 
-  return contexts;
+  return { contexts, serviceTiers };
 }
 
 function wait(delayMs) {
@@ -473,16 +547,18 @@ export async function verifySessionRouting(
   threadId,
   expectedModel,
   expectedReasoningEffort,
+  expectedServiceTier,
   { sessionRoots = getSessionRoots(), attempts = 20, retryDelayMs = 100 } = {},
 ) {
   let rolloutPath = null;
   let contexts = [];
+  let serviceTiers = [];
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     rolloutPath = await findRolloutFile(threadId, sessionRoots);
     if (rolloutPath !== null) {
-      contexts = await readTurnContexts(rolloutPath);
-      if (contexts.length > 0) {
+      ({ contexts, serviceTiers } = await readRoutingMetadata(rolloutPath));
+      if (contexts.length > 0 && serviceTiers.length > 0) {
         break;
       }
     }
@@ -500,6 +576,12 @@ export async function verifySessionRouting(
       { rolloutPath },
     );
   }
+  if (serviceTiers.length === 0) {
+    throw new RoutingVerificationError(
+      `No thread_settings_applied service tier metadata was found for thread ${threadId}.`,
+      { rolloutPath },
+    );
+  }
 
   const mismatchedContext = contexts.find(
     (context) =>
@@ -507,13 +589,18 @@ export async function verifySessionRouting(
       context.reasoningEffort !== expectedReasoningEffort,
   );
   const actualContext = mismatchedContext ?? contexts.at(-1);
+  const mismatchedServiceTier = serviceTiers.find(
+    (serviceTier) => serviceTier !== expectedServiceTier,
+  );
+  const actualServiceTier = mismatchedServiceTier ?? serviceTiers.at(-1);
 
-  if (mismatchedContext !== undefined) {
+  if (mismatchedContext !== undefined || mismatchedServiceTier !== undefined) {
     throw new RoutingVerificationError(
-      `Routing mismatch for thread ${threadId}: expected ${expectedModel}/${expectedReasoningEffort}, recorded ${actualContext.model}/${actualContext.reasoningEffort}.`,
+      `Routing mismatch for thread ${threadId}: expected ${expectedModel}/${expectedReasoningEffort}/${expectedServiceTier}, recorded ${actualContext.model}/${actualContext.reasoningEffort}/${actualServiceTier}.`,
       {
         actualModel: actualContext.model,
         actualReasoningEffort: actualContext.reasoningEffort,
+        actualServiceTier,
         rolloutPath,
       },
     );
@@ -523,7 +610,9 @@ export async function verifySessionRouting(
     rolloutPath,
     model: actualContext.model,
     reasoningEffort: actualContext.reasoningEffort,
+    serviceTier: actualServiceTier,
     contextCount: contexts.length,
+    serviceTierCount: serviceTiers.length,
   };
 }
 
@@ -578,7 +667,7 @@ export function validateExecutorPayload(value) {
 }
 
 function validateProfilePayload(profileName, payload) {
-  if (["explore", "review"].includes(profileName) && payload.changed_files.length > 0) {
+  if (["explore", "playwright", "review"].includes(profileName) && payload.changed_files.length > 0) {
     throw new ExecutorConfigurationError(
       `Profile ${profileName} must return an empty changed_files array.`,
     );
@@ -615,6 +704,7 @@ export function createStableResult({
   threadId = null,
   model = null,
   reasoningEffort = null,
+  serviceTier = null,
   routingVerified = false,
   sandboxMode = DEFAULT_SANDBOX_MODE,
   summary,
@@ -629,6 +719,7 @@ export function createStableResult({
     thread_id: threadId,
     model,
     reasoning_effort: reasoningEffort,
+    service_tier: serviceTier,
     routing_verified: routingVerified,
     sandbox_mode: sandboxMode,
     summary,
@@ -663,6 +754,7 @@ function configurationFailure(message, options, details = {}) {
       threadId: details.threadId ?? null,
       model: details.model ?? null,
       reasoningEffort: details.reasoningEffort ?? null,
+      serviceTier: details.serviceTier ?? null,
       sandboxMode: options.sandboxMode,
       summary: message,
       blockers: [message],
@@ -680,6 +772,7 @@ async function runExecutor({
   sessionRoots = getSessionRoots(environment),
   signal,
   processRunner = runProcess,
+  playwrightMcpVerifier = verifyPlaywrightMcp,
 }) {
   if (typeof briefing !== "string" || briefing.trim().length === 0) {
     throw new ExecutorInvocationError("An executor briefing is required.");
@@ -697,9 +790,20 @@ async function runExecutor({
     throw new ExecutorInvocationError(`Executor cwd is not a directory: ${options.cwd}`);
   }
 
+  let playwrightOutputDirectory = null;
+  if (profile.name === "playwright") {
+    try {
+      await playwrightMcpVerifier({ command, cwd: options.cwd, environment });
+      playwrightOutputDirectory = await mkdtemp(join(tmpdir(), "sol-luna-playwright-"));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return configurationFailure(message, options);
+    }
+  }
+
   const outputPath = join(
     tmpdir(),
-    `sol-sol-executor-${process.pid}-${randomUUID()}.json`,
+    `sol-luna-executor-${process.pid}-${randomUUID()}.json`,
   );
   const args = buildCodexArguments({
     profile: profile.name,
@@ -709,22 +813,29 @@ async function runExecutor({
   });
 
   try {
+    const executorEnvironment = {
+      ...environment,
+      [ORCHESTRATION_ROLE_ENV]: "executor",
+      CODEX_EXECUTOR_PROFILE: profile.name,
+      ...(profile.name === "playwright"
+        ? {
+            PLAYWRIGHT_MCP_ISOLATED: "true",
+            PLAYWRIGHT_MCP_OUTPUT_DIR: playwrightOutputDirectory,
+          }
+        : {}),
+    };
     const processResult = await processRunner(command, args, {
       input: `${briefing.trim()}\n`,
       timeoutMs: options.timeoutSeconds * 1000,
       cwd: options.cwd,
-      environment: {
-        ...environment,
-        [ORCHESTRATION_ROLE_ENV]: "executor",
-        CODEX_EXECUTOR_PROFILE: profile.name,
-      },
+      environment: executorEnvironment,
       signal,
     });
 
     if (processResult.timedOut || processResult.aborted) {
       const message = processResult.timedOut
-        ? `Sol executor timed out after ${options.timeoutSeconds} seconds.`
-        : "Sol executor was interrupted.";
+          ? `Profile executor timed out after ${options.timeoutSeconds} seconds.`
+          : "Profile executor was interrupted.";
       return configurationFailure(message, options, {
         threadId: processResult.threadId,
         warnings: processResult.warnings,
@@ -757,8 +868,9 @@ async function runExecutor({
     try {
       routing = await verifySessionRouting(
         processResult.threadId,
-        EXECUTOR_MODEL,
+        profile.model,
         profile.reasoningEffort,
+        profile.serviceTier,
         { sessionRoots },
       );
     } catch (error) {
@@ -769,6 +881,7 @@ async function runExecutor({
         threadId: processResult.threadId,
         model: error.actualModel ?? null,
         reasoningEffort: error.actualReasoningEffort ?? null,
+        serviceTier: error.actualServiceTier ?? null,
         warnings: processResult.warnings,
       });
     }
@@ -785,8 +898,38 @@ async function runExecutor({
         threadId: processResult.threadId,
         model: routing.model,
         reasoningEffort: routing.reasoningEffort,
+        serviceTier: routing.serviceTier,
         warnings: processResult.warnings,
       });
+    }
+
+    if (profile.name === "playwright") {
+      if (processResult.unsafePlaywrightToolUsed === true) {
+        return configurationFailure(
+          "The Playwright executor attempted to use browser_run_code_unsafe.",
+          options,
+          {
+            threadId: processResult.threadId,
+            model: routing.model,
+            reasoningEffort: routing.reasoningEffort,
+            serviceTier: routing.serviceTier,
+            warnings: processResult.warnings,
+          },
+        );
+      }
+      if (processResult.playwrightMcpUsed !== true) {
+        return configurationFailure(
+          "The Playwright executor did not emit a verified Playwright MCP tool call.",
+          options,
+          {
+            threadId: processResult.threadId,
+            model: routing.model,
+            reasoningEffort: routing.reasoningEffort,
+            serviceTier: routing.serviceTier,
+            warnings: processResult.warnings,
+          },
+        );
+      }
     }
 
     const result = createStableResult({
@@ -795,11 +938,14 @@ async function runExecutor({
       threadId: processResult.threadId,
       model: routing.model,
       reasoningEffort: routing.reasoningEffort,
+      serviceTier: routing.serviceTier,
       routingVerified: true,
       sandboxMode: options.sandboxMode,
       summary: payload.summary,
       changedFiles: payload.changed_files,
-      checks: payload.checks,
+      checks: profile.name === "playwright"
+        ? [...payload.checks, "playwright_mcp:verified"]
+        : payload.checks,
       blockers: payload.blockers,
       warnings: [...payload.warnings, ...processResult.warnings],
     });
@@ -812,6 +958,9 @@ async function runExecutor({
     };
   } finally {
     await rm(outputPath, { force: true });
+    if (playwrightOutputDirectory !== null) {
+      await rm(playwrightOutputDirectory, { recursive: true, force: true });
+    }
   }
 }
 
@@ -826,6 +975,7 @@ export async function invokeExecutor(input) {
     lease = await beginExecutorRun({
       cwd: input.options.cwd,
       profile: profile.name,
+      model: profile.model,
       environment,
       ...(input.coordinationOptions ?? {}),
     });
@@ -862,17 +1012,22 @@ export async function main(argv = process.argv.slice(2)) {
     writeStatusMessage(
       executorLaunchMessage({
         profile: profile.name,
-        model: EXECUTOR_MODEL,
+        model: profile.model,
         reasoningEffort: profile.reasoningEffort,
+        serviceTier: profile.serviceTier,
         sandboxMode: options.sandboxMode,
       }),
+      process.stderr,
+      { colorCode: profile.colorCode },
     );
     const execution = await invokeExecutor({
       briefing,
       options,
       signal: abortController.signal,
     });
-    writeStatusMessage(executorResultMessage(execution.result));
+    writeStatusMessage(executorResultMessage(execution.result), process.stderr, {
+      colorCode: profile.colorCode,
+    });
     process.stdout.write(`${JSON.stringify(execution.result)}\n`);
     return execution.exitCode;
   } catch (error) {

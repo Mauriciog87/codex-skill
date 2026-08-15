@@ -1,48 +1,54 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  colorizeStatus,
   executorLaunchMessage,
   executorResultMessage,
+  shouldUseColor,
   ultraLaunchMessage,
   ultraResultMessage,
   writeStatusMessage,
-} from "../.agents/skills/sol-sol-orchestration/scripts/orchestration-messages.mjs";
+} from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-messages.mjs";
 
-test("executor messages identify a separate executor and verified routing", () => {
+test("executor messages identify the complete verified route", () => {
   assert.equal(
     executorLaunchMessage({
-      profile: "explore",
-      model: "gpt-5.6-sol",
-      reasoningEffort: "medium",
+      profile: "playwright",
+      model: "gpt-5.6-luna",
+      reasoningEffort: "max",
+      serviceTier: "standard",
       sandboxMode: "read-only",
     }),
-    "Sol orchestrator: Launching a separate explore executor with gpt-5.6-sol at medium reasoning in read-only mode.",
+    "◆ PLAYWRIGHT · GPT-5.6-LUNA · MAX · STANDARD · READ-ONLY",
   );
   assert.equal(
     executorResultMessage({
       status: "completed",
       profile: "explore",
-      model: "gpt-5.6-sol",
-      reasoning_effort: "medium",
+      model: "gpt-5.6-luna",
+      reasoning_effort: "max",
+      service_tier: "fast",
+      sandbox_mode: "read-only",
       routing_verified: true,
     }),
-    "Sol orchestrator: Executor routing verified for explore: gpt-5.6-sol at medium reasoning (routing_verified=true). Status: completed.",
+    "Sol-Luna orchestrator: Executor routing verified for explore: gpt-5.6-luna at max reasoning on fast tier in read-only mode (routing_verified=true). Status: completed.",
   );
 });
 
-test("unverified executor messages do not claim a model or reasoning effort", () => {
+test("unverified executor messages do not claim route metadata", () => {
   const message = executorResultMessage({
     status: "failed",
     profile: "implement",
     model: "gpt-5.6-sol",
     reasoning_effort: "high",
+    service_tier: "standard",
     routing_verified: false,
   });
   assert.equal(
     message,
-    "Sol orchestrator: Executor routing was not verified for implement. Status: failed.",
+    "Sol-Luna orchestrator: Executor routing was not verified for implement. Status: failed.",
   );
-  assert.doesNotMatch(message, /gpt-5\.6-sol|high reasoning/);
+  assert.doesNotMatch(message, /gpt-5\.6-sol|high reasoning|standard tier/);
 });
 
 test("Ultra messages identify takeover mode and recovery state", () => {
@@ -50,9 +56,10 @@ test("Ultra messages identify takeover mode and recovery state", () => {
     ultraLaunchMessage({
       model: "gpt-5.6-sol",
       reasoningEffort: "ultra",
+      serviceTier: "standard",
       sandboxMode: "read-only",
     }),
-    "Sol orchestrator: Starting an exclusive Ultra takeover with gpt-5.6-sol at ultra reasoning in read-only mode.",
+    "◆ ULTRA · GPT-5.6-SOL · ULTRA · STANDARD · READ-ONLY",
   );
   assert.equal(
     ultraResultMessage({
@@ -60,16 +67,26 @@ test("Ultra messages identify takeover mode and recovery state", () => {
       routing_verified: false,
       warnings: ["Ultra lock is recovery-required."],
     }),
-    "Sol orchestrator: Ultra routing was not verified. Status: failed. The repository lock requires recovery.",
+    "Sol-Luna orchestrator: Ultra routing was not verified. Status: failed. The repository lock requires recovery.",
   );
 });
 
-test("status messages use the supplied stream", () => {
+test("status colors respect TTY, NO_COLOR, TERM, and FORCE_COLOR", () => {
+  const ttyStream = { isTTY: true, write() {} };
+  const plainStream = { isTTY: false, write() {} };
+  assert.equal(shouldUseColor(ttyStream, {}), true);
+  assert.equal(shouldUseColor(ttyStream, { NO_COLOR: "1" }), false);
+  assert.equal(shouldUseColor(ttyStream, { TERM: "dumb" }), false);
+  assert.equal(shouldUseColor(plainStream, { FORCE_COLOR: "1" }), true);
+  assert.equal(colorizeStatus("route", 94, { stream: ttyStream, environment: {} }), "\u001b[94mroute\u001b[0m");
+
   let output = "";
-  writeStatusMessage("Sol orchestrator: Test message.", {
+  const stream = {
+    isTTY: true,
     write(value) {
       output += value;
     },
-  });
-  assert.equal(output, "Sol orchestrator: Test message.\n");
+  };
+  writeStatusMessage("route", stream, { colorCode: 94, environment: {} });
+  assert.equal(output, "\u001b[94mroute\u001b[0m\n");
 });

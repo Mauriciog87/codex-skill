@@ -1,8 +1,12 @@
 model = "gpt-5.6-sol"
 model_reasoning_effort = "xhigh"
 model_verbosity = "low"
+service_tier = "default"
 plan_mode_reasoning_effort = "xhigh"
 
 [agents]
 max_depth = 1
 max_threads = 4
+
+[features]
+fast_mode = false

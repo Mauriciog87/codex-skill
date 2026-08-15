@@ -12,14 +12,14 @@ import {
   createUltraDeveloperInstructions,
   invokeUltra,
   parseUltraArguments,
-} from "../.agents/skills/sol-sol-orchestration/scripts/invoke-sol-ultra.mjs";
+} from "../.agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs";
 import {
   ORCHESTRATION_LOCK_ENV,
   SOL_MODEL_VERBOSITY,
   beginExecutorRun,
   finishExecutorRun,
   readUltraLock,
-} from "../.agents/skills/sol-sol-orchestration/scripts/orchestration-state.mjs";
+} from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
 
 async function createFixture(context) {
   const root = await mkdtemp(join(tmpdir(), "sol-ultra-launcher-"));
@@ -35,7 +35,17 @@ async function writeRoutingMetadata(sessionsRoot, threadId, effort, model = "gpt
   await mkdir(sessionsRoot, { recursive: true });
   await writeFile(
     join(sessionsRoot, `rollout-${threadId}.jsonl`),
-    `${JSON.stringify({ type: "turn_context", payload: { model, effort } })}\n`,
+    [
+      JSON.stringify({ type: "turn_context", payload: { model, effort } }),
+      JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "thread_settings_applied",
+          thread_settings: { model, reasoning_effort: effort, service_tier: "default" },
+        },
+      }),
+      "",
+    ].join("\n"),
   );
 }
 
@@ -132,28 +142,22 @@ test("Ultra command and instructions pin the exclusive Sol runtime", () => {
   assert.match(instructions, /^CODEX_ORCHESTRATION_ROLE=ultra-orchestrator$/m);
   assert.match(instructions, /^CODEX_ORCHESTRATION_LOCK_ID=lock-123$/m);
   assert.match(instructions, /Do not use native spawn_agent/);
-  assert.match(instructions, /invoke-sol-executor\.mjs/);
+  assert.match(instructions, /invoke-profile-executor\.mjs/);
+  assert.match(instructions, /implement-lite\|playwright/);
   const args = buildUltraCodexArguments({
     cwd: resolve("repository"),
     sandboxMode: "read-only",
     lockId: "lock-123",
     outputPath: resolve("result.json"),
   });
-  assert.deepEqual(args.slice(0, 13), [
-    "-m",
-    "gpt-5.6-sol",
-    "-c",
-    'model_reasoning_effort="ultra"',
-    "-c",
-    `model_verbosity=${JSON.stringify(SOL_MODEL_VERBOSITY)}`,
-    "-c",
-    "features.multi_agent=false",
-    "-c",
-    "agents.max_depth=1",
-    "-c",
-    "agents.max_threads=1",
-    "-c",
-  ]);
+  assert.deepEqual(args.slice(0, 2), ["-m", "gpt-5.6-sol"]);
+  assert.ok(args.includes('model_reasoning_effort="ultra"'));
+  assert.ok(args.includes(`model_verbosity=${JSON.stringify(SOL_MODEL_VERBOSITY)}`));
+  assert.ok(args.includes('service_tier="default"'));
+  assert.ok(args.includes("features.fast_mode=false"));
+  assert.ok(args.includes("features.multi_agent=false"));
+  assert.ok(args.includes("agents.max_depth=1"));
+  assert.ok(args.includes("agents.max_threads=1"));
   assert.equal(args.includes("danger-full-access"), false);
   assert.equal(args.includes("--dangerously-bypass-approvals-and-sandbox"), false);
   assert.equal(args.includes("--ask-for-approval"), false);
@@ -168,6 +172,7 @@ test("Ultra result preserves the public key order", () => {
     "thread_id",
     "model",
     "reasoning_effort",
+    "service_tier",
     "routing_verified",
     "sandbox_mode",
     "summary",
@@ -194,6 +199,7 @@ test("verified Ultra completion releases its repository lock", async (context) =
   assert.equal(execution.result.status, "completed");
   assert.equal(execution.result.model, "gpt-5.6-sol");
   assert.equal(execution.result.reasoning_effort, "ultra");
+  assert.equal(execution.result.service_tier, "standard");
   assert.equal(execution.result.routing_verified, true);
   assert.equal(
     await readUltraLock(fixture.repository, { homeDirectory: fixture.homeDirectory }),
@@ -235,6 +241,7 @@ test("Ultra reconstructs verified executors from registered leases", async (cont
       const lease = await beginExecutorRun({
         cwd: fixture.repository,
         profile: "implement",
+        model: "gpt-5.6-sol",
         environment: runnerOptions.environment,
         homeDirectory: fixture.homeDirectory,
       });
@@ -250,6 +257,7 @@ test("Ultra reconstructs verified executors from registered leases", async (cont
           thread_id: "implement-thread",
           model: "gpt-5.6-sol",
           reasoning_effort: "high",
+          service_tier: "standard",
           routing_verified: true,
         },
       });
@@ -264,6 +272,7 @@ test("Ultra reconstructs verified executors from registered leases", async (cont
       thread_id: "implement-thread",
       model: "gpt-5.6-sol",
       reasoning_effort: "high",
+      service_tier: "standard",
       routing_verified: true,
     },
   ]);
@@ -299,6 +308,7 @@ test("timeout and routing mismatch require manual recovery", async (context) => 
   assert.equal(mismatchExecution.exitCode, 2);
   assert.equal(mismatchExecution.result.model, "gpt-5.5");
   assert.equal(mismatchExecution.result.reasoning_effort, "xhigh");
+  assert.equal(mismatchExecution.result.service_tier, "standard");
   assert.equal(mismatchExecution.result.routing_verified, false);
   assert.equal(
     (await readUltraLock(mismatchFixture.repository, {

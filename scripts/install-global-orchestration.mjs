@@ -16,17 +16,25 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SOL_MODEL_VERBOSITY } from "../.agents/skills/sol-sol-orchestration/scripts/orchestration-state.mjs";
+import { SOL_MODEL_VERBOSITY } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
 
-export const SKILL_NAME = "sol-sol-orchestration";
-export const LEGACY_SKILL_NAME = "sol-terra-orchestration";
-export const MANAGED_BLOCK_START = "<!-- sol-sol-orchestration:start -->";
-export const MANAGED_BLOCK_END = "<!-- sol-sol-orchestration:end -->";
-export const MANAGED_HOOKS_START = "# sol-sol-orchestration:hooks:start";
-export const MANAGED_HOOKS_END = "# sol-sol-orchestration:hooks:end";
+export const SKILL_NAME = "sol-luna-orchestration";
+export const LEGACY_SKILL_NAME = "sol-sol-orchestration";
+export const TERRA_LEGACY_SKILL_NAME = "sol-terra-orchestration";
+export const MANAGED_BLOCK_START = "<!-- sol-luna-orchestration:start -->";
+export const MANAGED_BLOCK_END = "<!-- sol-luna-orchestration:end -->";
+export const MANAGED_HOOKS_START = "# sol-luna-orchestration:hooks:start";
+export const MANAGED_HOOKS_END = "# sol-luna-orchestration:hooks:end";
 
-const SKILL_DISPLAY_NAME = "Sol-Sol Orchestration";
-const LEGACY_SKILL_DISPLAY_NAME = "Sol-Terra Orchestration";
+const SKILL_DISPLAY_NAME = "Sol-Luna Orchestration";
+const LEGACY_SKILL_DISPLAY_NAME = "Sol-Sol Orchestration";
+const TERRA_LEGACY_SKILL_DISPLAY_NAME = "Sol-Terra Orchestration";
+const LEGACY_MANAGED_BLOCK_START = "<!-- sol-sol-orchestration:start -->";
+const LEGACY_MANAGED_BLOCK_END = "<!-- sol-sol-orchestration:end -->";
+const TERRA_MANAGED_BLOCK_START = "<!-- sol-terra-orchestration:start -->";
+const TERRA_MANAGED_BLOCK_END = "<!-- sol-terra-orchestration:end -->";
+const LEGACY_MANAGED_HOOKS_START = "# sol-sol-orchestration:hooks:start";
+const LEGACY_MANAGED_HOOKS_END = "# sol-sol-orchestration:hooks:end";
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_REPOSITORY_ROOT = resolve(SCRIPT_DIRECTORY, "..");
 
@@ -315,7 +323,7 @@ function managedHooksLines(hookScriptPath) {
     `command = ${serializedCommand}`,
     `command_windows = ${serializedCommand}`,
     "timeout = 10",
-    'statusMessage = "Checking exclusive Sol Ultra state"',
+    'statusMessage = "Checking exclusive Sol-Luna Ultra state"',
     "",
     "[[hooks.PreToolUse]]",
     'matcher = "^(Bash|Shell|shell|local_shell|shell_command|exec_command|unified_exec|apply_patch|Edit|Write|mcp__.*)$"',
@@ -325,12 +333,20 @@ function managedHooksLines(hookScriptPath) {
     `command = ${serializedCommand}`,
     `command_windows = ${serializedCommand}`,
     "timeout = 10",
-    'statusMessage = "Enforcing exclusive Sol Ultra state"',
+    'statusMessage = "Enforcing exclusive Sol-Luna Ultra state"',
     MANAGED_HOOKS_END,
   ];
 }
 
 function updateManagedHooks(lines, hookScriptPath) {
+  for (let index = 0; index < lines.length; index += 1) {
+    if (lines[index].trim() === LEGACY_MANAGED_HOOKS_START) {
+      lines[index] = MANAGED_HOOKS_START;
+    }
+    if (lines[index].trim() === LEGACY_MANAGED_HOOKS_END) {
+      lines[index] = MANAGED_HOOKS_END;
+    }
+  }
   const starts = [];
   const ends = [];
   for (let index = 0; index < lines.length; index += 1) {
@@ -343,10 +359,10 @@ function updateManagedHooks(lines, hookScriptPath) {
     }
   }
   if (starts.length !== ends.length || starts.length > 1) {
-    throw new Error("Global config contains malformed Sol-Sol hook markers.");
+    throw new Error("Global config contains malformed Sol-Luna hook markers.");
   }
   if (starts.length === 1 && starts[0] >= ends[0]) {
-    throw new Error("Global config contains malformed Sol-Sol hook markers.");
+    throw new Error("Global config contains malformed Sol-Luna hook markers.");
   }
   const block = managedHooksLines(hookScriptPath);
   if (starts.length === 1) {
@@ -369,9 +385,11 @@ export function updateGlobalConfig(content, { hookScriptPath = null } = {}) {
     model: "gpt-5.6-sol",
     model_reasoning_effort: "xhigh",
     model_verbosity: SOL_MODEL_VERBOSITY,
+    service_tier: "default",
     plan_mode_reasoning_effort: "xhigh",
   });
   setAgentsValues(shape.lines, { max_depth: 1, max_threads: 4 });
+  setFeaturesValues(shape.lines, { fast_mode: false });
   if (hookScriptPath !== null) {
     setFeaturesValues(shape.lines, { hooks: true });
     updateManagedHooks(shape.lines, hookScriptPath);
@@ -384,9 +402,9 @@ export function updateGlobalConfig(content, { hookScriptPath = null } = {}) {
 function managedBlockLines() {
   return [
     MANAGED_BLOCK_START,
-    "# Global Sol-Sol orchestration",
+    "# Global Sol-Luna orchestration",
     "",
-    "For every new substantive root task, explicitly invoke `$sol-sol-orchestration` before planning, delegating, or editing. A session whose developer instructions contain `CODEX_ORCHESTRATION_ROLE=executor` is an executor and must not invoke the skill or apply the root workflow.",
+    "For every new substantive root task, explicitly invoke `$sol-luna-orchestration` before planning, delegating, or editing. The root uses Sol/xhigh/Standard. Verified executors use the profile registry; Luna has capacity 10, Sol has capacity 4, and Playwright has a global sublimit of 2. Capacity is not a fan-out target.",
     "",
     "A human-confirmed Sol Ultra takeover owns its repository exclusively while its lock is active. Other root sessions must pause, and only executors carrying the matching `CODEX_ORCHESTRATION_LOCK_ID` may run. Never remove lock state manually; inspect or recover it through the orchestration gate.",
     MANAGED_BLOCK_END,
@@ -396,6 +414,14 @@ function managedBlockLines() {
 export function updateGlobalInstructions(content) {
   const original = content ?? "";
   const shape = textShape(content);
+  for (let index = 0; index < shape.lines.length; index += 1) {
+    if ([LEGACY_MANAGED_BLOCK_START, TERRA_MANAGED_BLOCK_START].includes(shape.lines[index].trim())) {
+      shape.lines[index] = MANAGED_BLOCK_START;
+    }
+    if ([LEGACY_MANAGED_BLOCK_END, TERRA_MANAGED_BLOCK_END].includes(shape.lines[index].trim())) {
+      shape.lines[index] = MANAGED_BLOCK_END;
+    }
+  }
   const starts = [];
   const ends = [];
   for (let index = 0; index < shape.lines.length; index += 1) {
@@ -408,18 +434,18 @@ export function updateGlobalInstructions(content) {
     }
   }
   if (starts.length !== ends.length || starts.length > 1) {
-    throw new Error("Global instructions contain malformed Sol-Sol managed markers.");
+    throw new Error("Global instructions contain malformed Sol-Luna managed markers.");
   }
   if (starts.length === 1 && starts[0] >= ends[0]) {
-    throw new Error("Global instructions contain malformed Sol-Sol managed markers.");
+    throw new Error("Global instructions contain malformed Sol-Luna managed markers.");
   }
 
   const unmanagedLines = [...shape.lines];
   if (starts.length === 1) {
     unmanagedLines.splice(starts[0], ends[0] - starts[0] + 1);
   }
-  if (unmanagedLines.some((line) => /sol-terra-orchestration|SOL_TERRA_ROLE/.test(line))) {
-    throw new Error("Global instructions contain unmanaged Sol-Terra orchestration references.");
+  if (unmanagedLines.some((line) => /sol-(?:sol|terra)-orchestration|SOL_TERRA_ROLE/.test(line))) {
+    throw new Error("Global instructions contain unmanaged legacy orchestration references.");
   }
 
   const block = managedBlockLines();
@@ -511,12 +537,23 @@ export async function installGlobalOrchestration({
   platform = process.platform,
 } = {}) {
   const canonicalDirectory = resolve(repositoryRoot, ".agents", "skills", SKILL_NAME);
-  const legacyCanonicalDirectory = resolve(
-    repositoryRoot,
-    ".agents",
-    "skills",
-    LEGACY_SKILL_NAME,
-  );
+  const legacySkills = [
+    {
+      name: LEGACY_SKILL_NAME,
+      displayName: LEGACY_SKILL_DISPLAY_NAME,
+      canonicalDirectory: resolve(repositoryRoot, ".agents", "skills", LEGACY_SKILL_NAME),
+    },
+    {
+      name: TERRA_LEGACY_SKILL_NAME,
+      displayName: TERRA_LEGACY_SKILL_DISPLAY_NAME,
+      canonicalDirectory: resolve(
+        repositoryRoot,
+        ".agents",
+        "skills",
+        TERRA_LEGACY_SKILL_NAME,
+      ),
+    },
+  ];
   const globalSkillsDirectory = resolve(homeDirectory, ".agents", "skills");
   const destination = join(globalSkillsDirectory, SKILL_NAME);
   const canonicalHookScript = join(canonicalDirectory, "scripts", "orchestration-gate.mjs");
@@ -536,21 +573,21 @@ export async function installGlobalOrchestration({
   const destinationState = await inspectDestination(destination, canonicalDirectory, platform);
   const legacySpecifications = uniqueLegacySpecifications(
     [
-      {
-        location: join(globalSkillsDirectory, LEGACY_SKILL_NAME),
-        expectedTarget: legacyCanonicalDirectory,
-        expectedName: LEGACY_SKILL_NAME,
-        expectedDisplayName: LEGACY_SKILL_DISPLAY_NAME,
+      ...legacySkills.map((legacySkill) => ({
+        location: join(globalSkillsDirectory, legacySkill.name),
+        expectedTarget: legacySkill.canonicalDirectory,
+        expectedName: legacySkill.name,
+        expectedDisplayName: legacySkill.displayName,
         platform,
-      },
+      })),
       ...[codexHome, defaultCodexHome].flatMap((skillsHome) => [
-        {
-          location: join(skillsHome, "skills", LEGACY_SKILL_NAME),
-          expectedTarget: legacyCanonicalDirectory,
-          expectedName: LEGACY_SKILL_NAME,
-          expectedDisplayName: LEGACY_SKILL_DISPLAY_NAME,
+        ...legacySkills.map((legacySkill) => ({
+          location: join(skillsHome, "skills", legacySkill.name),
+          expectedTarget: legacySkill.canonicalDirectory,
+          expectedName: legacySkill.name,
+          expectedDisplayName: legacySkill.displayName,
           platform,
-        },
+        })),
         {
           location: join(skillsHome, "skills", SKILL_NAME),
           expectedTarget: canonicalDirectory,

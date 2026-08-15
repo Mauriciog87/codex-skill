@@ -3,17 +3,19 @@ import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import test from "node:test";
-import { EXECUTOR_PROFILES } from "../.agents/skills/sol-sol-orchestration/scripts/executor-profiles.mjs";
-import { SOL_MODEL_VERBOSITY } from "../.agents/skills/sol-sol-orchestration/scripts/orchestration-state.mjs";
+import { EXECUTOR_PROFILES } from "../.agents/skills/sol-luna-orchestration/scripts/executor-profiles.mjs";
+import { SOL_MODEL_VERBOSITY } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
 
 const execFileAsync = promisify(execFile);
 const migrationFiles = new Set([
+  ".agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs",
+  "README.md",
   "scripts/install-global-orchestration.mjs",
   "tests/install-global-orchestration.test.mjs",
   "tests/static-policy.test.mjs",
 ]);
 
-test("tracked operational files contain only the Sol-Sol architecture", async () => {
+test("tracked operational files contain only the Sol-Luna architecture", async () => {
   const { stdout } = await execFileAsync("git", ["ls-files", "-co", "--exclude-standard"], {
     windowsHide: true,
   });
@@ -30,7 +32,7 @@ test("tracked operational files contain only the Sol-Sol architecture", async ()
     const content = await readFile(path, "utf8");
     assert.doesNotMatch(
       content,
-      /gpt-5\.6-terra|invoke-terra|SOL_TERRA|sol-terra-orchestration/,
+      /gpt-5\.6-terra|invoke-terra|SOL_TERRA|sol-terra-orchestration|invoke-sol-executor|sol-sol-orchestration/,
       `Stale orchestration reference in ${path}`,
     );
   }
@@ -42,16 +44,16 @@ test("package scripts and skill policy expose the supported interfaces", async (
   assert.deepEqual(packageJson.scripts, {
     "install:global": "node scripts/install-global-orchestration.mjs",
     executor:
-      "node .agents/skills/sol-sol-orchestration/scripts/invoke-sol-executor.mjs",
-    ultra: "node .agents/skills/sol-sol-orchestration/scripts/invoke-sol-ultra.mjs",
+      "node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs",
+    ultra: "node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs",
     "ultra:gate":
-      "node .agents/skills/sol-sol-orchestration/scripts/orchestration-gate.mjs",
+      "node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs",
     test: "node --test",
     "verify:live": "node scripts/verify-routing.mjs",
   });
 
   const metadata = await readFile(
-    ".agents/skills/sol-sol-orchestration/agents/openai.yaml",
+    ".agents/skills/sol-luna-orchestration/agents/openai.yaml",
     "utf8",
   );
   assert.match(metadata, /^\s*allow_implicit_invocation: false$/m);
@@ -59,7 +61,9 @@ test("package scripts and skill policy expose the supported interfaces", async (
   assert.match(config, /^model = "gpt-5\.6-sol"$/m);
   assert.match(config, /^model_reasoning_effort = "xhigh"$/m);
   assert.match(config, new RegExp(`^model_verbosity = "${SOL_MODEL_VERBOSITY}"$`, "m"));
+  assert.match(config, /^service_tier = "default"$/m);
   assert.match(config, /^plan_mode_reasoning_effort = "xhigh"$/m);
+  assert.match(config, /^max_threads = 4$/m);
 });
 
 test("profile registry and operational guidance stay aligned", async () => {
@@ -67,36 +71,35 @@ test("profile registry and operational guidance stay aligned", async () => {
     Object.fromEntries(
       Object.entries(EXECUTOR_PROFILES).map(([name, profile]) => [
         name,
-        [profile.reasoningEffort, profile.sandboxMode],
+        [profile.model, profile.reasoningEffort, profile.serviceTier, profile.sandboxMode],
       ]),
     ),
     {
-      explore: ["medium", "read-only"],
-      implement: ["high", "workspace-write"],
-      review: ["high", "read-only"],
+      explore: ["gpt-5.6-luna", "max", "fast", "read-only"],
+      "implement-lite": ["gpt-5.6-luna", "max", "fast", "workspace-write"],
+      playwright: ["gpt-5.6-luna", "max", "standard", "read-only"],
+      implement: ["gpt-5.6-sol", "high", "standard", "workspace-write"],
+      review: ["gpt-5.6-sol", "high", "standard", "read-only"],
     },
   );
 
   const launcher = await readFile(
-    ".agents/skills/sol-sol-orchestration/scripts/invoke-sol-executor.mjs",
+    ".agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs",
     "utf8",
   );
   assert.match(launcher, /--profile/);
   assert.match(launcher, /CODEX_EXECUTOR_PROFILE/);
-  assert.match(launcher, /model_verbosity/);
-  assert.doesNotMatch(launcher, /EXECUTOR_REASONING_EFFORT/);
-  const registry = await readFile(
-    ".agents/skills/sol-sol-orchestration/scripts/executor-profiles.mjs",
-    "utf8",
-  );
-  assert.doesNotMatch(registry, /ultra/);
+  assert.match(launcher, /service_tier/);
+  assert.match(launcher, /PLAYWRIGHT_MCP_ISOLATED/);
+  assert.match(launcher, /playwright_mcp:verified/);
+  assert.doesNotMatch(launcher, /EXECUTOR_MODEL|EXECUTOR_REASONING_EFFORT/);
 
   const ultraLauncher = await readFile(
-    ".agents/skills/sol-sol-orchestration/scripts/invoke-sol-ultra.mjs",
+    ".agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs",
     "utf8",
   );
   assert.match(ultraLauncher, /ULTRA_REASONING_EFFORT/);
-  assert.match(ultraLauncher, /model_verbosity/);
+  assert.match(ultraLauncher, /ULTRA_SERVICE_TIER/);
   assert.match(ultraLauncher, /--confirm-exclusive-takeover/);
   assert.match(ultraLauncher, /features\.multi_agent=false/);
   assert.match(ultraLauncher, /CODEX_ORCHESTRATION_LOCK_ID/);
@@ -104,17 +107,20 @@ test("profile registry and operational guidance stay aligned", async () => {
   for (const path of [
     "AGENTS.md",
     "README.md",
-    ".agents/skills/sol-sol-orchestration/SKILL.md",
+    ".agents/skills/sol-luna-orchestration/SKILL.md",
   ]) {
     const content = await readFile(path, "utf8");
     assert.match(content, /explore/);
+    assert.match(content, /implement-lite/);
+    assert.match(content, /playwright/);
     assert.match(content, /implement/);
     assert.match(content, /review/);
-    assert.match(content, /medium/);
-    assert.match(content, /high/);
-    assert.match(content, /xhigh/);
+    assert.match(content, /Luna/);
+    assert.match(content, /Fast/);
+    assert.match(content, /Standard/);
     assert.match(content, /model_verbosity.*low/);
-    assert.match(content, /ultra/i);
+    assert.match(content, /10/);
+    assert.match(content, /14/);
     assert.match(content, /recovery-required/);
   }
 });

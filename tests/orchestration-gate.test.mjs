@@ -3,8 +3,8 @@ import test from "node:test";
 import {
   evaluateHook,
   parseGateArguments,
-} from "../.agents/skills/sol-sol-orchestration/scripts/orchestration-gate.mjs";
-import { ORCHESTRATION_LOCK_ENV } from "../.agents/skills/sol-sol-orchestration/scripts/orchestration-state.mjs";
+} from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs";
+import { ORCHESTRATION_LOCK_ENV } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
 
 const lock = {
   lock_id: "lock-123",
