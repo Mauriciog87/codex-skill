@@ -1,0 +1,184 @@
+import { appendFile } from "node:fs/promises";
+import { createInterface } from "node:readline";
+
+const scenario = JSON.parse(process.env.MOCK_APP_SERVER_SCENARIO ?? "{}");
+const capturePath = process.env.MOCK_APP_SERVER_CAPTURE;
+const threadId = scenario.threadId ?? "mock-thread";
+const turnId = scenario.turnId ?? "mock-turn";
+const model = scenario.model ?? "gpt-5.6-sol";
+const effort = scenario.effort ?? "high";
+const serviceTier = scenario.serviceTier ?? "default";
+const payload = scenario.payload ?? {
+  status: "completed",
+  summary: "Mock task completed.",
+  changed_files: [],
+  checks: [],
+  blockers: [],
+  warnings: [],
+};
+
+if (scenario.ignoreSigterm === true) {
+  process.on("SIGTERM", () => {});
+}
+
+async function capture(message) {
+  if (capturePath !== undefined) {
+    await appendFile(capturePath, `${JSON.stringify(message)}\n`);
+  }
+}
+
+function send(message) {
+  process.stdout.write(`${JSON.stringify(message)}\n`);
+}
+
+function result(id, value) {
+  send({ jsonrpc: "2.0", id, result: value });
+}
+
+function notification(method, params) {
+  send({ jsonrpc: "2.0", method, params });
+}
+
+function settingsNotification() {
+  notification("thread/settings/updated", {
+    threadId,
+    threadSettings: {
+      model: scenario.settingsModel ?? model,
+      effort: scenario.settingsEffort ?? effort,
+      serviceTier: scenario.settingsServiceTier ?? serviceTier,
+    },
+  });
+}
+
+async function handle(message) {
+  await capture(message);
+  if (scenario.invalidJsonAfter === message.method) {
+    process.stdout.write("not-json\n");
+    return;
+  }
+  if (scenario.exitAfter === message.method) {
+    process.exit(7);
+  }
+  if (scenario.hangAfter === message.method) {
+    return;
+  }
+  if (message.method === "initialize") {
+    result(message.id, { serverInfo: { name: "mock", version: "1" } });
+    return;
+  }
+  if (message.method === "initialized") {
+    return;
+  }
+  if (scenario.rpcErrorAt === message.method) {
+    send({
+      jsonrpc: "2.0",
+      id: message.id,
+      error: { code: -32601, message: "Simulated RPC error" },
+    });
+    return;
+  }
+  if (message.method === "model/list") {
+    result(message.id, {
+      data: scenario.models ?? [
+        {
+          id: model,
+          supportedReasoningEfforts: scenario.efforts ?? [{ reasoningEffort: effort }],
+          serviceTiers: scenario.serviceTiers ?? [{ id: "priority" }],
+          additionalSpeedTiers: scenario.additionalSpeedTiers ?? ["fast"],
+        },
+      ],
+    });
+    return;
+  }
+  if (message.method === "thread/start") {
+    result(message.id, {
+      model: scenario.threadModel ?? model,
+      serviceTier: scenario.threadServiceTier ?? message.params.serviceTier,
+      thread: {
+        id: threadId,
+        cliVersion: scenario.cliVersion ?? "0.147.0",
+      },
+    });
+    return;
+  }
+  if (message.method === "thread/settings/update") {
+    if (scenario.omitSettingsNotification === true) {
+      result(message.id, scenario.settingsResult ?? {});
+      return;
+    }
+    if (scenario.settingsNotificationFirst === true) {
+      settingsNotification();
+      result(message.id, scenario.settingsResult ?? {});
+    } else {
+      result(message.id, scenario.settingsResult ?? {});
+      settingsNotification();
+    }
+    return;
+  }
+  if (message.method === "turn/start") {
+    result(message.id, { turn: { id: turnId, status: "inProgress" } });
+    if (scenario.serverRequest !== undefined) {
+      send({
+        jsonrpc: "2.0",
+        id: 900,
+        method: scenario.serverRequest,
+        params: { threadId, turnId },
+      });
+      return;
+    }
+    if (scenario.toolName !== undefined) {
+      notification("item/started", {
+        threadId,
+        turnId,
+        item: {
+          type: "mcpToolCall",
+          server: "playwright",
+          tool: scenario.toolName,
+        },
+      });
+    }
+    const item = {
+      type: "agentMessage",
+      id: "message-1",
+      text: scenario.finalResponse ?? JSON.stringify(payload),
+      phase: "final_answer",
+    };
+    const emitItem = () => notification("item/completed", { threadId, turnId, item });
+    const emitTerminal = () => notification("turn/completed", {
+      threadId,
+      turn: { id: turnId, status: scenario.turnStatus ?? "completed" },
+    });
+    if (scenario.terminalBeforeItem === true) {
+      emitTerminal();
+      emitItem();
+    } else {
+      emitItem();
+      emitTerminal();
+    }
+    return;
+  }
+  if (message.method === "turn/interrupt") {
+    result(message.id, {});
+    notification("turn/completed", {
+      threadId,
+      turn: { id: turnId, status: "interrupted" },
+    });
+    return;
+  }
+  if (message.id === 900) {
+    if (scenario.hangAfterServerResponse === true) {
+      return;
+    }
+    notification("turn/completed", {
+      threadId,
+      turn: { id: turnId, status: "interrupted" },
+    });
+  }
+}
+
+const reader = createInterface({ input: process.stdin, crlfDelay: Infinity });
+for await (const line of reader) {
+  if (line.trim().length > 0) {
+    await handle(JSON.parse(line));
+  }
+}

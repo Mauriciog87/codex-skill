@@ -16,6 +16,8 @@ The root Codex session is the orchestrator. At the beginning of every new substa
 
 Every role uses `model_verbosity = "low"`. Fast profiles force `features.fast_mode = true`; Standard roles force it to `false`. Verbosity controls response length independently from reasoning effort.
 
+The launchers require Codex CLI 0.147.0 or a later compatible version and use the experimental Codex App Server over local stdio JSON-RPC. They do not fall back to the legacy execution path. Fast maps to protocol `priority`; Standard maps to protocol `default`.
+
 All executor work must use:
 
 ```text
@@ -76,4 +78,4 @@ node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs recove
 
 `playwright` keeps repository files unchanged, uses the configured Playwright MCP in an isolated temporary environment, and never calls `browser_run_code_unsafe`. Full interaction is limited to localhost and named dev/test targets. External state changes require explicit destination-specific authorization, and purchases, deletion, publishing, messaging, account/security changes, or production mutation are prohibited.
 
-The launcher verifies rollout metadata for model, effort, and service tier. An absent or mismatched value is a routing failure. System, developer, security, user, and more-specific project instructions take precedence over this policy.
+The launcher requires matching `thread/settings/updated` evidence for effective model, effort, and tier plus rollout `turn_context` evidence for the model and effort used during the turn. Missing, contradictory, or incompatible protocol evidence is a routing failure. System, developer, security, user, and more-specific project instructions take precedence over this policy.

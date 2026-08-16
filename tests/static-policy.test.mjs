@@ -92,7 +92,21 @@ test("profile registry and operational guidance stay aligned", async () => {
   assert.match(launcher, /service_tier/);
   assert.match(launcher, /PLAYWRIGHT_MCP_ISOLATED/);
   assert.match(launcher, /playwright_mcp:verified/);
+  assert.doesNotMatch(launcher, /"exec"|output-last-message/);
   assert.doesNotMatch(launcher, /EXECUTOR_MODEL|EXECUTOR_REASONING_EFFORT/);
+
+  const appServerClient = await readFile(
+    ".agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs",
+    "utf8",
+  );
+  assert.match(appServerClient, /app-server/);
+  assert.match(appServerClient, /thread\/settings\/update/);
+  assert.match(appServerClient, /thread\/settings\/updated/);
+  assert.match(appServerClient, /experimentalApi: true/);
+  assert.match(appServerClient, /features\.multi_agent=false/);
+  assert.match(appServerClient, /agents\.max_depth=1/);
+  assert.match(appServerClient, /agents\.max_threads=1/);
+  assert.doesNotMatch(appServerClient, /"exec"|--json|output-last-message/);
 
   const ultraLauncher = await readFile(
     ".agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs",
@@ -101,8 +115,8 @@ test("profile registry and operational guidance stay aligned", async () => {
   assert.match(ultraLauncher, /ULTRA_REASONING_EFFORT/);
   assert.match(ultraLauncher, /ULTRA_SERVICE_TIER/);
   assert.match(ultraLauncher, /--confirm-exclusive-takeover/);
-  assert.match(ultraLauncher, /features\.multi_agent=false/);
   assert.match(ultraLauncher, /CODEX_ORCHESTRATION_LOCK_ID/);
+  assert.doesNotMatch(ultraLauncher, /"exec"|--json|output-last-message/);
 
   for (const path of [
     "AGENTS.md",
@@ -122,5 +136,10 @@ test("profile registry and operational guidance stay aligned", async () => {
     assert.match(content, /10/);
     assert.match(content, /14/);
     assert.match(content, /recovery-required/);
+    assert.match(content, /experimental Codex App Server/);
+    assert.match(content, /0\.147\.0/);
+    assert.match(content, /thread\/settings\/updated/);
+    assert.match(content, /priority/);
+    assert.match(content, /default/);
   }
 });

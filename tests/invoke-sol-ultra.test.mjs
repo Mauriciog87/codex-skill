@@ -7,7 +7,7 @@ import {
   DEFAULT_ULTRA_SANDBOX_MODE,
   DEFAULT_ULTRA_TIMEOUT_SECONDS,
   UltraInvocationError,
-  buildUltraCodexArguments,
+  buildUltraAppServerArguments,
   createStableUltraResult,
   createUltraDeveloperInstructions,
   invokeUltra,
@@ -20,6 +20,7 @@ import {
   finishExecutorRun,
   readUltraLock,
 } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
+import { AppServerTimeoutError } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
 
 async function createFixture(context) {
   const root = await mkdtemp(join(tmpdir(), "sol-ultra-launcher-"));
@@ -35,17 +36,7 @@ async function writeRoutingMetadata(sessionsRoot, threadId, effort, model = "gpt
   await mkdir(sessionsRoot, { recursive: true });
   await writeFile(
     join(sessionsRoot, `rollout-${threadId}.jsonl`),
-    [
-      JSON.stringify({ type: "turn_context", payload: { model, effort } }),
-      JSON.stringify({
-        type: "event_msg",
-        payload: {
-          type: "thread_settings_applied",
-          thread_settings: { model, reasoning_effort: effort, service_tier: "default" },
-        },
-      }),
-      "",
-    ].join("\n"),
+    `${JSON.stringify({ type: "turn_context", payload: { model, effort } })}\n`,
   );
 }
 
@@ -61,25 +52,22 @@ function completedPayload(overrides = {}) {
   };
 }
 
-function processResult(threadId, overrides = {}) {
-  return {
-    exitCode: 0,
-    signal: null,
-    timedOut: false,
-    aborted: false,
-    threadId,
-    warnings: [],
-    stderr: "",
-    ...overrides,
-  };
-}
-
 function createRunner(threadId, payload, action = async () => {}) {
-  return async (_command, args, options) => {
+  return async (options) => {
     await action(options);
-    const outputPath = args[args.indexOf("-o") + 1];
-    await writeFile(outputPath, JSON.stringify(payload));
-    return processResult(threadId);
+    return {
+      threadId,
+      model: options.model,
+      reasoningEffort: options.reasoningEffort,
+      serviceTier: options.serviceTier,
+      turnStatus: "completed",
+      finalResponse: JSON.stringify(payload),
+      blockedReason: null,
+      warnings: [],
+      stderr: "",
+      playwrightMcpUsed: false,
+      unsafePlaywrightToolUsed: false,
+    };
   };
 }
 
@@ -144,20 +132,15 @@ test("Ultra command and instructions pin the exclusive Sol runtime", () => {
   assert.match(instructions, /Do not use native spawn_agent/);
   assert.match(instructions, /invoke-profile-executor\.mjs/);
   assert.match(instructions, /implement-lite\|playwright/);
-  const args = buildUltraCodexArguments({
-    cwd: resolve("repository"),
-    sandboxMode: "read-only",
-    lockId: "lock-123",
-    outputPath: resolve("result.json"),
-  });
-  assert.deepEqual(args.slice(0, 2), ["-m", "gpt-5.6-sol"]);
-  assert.ok(args.includes('model_reasoning_effort="ultra"'));
+  const args = buildUltraAppServerArguments();
   assert.ok(args.includes(`model_verbosity=${JSON.stringify(SOL_MODEL_VERBOSITY)}`));
   assert.ok(args.includes('service_tier="default"'));
   assert.ok(args.includes("features.fast_mode=false"));
   assert.ok(args.includes("features.multi_agent=false"));
   assert.ok(args.includes("agents.max_depth=1"));
   assert.ok(args.includes("agents.max_threads=1"));
+  assert.deepEqual(args.slice(-3), ["app-server", "--listen", "stdio://"]);
+  assert.equal(args.includes("exec"), false);
   assert.equal(args.includes("danger-full-access"), false);
   assert.equal(args.includes("--dangerously-bypass-approvals-and-sandbox"), false);
   assert.equal(args.includes("--ask-for-approval"), false);
@@ -192,7 +175,7 @@ test("verified Ultra completion releases its repository lock", async (context) =
     briefing: "Resolve the bounded architecture problem.",
     options: ultraOptions(fixture.repository),
     sessionRoots: [fixture.sessionsRoot],
-    processRunner: createRunner(threadId, completedPayload()),
+    appServerRunner: createRunner(threadId, completedPayload()),
     coordinationOptions: { homeDirectory: fixture.homeDirectory },
   });
   assert.equal(execution.exitCode, 0);
@@ -215,7 +198,7 @@ test("structured blocked Ultra result exits one and releases the lock", async (c
     briefing: "Evaluate the bounded blocker.",
     options: ultraOptions(fixture.repository),
     sessionRoots: [fixture.sessionsRoot],
-    processRunner: createRunner(
+    appServerRunner: createRunner(
       threadId,
       completedPayload({ status: "blocked", blockers: ["Human input required"] }),
     ),
@@ -237,7 +220,7 @@ test("Ultra reconstructs verified executors from registered leases", async (cont
     briefing: "Implement the bounded temporary change.",
     options: ultraOptions(fixture.repository, { sandboxMode: "workspace-write" }),
     sessionRoots: [fixture.sessionsRoot],
-    processRunner: createRunner(threadId, completedPayload(), async (runnerOptions) => {
+    appServerRunner: createRunner(threadId, completedPayload(), async (runnerOptions) => {
       const lease = await beginExecutorRun({
         cwd: fixture.repository,
         profile: "implement",
@@ -283,7 +266,11 @@ test("timeout and routing mismatch require manual recovery", async (context) => 
   const timeoutExecution = await invokeUltra({
     briefing: "Wait for the bounded result.",
     options: ultraOptions(timeoutFixture.repository),
-    processRunner: async () => processResult("timed-out", { timedOut: true }),
+    appServerRunner: async () => {
+      throw new AppServerTimeoutError("Sol Ultra takeover timed out after 10 seconds.", {
+        threadId: "timed-out",
+      });
+    },
     coordinationOptions: { homeDirectory: timeoutFixture.homeDirectory },
   });
   assert.equal(timeoutExecution.exitCode, 2);
@@ -302,7 +289,7 @@ test("timeout and routing mismatch require manual recovery", async (context) => 
     briefing: "Verify routing.",
     options: ultraOptions(mismatchFixture.repository),
     sessionRoots: [mismatchFixture.sessionsRoot],
-    processRunner: createRunner(threadId, completedPayload()),
+    appServerRunner: createRunner(threadId, completedPayload()),
     coordinationOptions: { homeDirectory: mismatchFixture.homeDirectory },
   });
   assert.equal(mismatchExecution.exitCode, 2);

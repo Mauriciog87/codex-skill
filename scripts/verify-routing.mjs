@@ -1,18 +1,23 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { once } from "node:events";
-import { lstat, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import {
+  RESULT_SCHEMA_PATH,
   getSessionRoots,
   invokeExecutor,
   runProcess,
   verifySessionRouting,
 } from "../.agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs";
+import {
+  MINIMUM_CODEX_VERSION,
+  runAppServerTurn,
+} from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
 import { EXECUTOR_PROFILES } from "../.agents/skills/sol-luna-orchestration/scripts/executor-profiles.mjs";
 import {
   invokeUltra,
@@ -280,50 +285,113 @@ async function runGlobalRootProbe(sessionRoots) {
       "Do not invoke skills, delegate, inspect files, modify files, or run tools.",
       "Answer the prompt directly and stop.",
     ].join("\n");
-    const rootArguments = [
-      "--strict-config",
-      "-c",
-      "features.multi_agent=false",
-      "-c",
-      "agents.max_depth=1",
-      "-c",
-      "agents.max_threads=1",
-      "-c",
-      `developer_instructions=${JSON.stringify(developerInstructions)}`,
-      "-C",
-      temporaryRepository,
-      "-s",
-      "read-only",
-      "exec",
-      "--json",
-      "-",
-    ];
-    const rootProcess = await runProcess("codex", rootArguments, {
-      input: "Reply only with: Sol routing probe completed.\n",
-      timeoutMs: 300_000,
+    const rootProcess = await runAppServerTurn({
+      command: "codex",
       cwd: temporaryRepository,
+      model: ORCHESTRATOR_MODEL,
+      reasoningEffort: ORCHESTRATOR_REASONING_EFFORT,
+      serviceTier: ORCHESTRATOR_SERVICE_TIER,
+      configuredServiceTier: "default",
+      fastMode: false,
+      sandboxMode: "read-only",
+      developerInstructions,
+      briefing: "Return a completed structured result for the Sol routing probe.",
+      outputSchema: JSON.parse(await readFile(RESULT_SCHEMA_PATH, "utf8")),
+      timeoutMs: 300_000,
     });
-    if (rootProcess.timedOut || rootProcess.aborted) {
-      throw new Error("The Sol routing probe timed out or was interrupted.");
-    }
-    if (rootProcess.exitCode !== 0) {
-      throw new Error(
-        rootProcess.stderr || `Sol routing probe exited with ${rootProcess.exitCode}.`,
-      );
-    }
     if (rootProcess.threadId === null) {
-      throw new Error("The Sol routing probe did not emit a thread_id.");
+      throw new Error("The Sol routing probe did not return a thread id.");
+    }
+    if (rootProcess.turnStatus !== "completed" || rootProcess.blockedReason !== null) {
+      throw new Error("The Sol routing probe did not complete through App Server.");
     }
     const routing = await verifySessionRouting(
       rootProcess.threadId,
       ORCHESTRATOR_MODEL,
       ORCHESTRATOR_REASONING_EFFORT,
-      ORCHESTRATOR_SERVICE_TIER,
       { sessionRoots },
     );
-    return { threadId: rootProcess.threadId, routing };
+    return {
+      threadId: rootProcess.threadId,
+      routing: { ...routing, serviceTier: rootProcess.serviceTier },
+    };
   } finally {
     await rm(temporaryRepository, { recursive: true, force: true });
+  }
+}
+
+async function collectGeneratedSchemaFiles(directory, files = []) {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      await collectGeneratedSchemaFiles(path, files);
+    } else if (entry.isFile() && entry.name.endsWith(".json")) {
+      files.push(path);
+    }
+  }
+  return files;
+}
+
+export async function verifyAppServerSchema() {
+  const outputDirectory = await mkdtemp(join(tmpdir(), "codex-app-server-schema-"));
+  try {
+    await execFileAsync(
+      "codex",
+      ["app-server", "generate-json-schema", "--experimental", "--out", outputDirectory],
+      { windowsHide: true, maxBuffer: 16 * 1024 * 1024 },
+    );
+    const files = await collectGeneratedSchemaFiles(outputDirectory);
+    if (files.length === 0) {
+      throw new Error("App Server schema generation produced no JSON files.");
+    }
+    const schemaDocuments = await Promise.all(
+      files.map(async (path) => JSON.parse(await readFile(path, "utf8"))),
+    );
+    const schemaText = schemaDocuments.map((document) => JSON.stringify(document)).join("\n");
+    for (const requiredShape of [
+      "model/list",
+      "thread/start",
+      "thread/settings/update",
+      "thread/settings/updated",
+      "turn/start",
+      "turn/interrupt",
+      "item/commandExecution/requestApproval",
+      "mcpServer/elicitation/request",
+      "experimentalApi",
+      "serviceTier",
+      "outputSchema",
+      "developerInstructions",
+    ]) {
+      if (!schemaText.includes(requiredShape)) {
+        throw new Error(`Generated App Server schemas do not expose ${requiredShape}.`);
+      }
+    }
+    for (const [definitionName, properties] of Object.entries({
+      ThreadStartParams: ["model", "cwd", "sandbox", "developerInstructions", "serviceTier"],
+      ThreadSettingsUpdateParams: ["threadId", "model", "effort", "serviceTier"],
+      ThreadSettingsUpdatedNotification: ["threadId", "threadSettings"],
+      TurnStartParams: ["threadId", "input", "outputSchema"],
+    })) {
+      const definition = schemaDocuments
+        .map((document) =>
+          document.title === definitionName
+            ? document
+            : document.definitions?.[definitionName])
+        .find(Boolean);
+      if (definition === undefined) {
+        throw new Error(`Generated App Server schemas do not define ${definitionName}.`);
+      }
+      for (const property of properties) {
+        if (!Object.hasOwn(definition.properties ?? {}, property)) {
+          throw new Error(
+            `Generated App Server ${definitionName} does not expose ${property}.`,
+          );
+        }
+      }
+    }
+    return { cli_minimum: MINIMUM_CODEX_VERSION, generated_files: files.length };
+  } finally {
+    await rm(outputDirectory, { recursive: true, force: true });
   }
 }
 
@@ -335,7 +403,7 @@ async function runExploreProbe(repositoryRoot, sessionRoots) {
   const executor = await invokeExecutor({
     briefing: [
       "Use the local shell tool with its working directory set to the assigned repository to read package.json and compute its SHA-256 without modifying files.",
-      "Return status completed, summary Sol explore workspace probe completed, no changed files, exactly one check formatted as workspace_read_sha256:<lowercase hex digest>, and no blockers or warnings.",
+      "Return status completed, summary Luna explore workspace probe completed, no changed files, exactly one check formatted as workspace_read_sha256:<lowercase hex digest>, and no blockers or warnings.",
     ].join("\n"),
     options: {
       profile: "explore",
@@ -347,7 +415,7 @@ async function runExploreProbe(repositoryRoot, sessionRoots) {
   });
   verifyExecutorResultSchema(executor.result);
   if (executor.exitCode !== 0) {
-    throw new Error(`The Sol explore probe failed: ${executor.result.summary}`);
+    throw new Error(`The Luna explore probe failed: ${executor.result.summary}`);
   }
   verifyProfileRouting(executor.result, "explore");
   if (
@@ -355,7 +423,7 @@ async function runExploreProbe(repositoryRoot, sessionRoots) {
     executor.result.checks.length !== 1 ||
     executor.result.checks[0] !== expectedCheck
   ) {
-    throw new Error("The Sol explore probe did not prove read-only workspace access.");
+    throw new Error("The Luna explore probe did not prove read-only workspace access.");
   }
   return executor.result;
 }
@@ -831,6 +899,7 @@ export async function verifyRouting(repositoryRoot = REPOSITORY_ROOT) {
   const hooksPath = join(codexHome, "hooks.json");
   const hooksBefore = await readOptional(hooksPath);
   const skill = await verifySkillDiscovery(repositoryRoot);
+  const appServer = await verifyAppServerSchema();
   const sessionRoots = getSessionRoots();
   const rootProbe = await runGlobalRootProbe(sessionRoots);
   const executors = await runExecutorProbes(repositoryRoot, sessionRoots);
@@ -867,6 +936,7 @@ export async function verifyRouting(repositoryRoot = REPOSITORY_ROOT) {
     },
     capacity,
     skill,
+    app_server: appServer,
     git_unchanged: true,
     hooks_json_unchanged: true,
   };

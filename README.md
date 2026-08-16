@@ -1,8 +1,8 @@
 # Verified Sol-Luna orchestration for Codex
 
-This repository provides a small, dependency-free orchestration layer for Codex. It keeps planning and integration on GPT-5.6 Sol, moves bounded work to verified Sol or Luna profiles, and checks the model, reasoning effort, and service tier recorded by each Codex session before accepting its result.
+This repository provides a small, dependency-free orchestration layer for Codex. It keeps planning and integration on GPT-5.6 Sol, moves bounded work to verified Sol or Luna profiles, and checks the effective model, reasoning effort, and service tier before accepting a result.
 
-The launchers use separate `codex exec` processes instead of native subagent routing. That keeps each route explicit and independently verifiable while native multi-agent execution remains disabled.
+The launchers use the experimental Codex App Server over local stdio JSON-RPC instead of native subagent routing. App Server applies and reports each route explicitly while native multi-agent execution remains disabled. There is deliberately no fallback to the legacy execution path: an incompatible protocol fails closed with exit code `2`.
 
 ## Roles
 
@@ -18,9 +18,11 @@ The launchers use separate `codex exec` processes instead of native subagent rou
 
 Every role uses `model_verbosity = "low"`. Fast profiles force `features.fast_mode = true`, while Standard roles force it to `false`. Reasoning effort and output verbosity are independent settings.
 
+Routing requires two matching sources of evidence. `thread/settings/updated` confirms the effective model, effort, and protocol tier, while the rollout `turn_context` confirms the model and effort used for the turn. Protocol `priority` is reported publicly as `fast`; protocol `default` is reported as `standard`.
+
 ## Installation
 
-The project requires only the Node.js runtime bundled with Codex.
+The project requires only the Node.js runtime bundled with Codex and Codex CLI 0.147.0 or a later compatible release. App Server and `thread/settings/update` are experimental interfaces, so upgrades must pass the included schema and live verification before they are trusted.
 
 ```text
 npm run install:global
@@ -85,7 +87,7 @@ Machine-readable JSON remains the only stdout output. `NO_COLOR`, `TERM=dumb`, a
 }
 ```
 
-The executor supplies only task fields. The launcher adds the profile and observed routing metadata. `routing_verified` becomes true only when rollout metadata confirms the profile's model, effort, and tier.
+The executor supplies only task fields. The launcher adds the profile and observed routing metadata. `routing_verified` becomes true only when App Server settings confirm model, effort, and tier and rollout `turn_context` independently confirms model and effort.
 
 Exit codes are stable:
 
@@ -146,4 +148,4 @@ npm test
 npm run verify:live
 ```
 
-The unit suite covers profile routing, structured results, tiers, terminal colors, capacity races, Ultra locks, Playwright preflight and tool evidence, installer rollback, and migration behavior. Live verification checks the root and every profile against real rollout metadata, uses temporary repositories for write tests, and confirms that read-only checks do not alter this repository.
+The unit suite covers JSON-RPC ordering and failures, profile routing, structured results, tiers, terminal colors, capacity races, Ultra locks, Playwright preflight and tool evidence, installer rollback, and migration behavior. Live verification generates the installed App Server schemas, checks the root and every profile against protocol and rollout evidence, uses temporary repositories for write tests, and confirms that read-only checks do not alter this repository.

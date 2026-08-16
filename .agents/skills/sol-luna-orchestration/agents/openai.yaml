@@ -1,6 +1,6 @@
 interface:
   display_name: "Sol-Luna Orchestration"
-  short_description: "Coordinate verified Sol and Luna profiles with Ultra takeover"
+  short_description: "Route verified Sol and Luna profiles through Codex App Server"
   default_prompt: "Use $sol-luna-orchestration to coordinate this task."
 policy:
   allow_implicit_invocation: false

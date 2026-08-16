@@ -1,6 +1,4 @@
-import { randomUUID } from "node:crypto";
-import { access, readFile, rm, stat } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access, readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getExecutorProfile } from "./executor-profiles.mjs";
@@ -9,10 +7,14 @@ import {
   RoutingVerificationError,
   getSessionRoots,
   readBriefing,
-  runProcess,
   validateExecutorPayload,
   verifySessionRouting,
 } from "./invoke-profile-executor.mjs";
+import {
+  AppServerError,
+  buildAppServerArguments,
+  runAppServerTurn,
+} from "./codex-app-server-client.mjs";
 import {
   ORCHESTRATION_LOCK_ENV,
   ORCHESTRATION_ROLE_ENV,
@@ -143,46 +145,12 @@ export function createUltraDeveloperInstructions(lockId) {
   ].join("\n");
 }
 
-export function buildUltraCodexArguments({
-  cwd,
-  sandboxMode,
-  lockId,
-  outputPath,
-  schemaPath = RESULT_SCHEMA_PATH,
-  developerInstructions,
-}) {
-  const resolvedInstructions = developerInstructions ?? createUltraDeveloperInstructions(lockId);
-  return [
-    "-m",
-    ULTRA_MODEL,
-    "-c",
-    `model_reasoning_effort=${JSON.stringify(ULTRA_REASONING_EFFORT)}`,
-    "-c",
-    `model_verbosity=${JSON.stringify(SOL_MODEL_VERBOSITY)}`,
-    "-c",
-    `service_tier=${JSON.stringify(ULTRA_CONFIGURED_SERVICE_TIER)}`,
-    "-c",
-    "features.fast_mode=false",
-    "-c",
-    "features.multi_agent=false",
-    "-c",
-    "agents.max_depth=1",
-    "-c",
-    "agents.max_threads=1",
-    "-c",
-    `developer_instructions=${JSON.stringify(resolvedInstructions)}`,
-    "-C",
-    cwd,
-    "-s",
-    sandboxMode,
-    "exec",
-    "--json",
-    "--output-schema",
-    schemaPath,
-    "-o",
-    outputPath,
-    "-",
-  ];
+export function buildUltraAppServerArguments() {
+  return buildAppServerArguments({
+    fastMode: false,
+    configuredServiceTier: ULTRA_CONFIGURED_SERVICE_TIER,
+    modelVerbosity: SOL_MODEL_VERBOSITY,
+  });
 }
 
 export function createStableUltraResult({
@@ -288,7 +256,7 @@ export async function invokeUltra({
   environment = process.env,
   sessionRoots = getSessionRoots(environment),
   signal,
-  processRunner = runProcess,
+  appServerRunner = runAppServerTurn,
   coordinationOptions = {},
 }) {
   if (typeof briefing !== "string" || briefing.trim().length === 0) {
@@ -299,6 +267,7 @@ export async function invokeUltra({
     throw new UltraInvocationError(`Ultra cwd is not a directory: ${options.cwd}`);
   }
   await access(RESULT_SCHEMA_PATH);
+  const outputSchema = JSON.parse(await readFile(RESULT_SCHEMA_PATH, "utf8"));
   const lock = await acquireUltraLock({
     cwd: options.cwd,
     reason: options.reason,
@@ -306,32 +275,37 @@ export async function invokeUltra({
     environment,
     ...coordinationOptions,
   });
-  const outputPath = join(tmpdir(), `sol-ultra-${process.pid}-${randomUUID()}.json`);
-  const args = buildUltraCodexArguments({
-    cwd: options.cwd,
-    sandboxMode: options.sandboxMode,
-    lockId: lock.lock_id,
-    outputPath,
-  });
   let threadId = null;
   let actualModel = null;
   let actualReasoningEffort = null;
   let actualServiceTier = null;
   let warnings = [];
   try {
-    const processResult = await processRunner(command, args, {
-      input: `${briefing.trim()}\n`,
-      timeoutMs: options.timeoutSeconds * 1000,
+    const appServerResult = await appServerRunner({
+      command,
       cwd: options.cwd,
       environment: {
         ...environment,
         [ORCHESTRATION_ROLE_ENV]: ULTRA_ORCHESTRATOR_ROLE,
         [ORCHESTRATION_LOCK_ENV]: lock.lock_id,
       },
+      model: ULTRA_MODEL,
+      reasoningEffort: ULTRA_REASONING_EFFORT,
+      serviceTier: ULTRA_SERVICE_TIER,
+      configuredServiceTier: ULTRA_CONFIGURED_SERVICE_TIER,
+      fastMode: false,
+      sandboxMode: options.sandboxMode,
+      developerInstructions: createUltraDeveloperInstructions(lock.lock_id),
+      briefing: briefing.trim(),
+      outputSchema,
+      timeoutMs: options.timeoutSeconds * 1000,
       signal,
     });
-    threadId = processResult.threadId;
-    warnings = processResult.warnings;
+    threadId = appServerResult.threadId;
+    actualModel = appServerResult.model;
+    actualReasoningEffort = appServerResult.reasoningEffort;
+    actualServiceTier = appServerResult.serviceTier;
+    warnings = appServerResult.warnings ?? [];
     if (threadId !== null) {
       await updateUltraLock({
         cwd: options.cwd,
@@ -341,35 +315,26 @@ export async function invokeUltra({
         ...coordinationOptions,
       });
     }
-    if (processResult.timedOut || processResult.aborted) {
-      throw new UltraInvocationError(
-        processResult.timedOut
-          ? `Sol Ultra takeover timed out after ${options.timeoutSeconds} seconds.`
-          : "Sol Ultra takeover was interrupted.",
-      );
-    }
-    if (processResult.exitCode !== 0) {
-      throw new UltraInvocationError(
-        processResult.stderr || `Codex exited with code ${processResult.exitCode}.`,
-      );
-    }
     if (threadId === null) {
-      throw new UltraInvocationError("Codex did not emit a thread_id for Sol Ultra takeover.");
+      throw new UltraInvocationError("App Server did not return a thread id for Sol Ultra takeover.");
+    }
+    if (
+      actualModel !== ULTRA_MODEL ||
+      actualReasoningEffort !== ULTRA_REASONING_EFFORT ||
+      actualServiceTier !== ULTRA_SERVICE_TIER
+    ) {
+      throw new UltraInvocationError(
+        `App Server routing mismatch: expected ${ULTRA_MODEL}/${ULTRA_REASONING_EFFORT}/${ULTRA_SERVICE_TIER}, received ${actualModel ?? "null"}/${actualReasoningEffort ?? "null"}/${actualServiceTier ?? "null"}.`,
+      );
     }
     const routing = await verifySessionRouting(
       threadId,
       ULTRA_MODEL,
       ULTRA_REASONING_EFFORT,
-      ULTRA_SERVICE_TIER,
       { sessionRoots },
     );
     actualModel = routing.model;
     actualReasoningEffort = routing.reasoningEffort;
-    actualServiceTier = routing.serviceTier;
-    const payload = validateUltraPayload(
-      JSON.parse(await readFile(outputPath, "utf8")),
-      options.sandboxMode,
-    );
     const executors = validateUltraExecutors(
       await listUltraExecutorResults({
         cwd: options.cwd,
@@ -377,6 +342,57 @@ export async function invokeUltra({
         environment,
         ...coordinationOptions,
       }),
+    );
+    if (appServerResult.blockedReason !== null) {
+      const result = createStableUltraResult({
+        status: "blocked",
+        lockId: lock.lock_id,
+        threadId,
+        model: actualModel,
+        reasoningEffort: actualReasoningEffort,
+        serviceTier: actualServiceTier,
+        routingVerified: true,
+        sandboxMode: options.sandboxMode,
+        summary: appServerResult.blockedReason,
+        executors,
+        blockers: [appServerResult.blockedReason],
+        warnings,
+      });
+      await releaseUltraLock({
+        cwd: options.cwd,
+        lockId: lock.lock_id,
+        environment,
+        ...coordinationOptions,
+      });
+      return { result, exitCode: 1 };
+    }
+    if (appServerResult.turnStatus !== "completed") {
+      const message = `App Server turn ended with status ${appServerResult.turnStatus ?? "unknown"}.`;
+      const result = createStableUltraResult({
+        status: "failed",
+        lockId: lock.lock_id,
+        threadId,
+        model: actualModel,
+        reasoningEffort: actualReasoningEffort,
+        serviceTier: actualServiceTier,
+        routingVerified: true,
+        sandboxMode: options.sandboxMode,
+        summary: message,
+        executors,
+        blockers: [message],
+        warnings,
+      });
+      await releaseUltraLock({
+        cwd: options.cwd,
+        lockId: lock.lock_id,
+        environment,
+        ...coordinationOptions,
+      });
+      return { result, exitCode: 1 };
+    }
+    const payload = validateUltraPayload(
+      JSON.parse(appServerResult.finalResponse),
+      options.sandboxMode,
     );
     const result = createStableUltraResult({
       status: payload.status,
@@ -402,10 +418,19 @@ export async function invokeUltra({
     });
     return { result, exitCode: result.status === "completed" ? 0 : 1 };
   } catch (error) {
+    if (error instanceof AppServerError) {
+      threadId = error.threadId ?? threadId;
+      actualModel = error.actualModel ?? actualModel;
+      actualReasoningEffort = error.actualReasoningEffort ?? actualReasoningEffort;
+      actualServiceTier = error.actualServiceTier ?? actualServiceTier;
+      if (error.stderr) {
+        warnings.push(error.stderr);
+      }
+    }
     if (error instanceof RoutingVerificationError) {
-      actualModel = error.actualModel ?? null;
-      actualReasoningEffort = error.actualReasoningEffort ?? null;
-      actualServiceTier = error.actualServiceTier ?? null;
+      actualModel = error.actualModel ?? actualModel;
+      actualReasoningEffort = error.actualReasoningEffort ?? actualReasoningEffort;
+      actualServiceTier = error.actualServiceTier ?? actualServiceTier;
     }
     const recoveryWarning = await markRecoveryRequired(
       options,
@@ -423,8 +448,6 @@ export async function invokeUltra({
       serviceTier: actualServiceTier,
       warnings: [...warnings, recoveryWarning].filter(Boolean),
     });
-  } finally {
-    await rm(outputPath, { force: true });
   }
 }
 

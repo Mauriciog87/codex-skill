@@ -15,7 +15,7 @@ import {
   ExecutorConfigurationError,
   ExecutorInvocationError,
   RoutingVerificationError,
-  buildCodexArguments,
+  buildProfileAppServerArguments,
   createExecutorDeveloperInstructions,
   createStableResult,
   determineExitCode,
@@ -27,45 +27,36 @@ import {
   verifySessionRouting,
 } from "../.agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs";
 import { acquireUltraLock, releaseUltraLock } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
+import { AppServerProtocolError } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
 
 async function writeRoutingMetadata(
   sessionsRoot,
   threadId,
   effort,
   model = "gpt-5.6-sol",
-  serviceTier = "default",
 ) {
   await mkdir(sessionsRoot, { recursive: true });
   await writeFile(
     join(sessionsRoot, `rollout-${threadId}.jsonl`),
-    [
-      JSON.stringify({ type: "turn_context", payload: { model, effort } }),
-      JSON.stringify({
-        type: "event_msg",
-        payload: {
-          type: "thread_settings_applied",
-          thread_settings: { model, reasoning_effort: effort, service_tier: serviceTier },
-        },
-      }),
-      "",
-    ].join("\n"),
+    `${JSON.stringify({ type: "turn_context", payload: { model, effort } })}\n`,
   );
 }
 
-function createProcessRunner(threadId, payload) {
-  return async (_command, args) => {
-    const outputPath = args[args.indexOf("-o") + 1];
-    await writeFile(outputPath, JSON.stringify(payload));
+function createAppServerRunner(threadId, payload, overrides = {}) {
+  return async (options) => {
     return {
-      exitCode: 0,
-      signal: null,
-      timedOut: false,
-      aborted: false,
       threadId,
+      model: options.model,
+      reasoningEffort: options.reasoningEffort,
+      serviceTier: options.serviceTier,
+      turnStatus: "completed",
+      finalResponse: JSON.stringify(payload),
+      blockedReason: null,
       warnings: [],
       stderr: "",
       playwrightMcpUsed: true,
       unsafePlaywrightToolUsed: false,
+      ...overrides,
     };
   };
 }
@@ -182,29 +173,22 @@ test("developer instructions identify the selected bounded profile", () => {
   assert.match(createExecutorDeveloperInstructions("review"), /REQUEST_CHANGES/);
 });
 
-test("buildCodexArguments pins each selected route without bypass flags", () => {
+test("buildProfileAppServerArguments pins each selected route without bypass flags", () => {
   for (const profileName of EXECUTOR_PROFILE_NAMES) {
     const profile = EXECUTOR_PROFILES[profileName];
-    const args = buildCodexArguments({
+    const args = buildProfileAppServerArguments({
       profile: profileName,
-      cwd: resolve("repository"),
       sandboxMode: profile.sandboxMode,
-      schemaPath: resolve("schema.json"),
-      outputPath: resolve("result.json"),
     });
-    assert.deepEqual(args.slice(0, 2), ["-m", profile.model]);
-    assert.ok(args.includes(`model_reasoning_effort=${JSON.stringify(profile.reasoningEffort)}`));
     assert.ok(args.includes(`model_verbosity=${JSON.stringify(MODEL_VERBOSITY)}`));
     assert.ok(args.includes(`service_tier=${JSON.stringify(profile.configuredServiceTier)}`));
     assert.ok(args.includes(`features.fast_mode=${profile.fastMode}`));
     assert.ok(args.includes("features.multi_agent=false"));
     assert.ok(args.includes("agents.max_depth=1"));
     assert.ok(args.includes("agents.max_threads=1"));
-    assert.ok(args.some((entry) => entry.includes(`CODEX_EXECUTOR_PROFILE=${profileName}`)));
-    assert.ok(args.includes("exec"));
-    assert.ok(args.includes("--json"));
-    assert.ok(args.includes("--output-schema"));
-    assert.equal(args.at(-1), "-");
+    assert.deepEqual(args.slice(-3), ["app-server", "--listen", "stdio://"]);
+    assert.equal(args.includes("exec"), false);
+    assert.equal(args.includes("--json"), false);
     for (const prohibitedFlag of [
       "--dangerously-bypass-approvals-and-sandbox",
       "--full-auto",
@@ -307,17 +291,15 @@ test("verifySessionRouting accepts profile efforts and reports mismatches", asyn
       threadId,
       profile.model,
       profile.reasoningEffort,
-      profile.serviceTier,
       { sessionRoots: [sessionsRoot], attempts: 1 },
     );
     assert.equal(routing.model, profile.model);
     assert.equal(routing.reasoningEffort, profile.reasoningEffort);
-    assert.equal(routing.serviceTier, profile.serviceTier);
   }
 
   await writeRoutingMetadata(sessionsRoot, "invalid-model", "medium", "gpt-5.5");
   await assert.rejects(
-    verifySessionRouting("invalid-model", "gpt-5.6-sol", "medium", "standard", {
+    verifySessionRouting("invalid-model", "gpt-5.6-sol", "medium", {
       sessionRoots: [sessionsRoot],
       attempts: 1,
     }),
@@ -325,47 +307,18 @@ test("verifySessionRouting accepts profile efforts and reports mismatches", asyn
   );
   await writeRoutingMetadata(sessionsRoot, "invalid-effort", "xhigh");
   await assert.rejects(
-    verifySessionRouting("invalid-effort", "gpt-5.6-sol", "medium", "standard", {
+    verifySessionRouting("invalid-effort", "gpt-5.6-sol", "medium", {
       sessionRoots: [sessionsRoot],
       attempts: 1,
     }),
     RoutingVerificationError,
   );
   await assert.rejects(
-    verifySessionRouting("missing", "gpt-5.6-sol", "medium", "standard", {
+    verifySessionRouting("missing", "gpt-5.6-sol", "medium", {
       sessionRoots: [sessionsRoot],
       attempts: 1,
     }),
     RoutingVerificationError,
-  );
-  await writeFile(
-    join(sessionsRoot, "rollout-missing-tier.jsonl"),
-    `${JSON.stringify({
-      type: "turn_context",
-      payload: { model: "gpt-5.6-sol", effort: "high" },
-    })}\n`,
-  );
-  await assert.rejects(
-    verifySessionRouting("missing-tier", "gpt-5.6-sol", "high", "standard", {
-      sessionRoots: [sessionsRoot],
-      attempts: 1,
-    }),
-    /No thread_settings_applied service tier metadata/,
-  );
-  await writeRoutingMetadata(
-    sessionsRoot,
-    "invalid-tier",
-    "high",
-    "gpt-5.6-sol",
-    "fast",
-  );
-  await assert.rejects(
-    verifySessionRouting("invalid-tier", "gpt-5.6-sol", "high", "standard", {
-      sessionRoots: [sessionsRoot],
-      attempts: 1,
-    }),
-    (error) =>
-      error instanceof RoutingVerificationError && error.actualServiceTier === "fast",
   );
 });
 
@@ -393,7 +346,7 @@ test("invokeExecutor returns verified profile metadata and status exit codes", a
       coordinationOptions: { homeDirectory: temporaryRoot },
       sessionRoots: [sessionsRoot],
       playwrightMcpVerifier: async () => ({ enabled: true }),
-      processRunner: createProcessRunner(threadId, {
+      appServerRunner: createAppServerRunner(threadId, {
         status: "completed",
         summary: profileName === "review"
           ? "APPROVE: Review completed."
@@ -429,7 +382,7 @@ test("review verdicts enforce status, blockers, and exit codes", async (context)
       options: profileOptions(temporaryRoot, "review"),
       coordinationOptions: { homeDirectory: temporaryRoot },
       sessionRoots: [sessionsRoot],
-      processRunner: createProcessRunner(threadId, payload),
+      appServerRunner: createAppServerRunner(threadId, payload),
     });
   }
 
@@ -504,7 +457,7 @@ test("read-only profiles reject reported file changes", async (context) => {
     options: profileOptions(temporaryRoot, "explore"),
     coordinationOptions: { homeDirectory: temporaryRoot },
     sessionRoots: [sessionsRoot],
-    processRunner: createProcessRunner(threadId, {
+    appServerRunner: createAppServerRunner(threadId, {
       status: "completed",
       summary: "Exploration completed.",
       changed_files: ["unexpected.mjs"],
@@ -517,29 +470,49 @@ test("read-only profiles reject reported file changes", async (context) => {
   assert.match(execution.result.summary, /empty changed_files/);
 });
 
-test("invokeExecutor preserves profile without claiming routing after process failure", async (context) => {
+test("invokeExecutor preserves profile without claiming routing after App Server failure", async (context) => {
   const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-luna-process-failure-test-"));
   context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
   const execution = await invokeExecutor({
     briefing: "Complete the bounded test task.",
     options: profileOptions(temporaryRoot, "explore"),
     coordinationOptions: { homeDirectory: temporaryRoot },
-    processRunner: async () => ({
-      exitCode: 1,
-      signal: null,
-      timedOut: false,
-      aborted: false,
-      threadId: null,
-      warnings: [],
-      stderr: "Codex failed.",
-    }),
+    appServerRunner: async () => {
+      throw new AppServerProtocolError("App Server failed.");
+    },
   });
-  assert.equal(execution.exitCode, 1);
+  assert.equal(execution.exitCode, 2);
   assert.equal(execution.result.profile, "explore");
   assert.equal(execution.result.model, null);
   assert.equal(execution.result.reasoning_effort, null);
   assert.equal(execution.result.service_tier, null);
   assert.equal(execution.result.routing_verified, false);
+});
+
+test("declined App Server interaction returns blocked with verified routing", async (context) => {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-luna-blocked-interaction-"));
+  context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const sessionsRoot = join(temporaryRoot, "sessions");
+  const threadId = "blocked-interaction";
+  await writeRoutingMetadata(sessionsRoot, threadId, "max", "gpt-5.6-luna");
+  const execution = await invokeExecutor({
+    briefing: "Complete the bounded test task.",
+    options: profileOptions(temporaryRoot, "explore"),
+    coordinationOptions: { homeDirectory: temporaryRoot },
+    sessionRoots: [sessionsRoot],
+    appServerRunner: createAppServerRunner(
+      threadId,
+      null,
+      {
+        finalResponse: null,
+        blockedReason: "Declined App Server approval request.",
+      },
+    ),
+  });
+  assert.equal(execution.exitCode, 1);
+  assert.equal(execution.result.status, "blocked");
+  assert.equal(execution.result.routing_verified, true);
+  assert.deepEqual(execution.result.blockers, ["Declined App Server approval request."]);
 });
 
 test("invokeExecutor returns actual metadata and exit code 2 for routing mismatch", async (context) => {
@@ -553,7 +526,7 @@ test("invokeExecutor returns actual metadata and exit code 2 for routing mismatc
     options: profileOptions(temporaryRoot, "explore"),
     coordinationOptions: { homeDirectory: temporaryRoot },
     sessionRoots: [sessionsRoot],
-    processRunner: createProcessRunner(threadId, {
+    appServerRunner: createAppServerRunner(threadId, {
       status: "completed",
       summary: "Done.",
       changed_files: [],
@@ -566,7 +539,7 @@ test("invokeExecutor returns actual metadata and exit code 2 for routing mismatc
   assert.equal(execution.result.profile, "explore");
   assert.equal(execution.result.model, "gpt-5.5");
   assert.equal(execution.result.reasoning_effort, "high");
-  assert.equal(execution.result.service_tier, "standard");
+  assert.equal(execution.result.service_tier, "fast");
   assert.equal(execution.result.routing_verified, false);
 });
 
@@ -612,7 +585,7 @@ test("playwright profile verifies MCP use and removes its temporary output", asy
     "default",
   );
   let outputDirectory;
-  const delegate = createProcessRunner(threadId, {
+  const delegate = createAppServerRunner(threadId, {
     status: "completed",
     summary: "Browser check completed.",
     changed_files: [],
@@ -626,10 +599,10 @@ test("playwright profile verifies MCP use and removes its temporary output", asy
     coordinationOptions: { homeDirectory: temporaryRoot },
     sessionRoots: [sessionsRoot],
     playwrightMcpVerifier: async () => ({ enabled: true }),
-    processRunner: async (command, args, options) => {
+    appServerRunner: async (options) => {
       outputDirectory = options.environment.PLAYWRIGHT_MCP_OUTPUT_DIR;
       assert.equal(options.environment.PLAYWRIGHT_MCP_ISOLATED, "true");
-      return delegate(command, args, options);
+      return delegate(options);
     },
   });
   assert.equal(execution.exitCode, 0);
@@ -652,7 +625,7 @@ test("playwright profile rejects missing or unsafe MCP evidence", async (context
       "gpt-5.6-luna",
       "default",
     );
-    const baseRunner = createProcessRunner(threadId, {
+    const baseRunner = createAppServerRunner(threadId, {
       status: "completed",
       summary: "Browser check completed.",
       changed_files: [],
@@ -666,7 +639,7 @@ test("playwright profile rejects missing or unsafe MCP evidence", async (context
       coordinationOptions: { homeDirectory: temporaryRoot },
       sessionRoots: [sessionsRoot],
       playwrightMcpVerifier: async () => ({ enabled: true }),
-      processRunner: async (...args) => ({ ...(await baseRunner(...args)), ...processFields }),
+      appServerRunner: async (...args) => ({ ...(await baseRunner(...args)), ...processFields }),
     });
     assert.equal(execution.exitCode, 2);
     assert.match(execution.result.summary, expected);
@@ -687,8 +660,8 @@ test("invokeExecutor returns stable exit code 2 while Ultra owns the repository"
       briefing: "This task must not start Codex.",
       options: profileOptions(temporaryRoot, "explore"),
       coordinationOptions: { homeDirectory: temporaryRoot },
-      processRunner: async () => {
-        throw new Error("Process runner must not execute while the lock is active.");
+      appServerRunner: async () => {
+        throw new Error("App Server runner must not execute while the lock is active.");
       },
     });
     assert.equal(execution.exitCode, 2);

@@ -16,7 +16,7 @@ Run this workflow once before the first substantive request in a root task. Do n
 5. Select exactly one verified profile from the matrix below.
 6. Send a bounded briefing through the canonical Node launcher. Include objective, exclusions, owned files or review target, expected result, and required checks.
 7. Serialize overlapping writes and avoid redundant executors whose results would cost more to integrate than they save.
-8. Accept a result only when model, effort, and service tier are verified from rollout metadata and `routing_verified` is true.
+8. Accept a result only when App Server settings and rollout turn metadata agree and `routing_verified` is true.
 9. Inspect and integrate the evidence, resolve conflicts, run final checks, and own the user-facing result.
 
 ## Profiles
@@ -30,6 +30,8 @@ Run this workflow once before the first substantive request in a root task. Do n
 | `review` | `gpt-5.6-sol` | `high` | Standard | `read-only` | Independent plan or Git-change review |
 
 All roles use low output verbosity. Fast profiles force `features.fast_mode = true`; Standard roles force it to `false`. Model, effort, tier, and sandbox are fixed by the profile and cannot be overridden by the caller.
+
+The launcher requires Codex CLI 0.147.0 or a later compatible version and uses the experimental Codex App Server over local stdio JSON-RPC. It deliberately has no fallback to the legacy execution path. App Server protocol `priority` maps to public `fast`, and protocol `default` maps to public `standard`.
 
 ## Launcher
 
@@ -103,7 +105,7 @@ node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs recove
 - Do not alter approval policy, request `danger-full-access`, or use bypasses.
 - Do not let executors re-delegate, alter orchestration policy, commit, push, or own overlapping files concurrently.
 - Keep `explore`, `playwright`, and `review` read-only. Require explicit workspace write for both implementation profiles.
-- Do not infer model, effort, or tier from configuration or executor prose; require rollout evidence.
+- Do not infer model, effort, or tier from configuration or executor prose. Require matching `thread/settings/updated` model, effort, and tier plus rollout `turn_context` model and effort.
 - Do not manually edit or delete orchestration state.
 - Treat hooks as defense in depth, not complete enforcement across every tool path.
 

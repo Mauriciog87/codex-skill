@@ -1,5 +1,4 @@
 import { spawn as spawnChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { access, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -11,6 +10,11 @@ import {
   MODEL_VERBOSITY,
   getExecutorProfile,
 } from "./executor-profiles.mjs";
+import {
+  AppServerError,
+  buildAppServerArguments,
+  runAppServerTurn,
+} from "./codex-app-server-client.mjs";
 import {
   ORCHESTRATION_ROLE_ENV,
   abandonExecutorRun,
@@ -179,89 +183,16 @@ export function createExecutorDeveloperInstructions(profileName) {
   ].join("\n");
 }
 
-export function buildCodexArguments({
+export function buildProfileAppServerArguments({
   profile: profileName,
-  cwd,
   sandboxMode,
-  schemaPath = RESULT_SCHEMA_PATH,
-  outputPath,
-  developerInstructions,
 }) {
   const profile = requireExecutorProfile(profileName, sandboxMode);
-  const resolvedDeveloperInstructions =
-    developerInstructions ?? createExecutorDeveloperInstructions(profile.name);
-  return [
-    "-m",
-    profile.model,
-    "-c",
-    `model_reasoning_effort=${JSON.stringify(profile.reasoningEffort)}`,
-    "-c",
-    `model_verbosity=${JSON.stringify(MODEL_VERBOSITY)}`,
-    "-c",
-    `service_tier=${JSON.stringify(profile.configuredServiceTier)}`,
-    "-c",
-    `features.fast_mode=${profile.fastMode}`,
-    "-c",
-    "features.multi_agent=false",
-    "-c",
-    "agents.max_depth=1",
-    "-c",
-    "agents.max_threads=1",
-    "-c",
-    `developer_instructions=${JSON.stringify(resolvedDeveloperInstructions)}`,
-    "-C",
-    cwd,
-    "-s",
-    sandboxMode,
-    "exec",
-    "--json",
-    "--output-schema",
-    schemaPath,
-    "-o",
-    outputPath,
-    "-",
-  ];
-}
-
-function recordCodexEvent(line, state) {
-  if (line.trim().length === 0) {
-    return;
-  }
-
-  let event;
-  try {
-    event = JSON.parse(line);
-  } catch {
-    state.warnings.push(`Codex emitted non-JSON output: ${line.slice(0, 500)}`);
-    return;
-  }
-
-  const serializedEvent = JSON.stringify(event);
-  if (/mcp__playwright__|"server"\s*:\s*"playwright"|"server_name"\s*:\s*"playwright"/i.test(serializedEvent)) {
-    state.playwrightMcpUsed = true;
-  }
-  if (/browser_run_code_unsafe/i.test(serializedEvent)) {
-    state.unsafePlaywrightToolUsed = true;
-  }
-
-  if (event.type === "thread.started" && typeof event.thread_id === "string") {
-    state.threadId = event.thread_id;
-  }
-  if (event.type === "error" && typeof event.message === "string") {
-    state.warnings.push(event.message);
-  }
-  if (event.type === "turn.failed") {
-    const message = event.error?.message ?? event.message;
-    if (typeof message === "string") {
-      state.warnings.push(message);
-    }
-  }
-  if (event.type === "item.completed" && event.item?.type === "error") {
-    const message = event.item.message ?? event.item.text;
-    if (typeof message === "string") {
-      state.warnings.push(message);
-    }
-  }
+  return buildAppServerArguments({
+    fastMode: profile.fastMode,
+    configuredServiceTier: profile.configuredServiceTier,
+    modelVerbosity: MODEL_VERBOSITY,
+  });
 }
 
 export async function runProcess(
@@ -296,12 +227,6 @@ export async function runProcess(
       return;
     }
 
-    const state = {
-      threadId: null,
-      warnings: [],
-      playwrightMcpUsed: false,
-      unsafePlaywrightToolUsed: false,
-    };
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -312,12 +237,13 @@ export async function runProcess(
     const lineReader = createInterface({ input: child.stdout, crlfDelay: Infinity });
     lineReader.on("line", (line) => {
       stdout = appendLimited(stdout, `${line}\n`);
-      recordCodexEvent(line, state);
     });
     child.stderr.on("data", (chunk) => {
       stderr = appendLimited(stderr, chunk.toString("utf8"));
     });
-    child.stdin.on("error", () => {});
+    child.stdin.on("error", (error) => {
+      stderr = appendLimited(stderr, `stdin: ${error.message}\n`);
+    });
 
     const terminate = (reason) => {
       if (settled || child.killed) {
@@ -372,10 +298,6 @@ export async function runProcess(
         signal: processSignal,
         timedOut,
         aborted,
-        threadId: state.threadId,
-        playwrightMcpUsed: state.playwrightMcpUsed,
-        unsafePlaywrightToolUsed: state.unsafePlaywrightToolUsed,
-        warnings: uniqueStrings(state.warnings),
         stdout: stdout.trim(),
         stderr: stderr.trim(),
       });
@@ -490,26 +412,15 @@ export async function findRolloutFile(threadId, sessionRoots = getSessionRoots()
   return datedCandidates[0].path;
 }
 
-export function normalizeServiceTier(value) {
-  if (["fast", "priority"].includes(value)) {
-    return "fast";
-  }
-  if (["default", "standard"].includes(value)) {
-    return "standard";
-  }
-  return value ?? null;
-}
-
 async function readRoutingMetadata(rolloutPath) {
   const contexts = [];
-  const serviceTiers = [];
   const lineReader = createInterface({
     input: createReadStream(rolloutPath),
     crlfDelay: Infinity,
   });
 
   for await (const line of lineReader) {
-    if (!line.includes('"turn_context"') && !line.includes('"thread_settings_applied"')) {
+    if (!line.includes('"turn_context"')) {
       continue;
     }
     let entry;
@@ -526,17 +437,9 @@ async function readRoutingMetadata(rolloutPath) {
         reasoningEffort: entry.payload?.effort ?? null,
       });
     }
-    if (
-      entry.type === "event_msg" &&
-      entry.payload?.type === "thread_settings_applied"
-    ) {
-      serviceTiers.push(
-        normalizeServiceTier(entry.payload.thread_settings?.service_tier),
-      );
-    }
   }
 
-  return { contexts, serviceTiers };
+  return { contexts };
 }
 
 function wait(delayMs) {
@@ -547,18 +450,16 @@ export async function verifySessionRouting(
   threadId,
   expectedModel,
   expectedReasoningEffort,
-  expectedServiceTier,
   { sessionRoots = getSessionRoots(), attempts = 20, retryDelayMs = 100 } = {},
 ) {
   let rolloutPath = null;
   let contexts = [];
-  let serviceTiers = [];
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     rolloutPath = await findRolloutFile(threadId, sessionRoots);
     if (rolloutPath !== null) {
-      ({ contexts, serviceTiers } = await readRoutingMetadata(rolloutPath));
-      if (contexts.length > 0 && serviceTiers.length > 0) {
+      ({ contexts } = await readRoutingMetadata(rolloutPath));
+      if (contexts.length > 0) {
         break;
       }
     }
@@ -576,31 +477,19 @@ export async function verifySessionRouting(
       { rolloutPath },
     );
   }
-  if (serviceTiers.length === 0) {
-    throw new RoutingVerificationError(
-      `No thread_settings_applied service tier metadata was found for thread ${threadId}.`,
-      { rolloutPath },
-    );
-  }
-
   const mismatchedContext = contexts.find(
     (context) =>
       context.model !== expectedModel ||
       context.reasoningEffort !== expectedReasoningEffort,
   );
   const actualContext = mismatchedContext ?? contexts.at(-1);
-  const mismatchedServiceTier = serviceTiers.find(
-    (serviceTier) => serviceTier !== expectedServiceTier,
-  );
-  const actualServiceTier = mismatchedServiceTier ?? serviceTiers.at(-1);
 
-  if (mismatchedContext !== undefined || mismatchedServiceTier !== undefined) {
+  if (mismatchedContext !== undefined) {
     throw new RoutingVerificationError(
-      `Routing mismatch for thread ${threadId}: expected ${expectedModel}/${expectedReasoningEffort}/${expectedServiceTier}, recorded ${actualContext.model}/${actualContext.reasoningEffort}/${actualServiceTier}.`,
+      `Routing mismatch for thread ${threadId}: expected ${expectedModel}/${expectedReasoningEffort}, recorded ${actualContext.model}/${actualContext.reasoningEffort}.`,
       {
         actualModel: actualContext.model,
         actualReasoningEffort: actualContext.reasoningEffort,
-        actualServiceTier,
         rolloutPath,
       },
     );
@@ -610,9 +499,7 @@ export async function verifySessionRouting(
     rolloutPath,
     model: actualContext.model,
     reasoningEffort: actualContext.reasoningEffort,
-    serviceTier: actualServiceTier,
     contextCount: contexts.length,
-    serviceTierCount: serviceTiers.length,
   };
 }
 
@@ -771,7 +658,7 @@ async function runExecutor({
   environment = process.env,
   sessionRoots = getSessionRoots(environment),
   signal,
-  processRunner = runProcess,
+  appServerRunner = runAppServerTurn,
   playwrightMcpVerifier = verifyPlaywrightMcp,
 }) {
   if (typeof briefing !== "string" || briefing.trim().length === 0) {
@@ -780,9 +667,11 @@ async function runExecutor({
   const profile = requireExecutorProfile(options.profile, options.sandboxMode);
 
   let workingDirectory;
+  let outputSchema;
   try {
     workingDirectory = await stat(options.cwd);
     await access(RESULT_SCHEMA_PATH);
+    outputSchema = JSON.parse(await readFile(RESULT_SCHEMA_PATH, "utf8"));
   } catch (error) {
     throw new ExecutorConfigurationError(error.message);
   }
@@ -801,17 +690,6 @@ async function runExecutor({
     }
   }
 
-  const outputPath = join(
-    tmpdir(),
-    `sol-luna-executor-${process.pid}-${randomUUID()}.json`,
-  );
-  const args = buildCodexArguments({
-    profile: profile.name,
-    cwd: options.cwd,
-    sandboxMode: options.sandboxMode,
-    outputPath,
-  });
-
   try {
     const executorEnvironment = {
       ...environment,
@@ -824,53 +702,71 @@ async function runExecutor({
           }
         : {}),
     };
-    const processResult = await processRunner(command, args, {
-      input: `${briefing.trim()}\n`,
-      timeoutMs: options.timeoutSeconds * 1000,
-      cwd: options.cwd,
-      environment: executorEnvironment,
-      signal,
-    });
-
-    if (processResult.timedOut || processResult.aborted) {
-      const message = processResult.timedOut
-          ? `Profile executor timed out after ${options.timeoutSeconds} seconds.`
-          : "Profile executor was interrupted.";
-      return configurationFailure(message, options, {
-        threadId: processResult.threadId,
-        warnings: processResult.warnings,
+    let appServerResult;
+    try {
+      appServerResult = await appServerRunner({
+        command,
+        cwd: options.cwd,
+        environment: executorEnvironment,
+        model: profile.model,
+        reasoningEffort: profile.reasoningEffort,
+        serviceTier: profile.serviceTier,
+        configuredServiceTier: profile.configuredServiceTier,
+        fastMode: profile.fastMode,
+        sandboxMode: options.sandboxMode,
+        developerInstructions: createExecutorDeveloperInstructions(profile.name),
+        briefing: briefing.trim(),
+        outputSchema,
+        timeoutMs: options.timeoutSeconds * 1000,
+        signal,
+      });
+    } catch (error) {
+      if (!(error instanceof AppServerError)) {
+        throw error;
+      }
+      return configurationFailure(error.message, options, {
+        threadId: error.threadId ?? null,
+        model: error.actualModel ?? null,
+        reasoningEffort: error.actualReasoningEffort ?? null,
+        serviceTier: error.actualServiceTier ?? null,
+        warnings: error.stderr ? [error.stderr] : [],
       });
     }
 
-    if (processResult.exitCode !== 0) {
-      const diagnostic = processResult.stderr || `Codex exited with code ${processResult.exitCode}.`;
-      return {
-        result: createStableResult({
-          status: "failed",
-          profile: profile.name,
-          threadId: processResult.threadId,
-          sandboxMode: options.sandboxMode,
-          summary: diagnostic,
-          blockers: [diagnostic],
-          warnings: processResult.warnings,
-        }),
-        exitCode: 1,
-      };
-    }
-
-    if (processResult.threadId === null) {
-      return configurationFailure("Codex did not emit a thread_id.", options, {
-        warnings: processResult.warnings,
+    const protocolWarnings = appServerResult.warnings ?? [];
+    const diagnosticWarnings = [
+      ...protocolWarnings,
+      ...(appServerResult.stderr ? [appServerResult.stderr] : []),
+    ];
+    if (appServerResult.threadId === null) {
+      return configurationFailure("App Server did not return a thread id.", options, {
+        warnings: diagnosticWarnings,
       });
+    }
+    if (
+      appServerResult.model !== profile.model ||
+      appServerResult.reasoningEffort !== profile.reasoningEffort ||
+      appServerResult.serviceTier !== profile.serviceTier
+    ) {
+      return configurationFailure(
+        `App Server routing mismatch: expected ${profile.model}/${profile.reasoningEffort}/${profile.serviceTier}, received ${appServerResult.model ?? "null"}/${appServerResult.reasoningEffort ?? "null"}/${appServerResult.serviceTier ?? "null"}.`,
+        options,
+        {
+          threadId: appServerResult.threadId,
+          model: appServerResult.model ?? null,
+          reasoningEffort: appServerResult.reasoningEffort ?? null,
+          serviceTier: appServerResult.serviceTier ?? null,
+          warnings: diagnosticWarnings,
+        },
+      );
     }
 
     let routing;
     try {
       routing = await verifySessionRouting(
-        processResult.threadId,
+        appServerResult.threadId,
         profile.model,
         profile.reasoningEffort,
-        profile.serviceTier,
         { sessionRoots },
       );
     } catch (error) {
@@ -878,55 +774,91 @@ async function runExecutor({
         throw error;
       }
       return configurationFailure(error.message, options, {
-        threadId: processResult.threadId,
-        model: error.actualModel ?? null,
-        reasoningEffort: error.actualReasoningEffort ?? null,
-        serviceTier: error.actualServiceTier ?? null,
-        warnings: processResult.warnings,
+        threadId: appServerResult.threadId,
+        model: error.actualModel ?? appServerResult.model,
+        reasoningEffort:
+          error.actualReasoningEffort ?? appServerResult.reasoningEffort,
+        serviceTier: appServerResult.serviceTier,
+        warnings: diagnosticWarnings,
       });
+    }
+
+    if (appServerResult.blockedReason !== null) {
+      const result = createStableResult({
+        status: "blocked",
+        profile: profile.name,
+        threadId: appServerResult.threadId,
+        model: routing.model,
+        reasoningEffort: routing.reasoningEffort,
+        serviceTier: appServerResult.serviceTier,
+        routingVerified: true,
+        sandboxMode: options.sandboxMode,
+        summary: appServerResult.blockedReason,
+        blockers: [appServerResult.blockedReason],
+        warnings: protocolWarnings,
+      });
+      return { result, exitCode: 1 };
+    }
+
+    if (appServerResult.turnStatus !== "completed") {
+      const message = `App Server turn ended with status ${appServerResult.turnStatus ?? "unknown"}.`;
+      const result = createStableResult({
+        status: "failed",
+        profile: profile.name,
+        threadId: appServerResult.threadId,
+        model: routing.model,
+        reasoningEffort: routing.reasoningEffort,
+        serviceTier: appServerResult.serviceTier,
+        routingVerified: true,
+        sandboxMode: options.sandboxMode,
+        summary: message,
+        blockers: [message],
+        warnings: diagnosticWarnings,
+      });
+      return { result, exitCode: 1 };
     }
 
     let payload;
     try {
       payload = validateProfilePayload(
         profile.name,
-        validateExecutorPayload(JSON.parse(await readFile(outputPath, "utf8"))),
+        validateExecutorPayload(JSON.parse(appServerResult.finalResponse)),
       );
     } catch (error) {
       const message = `Invalid structured executor result: ${error.message}`;
       return configurationFailure(message, options, {
-        threadId: processResult.threadId,
+        threadId: appServerResult.threadId,
         model: routing.model,
         reasoningEffort: routing.reasoningEffort,
-        serviceTier: routing.serviceTier,
-        warnings: processResult.warnings,
+        serviceTier: appServerResult.serviceTier,
+        warnings: diagnosticWarnings,
       });
     }
 
     if (profile.name === "playwright") {
-      if (processResult.unsafePlaywrightToolUsed === true) {
+      if (appServerResult.unsafePlaywrightToolUsed === true) {
         return configurationFailure(
           "The Playwright executor attempted to use browser_run_code_unsafe.",
           options,
           {
-            threadId: processResult.threadId,
+            threadId: appServerResult.threadId,
             model: routing.model,
             reasoningEffort: routing.reasoningEffort,
-            serviceTier: routing.serviceTier,
-            warnings: processResult.warnings,
+            serviceTier: appServerResult.serviceTier,
+            warnings: diagnosticWarnings,
           },
         );
       }
-      if (processResult.playwrightMcpUsed !== true) {
+      if (appServerResult.playwrightMcpUsed !== true) {
         return configurationFailure(
           "The Playwright executor did not emit a verified Playwright MCP tool call.",
           options,
           {
-            threadId: processResult.threadId,
+            threadId: appServerResult.threadId,
             model: routing.model,
             reasoningEffort: routing.reasoningEffort,
-            serviceTier: routing.serviceTier,
-            warnings: processResult.warnings,
+            serviceTier: appServerResult.serviceTier,
+            warnings: diagnosticWarnings,
           },
         );
       }
@@ -935,10 +867,10 @@ async function runExecutor({
     const result = createStableResult({
       status: payload.status,
       profile: profile.name,
-      threadId: processResult.threadId,
+      threadId: appServerResult.threadId,
       model: routing.model,
       reasoningEffort: routing.reasoningEffort,
-      serviceTier: routing.serviceTier,
+      serviceTier: appServerResult.serviceTier,
       routingVerified: true,
       sandboxMode: options.sandboxMode,
       summary: payload.summary,
@@ -947,7 +879,7 @@ async function runExecutor({
         ? [...payload.checks, "playwright_mcp:verified"]
         : payload.checks,
       blockers: payload.blockers,
-      warnings: [...payload.warnings, ...processResult.warnings],
+      warnings: [...payload.warnings, ...protocolWarnings],
     });
     return {
       result,
@@ -957,7 +889,6 @@ async function runExecutor({
       }),
     };
   } finally {
-    await rm(outputPath, { force: true });
     if (playwrightOutputDirectory !== null) {
       await rm(playwrightOutputDirectory, { recursive: true, force: true });
     }
