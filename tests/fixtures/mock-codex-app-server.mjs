@@ -149,8 +149,20 @@ async function handle(message) {
       turn: { id: turnId, status: scenario.turnStatus ?? "completed" },
     });
     if (scenario.terminalBeforeItem === true) {
-      emitTerminal();
-      emitItem();
+      process.stdout.write(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          method: "turn/completed",
+          params: {
+            threadId,
+            turn: { id: turnId, status: scenario.turnStatus ?? "completed" },
+          },
+        })}\n${JSON.stringify({
+          jsonrpc: "2.0",
+          method: "item/completed",
+          params: { threadId, turnId, item },
+        })}\n`,
+      );
     } else {
       emitItem();
       emitTerminal();

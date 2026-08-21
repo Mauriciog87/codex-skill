@@ -1,5 +1,6 @@
 import { spawn as spawnChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
+import { resolveCodexInvocation } from "./codex-command.mjs";
 
 const MAX_CAPTURE_LENGTH = 32_768;
 const FORCE_KILL_DELAY_MS = 1_000;
@@ -538,6 +539,9 @@ export async function runAppServerTurn({
   outputSchema,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   signal,
+  platform = process.platform,
+  architecture = process.arch,
+  commandResolver = resolveCodexInvocation,
   spawnImplementation = spawnChildProcess,
   minimumVersion = MINIMUM_CODEX_VERSION,
 }) {
@@ -549,9 +553,14 @@ export async function runAppServerTurn({
   const args = buildAppServerArguments({ fastMode, configuredServiceTier });
   let child;
   try {
-    child = spawnImplementation(command, args, {
+    const invocation = await commandResolver(command, {
+      platform,
+      architecture,
+      environment,
+    });
+    child = spawnImplementation(invocation.executable, args, {
       cwd,
-      env: environment,
+      env: invocation.environment,
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     });

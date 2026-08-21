@@ -8,6 +8,7 @@ import {
   isPathInside,
   parseCodexVersion,
   readCodexVersion,
+  runCommand,
   writeJsonOutput,
 } from "../scripts/platform-runtime.mjs";
 
@@ -33,6 +34,60 @@ test("Codex versions are parsed and read from native process output", async () =
     }),
     /semantic version/,
   );
+});
+
+test("command execution resolves Codex and preserves native process options", async () => {
+  const environment = { PATH: "C:\\npm" };
+  const calls = [];
+  const commandResolver = async (command, options) => {
+    calls.push({ type: "resolve", command, options });
+    return {
+      executable: command === "codex" ? "C:\\native\\codex.exe" : command,
+      environment,
+    };
+  };
+  const execFileImplementation = async (command, args, options) => {
+    calls.push({ type: "execute", command, args, options });
+    return { stdout: "ok", stderr: "" };
+  };
+
+  await runCommand("codex", ["--version"], {
+    cwd: "C:\\workspace",
+    environment,
+    maxBuffer: 4096,
+    platform: "win32",
+    architecture: "x64",
+    commandResolver,
+    execFileImplementation,
+  });
+  await runCommand("git", ["status"], {
+    environment,
+    commandResolver,
+    execFileImplementation,
+  });
+
+  assert.deepEqual(calls[0], {
+    type: "resolve",
+    command: "codex",
+    options: {
+      platform: "win32",
+      architecture: "x64",
+      environment,
+    },
+  });
+  assert.deepEqual(calls[1], {
+    type: "execute",
+    command: "C:\\native\\codex.exe",
+    args: ["--version"],
+    options: {
+      cwd: "C:\\workspace",
+      env: environment,
+      windowsHide: true,
+      maxBuffer: 4096,
+    },
+  });
+  assert.equal(calls[2].command, "git");
+  assert.equal(calls[3].command, "git");
 });
 
 test("repository containment rejects evidence files inside the checkout", () => {

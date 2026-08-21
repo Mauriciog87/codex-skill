@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { copyFile, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { promisify } from "node:util";
+import { resolveCodexInvocation } from "../.agents/skills/sol-luna-orchestration/scripts/codex-command.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -26,11 +27,20 @@ export async function runCommand(
     cwd,
     environment = process.env,
     maxBuffer = 16 * 1024 * 1024,
+    platform = process.platform,
+    architecture = process.arch,
+    commandResolver = resolveCodexInvocation,
+    execFileImplementation = execFileAsync,
   } = {},
 ) {
-  return execFileAsync(command, args, {
+  const invocation = await commandResolver(command, {
+    platform,
+    architecture,
+    environment,
+  });
+  return execFileImplementation(invocation.executable, args, {
     cwd,
-    env: environment,
+    env: invocation.environment,
     windowsHide: true,
     maxBuffer,
   });

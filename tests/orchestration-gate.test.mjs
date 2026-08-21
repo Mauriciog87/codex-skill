@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { resolve } from "node:path";
 import test from "node:test";
 import {
   evaluateHook,
@@ -13,14 +14,15 @@ const lock = {
 };
 
 test("gate arguments require explicit repository and recovery id", () => {
-  assert.deepEqual(parseGateArguments(["status", "--cwd", "."], "C:\\repo"), {
+  const repository = resolve("gate-test-repository");
+  assert.deepEqual(parseGateArguments(["status", "--cwd", "."], repository), {
     command: "status",
-    cwd: "C:\\repo",
+    cwd: repository,
     lockId: null,
   });
   assert.deepEqual(
-    parseGateArguments(["recover", "--cwd", ".", "--lock-id", "abc"], "C:\\repo"),
-    { command: "recover", cwd: "C:\\repo", lockId: "abc" },
+    parseGateArguments(["recover", "--cwd", ".", "--lock-id", "abc"], repository),
+    { command: "recover", cwd: repository, lockId: "abc" },
   );
   assert.throws(() => parseGateArguments(["status"]), /--cwd is required/);
   assert.throws(

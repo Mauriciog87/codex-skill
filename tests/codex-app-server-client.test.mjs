@@ -39,7 +39,9 @@ function spawnMock(scenario, capturePath) {
 function runMock(scenario = {}, overrides = {}) {
   const serviceTier = overrides.serviceTier ?? "standard";
   return runAppServerTurn({
+    command: overrides.command ?? "codex",
     cwd: resolve("."),
+    environment: overrides.environment ?? process.env,
     model: overrides.model ?? scenario.model ?? "gpt-5.6-sol",
     reasoningEffort: overrides.reasoningEffort ?? scenario.effort ?? "high",
     serviceTier,
@@ -50,7 +52,12 @@ function runMock(scenario = {}, overrides = {}) {
     briefing: "Complete the bounded test task.",
     outputSchema: OUTPUT_SCHEMA,
     timeoutMs: overrides.timeoutMs ?? 2_000,
-    spawnImplementation: spawnMock(scenario, overrides.capturePath),
+    platform: overrides.platform ?? process.platform,
+    architecture: overrides.architecture ?? process.arch,
+    commandResolver: overrides.commandResolver
+      ?? (async (command, { environment }) => ({ executable: command, environment })),
+    spawnImplementation: overrides.spawnImplementation
+      ?? spawnMock(scenario, overrides.capturePath),
   });
 }
 
@@ -68,6 +75,49 @@ test("App Server arguments pin local orchestration safeguards without exec fallb
   assert.deepEqual(args.slice(-3), ["app-server", "--listen", "stdio://"]);
   assert.equal(args.includes("exec"), false);
   assert.equal(args.includes("--json"), false);
+});
+
+test("App Server launches the resolved native Codex executable", async () => {
+  const environment = { PATH: "C:\\npm" };
+  const nativeExecutable = "C:\\npm\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\bin\\codex.exe";
+  const baseSpawn = spawnMock({});
+  let invocation = null;
+  const result = await runMock({}, {
+    platform: "win32",
+    architecture: "x64",
+    environment,
+    commandResolver: async (command, options) => {
+      assert.equal(command, "codex");
+      assert.equal(options.platform, "win32");
+      assert.equal(options.architecture, "x64");
+      assert.equal(options.environment, environment);
+      return { executable: nativeExecutable, environment };
+    },
+    spawnImplementation: (command, args, options) => {
+      invocation = { command, args, options };
+      return baseSpawn(command, args, options);
+    },
+  });
+
+  assert.equal(result.turnStatus, "completed");
+  assert.equal(invocation.command, nativeExecutable);
+  assert.deepEqual(invocation.args.slice(-3), ["app-server", "--listen", "stdio://"]);
+  assert.equal(invocation.options.env, environment);
+  assert.equal(invocation.options.windowsHide, true);
+  assert.deepEqual(invocation.options.stdio, ["pipe", "pipe", "pipe"]);
+});
+
+test("App Server reports native Codex resolution failures as protocol errors", async () => {
+  await assert.rejects(
+    runMock({}, {
+      platform: "win32",
+      commandResolver: async () => {
+        throw new Error("native Codex missing");
+      },
+    }),
+    (error) => error instanceof AppServerProtocolError
+      && /Unable to start Codex App Server: native Codex missing/.test(error.message),
+  );
 });
 
 test("version and service tier normalization enforce the compatibility boundary", () => {
