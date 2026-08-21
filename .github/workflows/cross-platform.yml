@@ -1,0 +1,80 @@
+name: Cross-platform CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 0"
+
+permissions:
+  contents: read
+
+jobs:
+  supported:
+    name: Codex 0.147.0 · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install supported Codex CLI
+        run: npm install --global @openai/codex@0.147.0
+      - name: Run unit tests
+        run: npm test
+      - name: Verify platform integration
+        run: npm run verify:platform -- --expected-codex-version 0.147.0 --output "${{ runner.temp }}/platform-verification.json"
+      - name: Verify clean checkout
+        run: node -e "const {execFileSync}=require('node:child_process');const status=execFileSync('git',['status','--porcelain=v1','--untracked-files=all']);if(status.length){process.stderr.write(status);process.exit(1)}"
+      - name: Upload platform evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-supported-${{ matrix.os }}
+          path: ${{ runner.temp }}/platform-verification.json
+          if-no-files-found: warn
+
+  latest-advisory:
+    name: Latest advisory · ${{ matrix.os }}
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install latest Codex CLI
+        run: npm install --global @openai/codex@latest
+      - name: Run unit tests
+        run: npm test
+      - name: Probe latest App Server compatibility
+        run: npm run verify:platform -- --output "${{ runner.temp }}/platform-verification-latest.json"
+      - name: Verify clean checkout
+        run: node -e "const {execFileSync}=require('node:child_process');const status=execFileSync('git',['status','--porcelain=v1','--untracked-files=all']);if(status.length){process.stderr.write(status);process.exit(1)}"
+      - name: Upload advisory evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-latest-${{ matrix.os }}
+          path: ${{ runner.temp }}/platform-verification-latest.json
+          if-no-files-found: warn

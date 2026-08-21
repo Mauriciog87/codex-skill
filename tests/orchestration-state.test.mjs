@@ -9,6 +9,7 @@ import {
   acquireUltraLock,
   beginExecutorRun,
   finishExecutorRun,
+  getCodexHome,
   getOrchestrationStatus,
   getRepositoryKey,
   getRepositoryState,
@@ -280,6 +281,30 @@ test("Windows repository keys normalize path casing", () => {
   assert.equal(
     getRepositoryKey("C:\\Users\\MAURI\\Repo", "win32"),
     getRepositoryKey("c:\\users\\mauri\\repo", "win32"),
+  );
+});
+
+test("Linux and macOS repository keys preserve path casing", () => {
+  for (const platform of ["linux", "darwin"]) {
+    assert.notEqual(
+      getRepositoryKey("/Users/Mauri/Repo", platform),
+      getRepositoryKey("/Users/mauri/repo", platform),
+    );
+  }
+});
+
+test("CODEX_HOME takes precedence over the supplied home directory", () => {
+  assert.equal(
+    getCodexHome({ CODEX_HOME: "custom-codex-home", HOME: "ignored-home" }, "fallback-home"),
+    join(process.cwd(), "custom-codex-home"),
+  );
+  assert.equal(
+    getCodexHome({ HOME: "ignored-home" }, "fallback-home"),
+    join(process.cwd(), "fallback-home", ".codex"),
+  );
+  assert.equal(
+    getCodexHome({ HOME: "environment-home" }),
+    join(process.cwd(), "environment-home", ".codex"),
   );
 });
 

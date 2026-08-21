@@ -16,7 +16,10 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SOL_MODEL_VERBOSITY } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
+import {
+  SOL_MODEL_VERBOSITY,
+  getCodexHome,
+} from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
 
 export const SKILL_NAME = "sol-luna-orchestration";
 export const LEGACY_SKILL_NAME = "sol-sol-orchestration";
@@ -38,13 +41,23 @@ const LEGACY_MANAGED_HOOKS_END = "# sol-sol-orchestration:hooks:end";
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_REPOSITORY_ROOT = resolve(SCRIPT_DIRECTORY, "..");
 
-function pathKey(value, platform) {
+export function canonicalPathKey(value, platform = process.platform) {
   const normalized = resolve(value).replace(/^\\\\\?\\/, "");
   return platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 function samePath(left, right, platform) {
-  return pathKey(left, platform) === pathKey(right, platform);
+  return canonicalPathKey(left, platform) === canonicalPathKey(right, platform);
+}
+
+export function getSkillLinkType(platform = process.platform) {
+  if (platform === "win32") {
+    return "junction";
+  }
+  if (["linux", "darwin"].includes(platform)) {
+    return "symlink";
+  }
+  throw new Error(`Unsupported platform: ${platform}`);
 }
 
 async function getEntry(path) {
@@ -523,7 +536,7 @@ async function restoreFile(path, content) {
 function uniqueLegacySpecifications(specifications, platform) {
   const unique = new Map();
   for (const specification of specifications) {
-    unique.set(pathKey(specification.location, platform), specification);
+    unique.set(canonicalPathKey(specification.location, platform), specification);
   }
   return [...unique.values()];
 }
@@ -531,11 +544,10 @@ function uniqueLegacySpecifications(specifications, platform) {
 export async function installGlobalOrchestration({
   repositoryRoot = DEFAULT_REPOSITORY_ROOT,
   homeDirectory = homedir(),
-  codexHome = process.env.CODEX_HOME
-    ? resolve(process.env.CODEX_HOME)
-    : resolve(homeDirectory, ".codex"),
+  codexHome = getCodexHome(process.env, homeDirectory),
   platform = process.platform,
 } = {}) {
+  const linkType = getSkillLinkType(platform);
   const canonicalDirectory = resolve(repositoryRoot, ".agents", "skills", SKILL_NAME);
   const legacySkills = [
     {
@@ -621,7 +633,7 @@ export async function installGlobalOrchestration({
       await symlink(
         canonicalDirectory,
         destination,
-        platform === "win32" ? "junction" : "dir",
+        linkType === "junction" ? "junction" : "dir",
       );
       linkCreated = true;
     }
@@ -656,7 +668,7 @@ export async function installGlobalOrchestration({
     status: "completed",
     canonical_skill: canonicalDirectory,
     global_skill: destination,
-    link_type: platform === "win32" ? "junction" : "symlink",
+    link_type: linkType,
     already_linked: destinationState.linked,
     global_config: configPath,
     global_instructions: globalInstructions.path,

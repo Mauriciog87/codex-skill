@@ -9,6 +9,7 @@
     "ultra": "node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs",
     "ultra:gate": "node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs",
     "test": "node --test",
+    "verify:platform": "node scripts/verify-platform.mjs",
     "verify:live": "node scripts/verify-routing.mjs"
   }
 }

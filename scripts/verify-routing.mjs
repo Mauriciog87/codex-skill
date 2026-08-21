@@ -37,6 +37,13 @@ import {
   updateGlobalConfig,
   updateGlobalInstructions,
 } from "./install-global-orchestration.mjs";
+import {
+  getPlatformName,
+  isPathInside,
+  readCodexVersion,
+  runCommand,
+  writeJsonOutput,
+} from "./platform-runtime.mjs";
 
 export const ORCHESTRATOR_MODEL = "gpt-5.6-sol";
 export const ORCHESTRATOR_REASONING_EFFORT = "xhigh";
@@ -332,13 +339,16 @@ async function collectGeneratedSchemaFiles(directory, files = []) {
   return files;
 }
 
-export async function verifyAppServerSchema() {
+export async function verifyAppServerSchema({
+  environment = process.env,
+  commandRunner = runCommand,
+} = {}) {
   const outputDirectory = await mkdtemp(join(tmpdir(), "codex-app-server-schema-"));
   try {
-    await execFileAsync(
+    await commandRunner(
       "codex",
       ["app-server", "generate-json-schema", "--experimental", "--out", outputDirectory],
-      { windowsHide: true, maxBuffer: 16 * 1024 * 1024 },
+      { environment, maxBuffer: 16 * 1024 * 1024 },
     );
     const files = await collectGeneratedSchemaFiles(outputDirectory);
     if (files.length === 0) {
@@ -893,6 +903,11 @@ async function runCapacityProbe() {
 
 export async function verifyRouting(repositoryRoot = REPOSITORY_ROOT) {
   const beforeStatus = await gitStatus(repositoryRoot);
+  const platform = getPlatformName();
+  if (platform === null) {
+    throw new Error(`Unsupported platform: ${process.platform}`);
+  }
+  const codexVersion = await readCodexVersion({ cwd: repositoryRoot });
   const codexHome = process.env.CODEX_HOME
     ? resolve(process.env.CODEX_HOME)
     : resolve(homedir(), ".codex");
@@ -920,6 +935,10 @@ export async function verifyRouting(repositoryRoot = REPOSITORY_ROOT) {
 
   return {
     status: "completed",
+    platform,
+    architecture: process.arch,
+    node_version: process.version,
+    codex_version: codexVersion,
     root: {
       thread_id: rootProbe.threadId,
       model: rootProbe.routing.model,
@@ -942,18 +961,59 @@ export async function verifyRouting(repositoryRoot = REPOSITORY_ROOT) {
   };
 }
 
-export async function main(argv = process.argv.slice(2)) {
-  if (argv.length > 0) {
-    process.stderr.write("verify-routing does not accept arguments.\n");
-    return 2;
+export function parseVerifyRoutingArguments(argv) {
+  let outputPath = null;
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument !== "--output") {
+      throw new Error(`Unknown argument: ${argument}`);
+    }
+    if (outputPath !== null) {
+      throw new Error("--output may be provided only once.");
+    }
+    const value = argv[index + 1];
+    if (!value || value.startsWith("--")) {
+      throw new Error("--output requires a path.");
+    }
+    outputPath = resolve(value);
+    index += 1;
   }
+  return { outputPath };
+}
+
+export async function main(argv = process.argv.slice(2), dependencies = {}) {
+  const verify = dependencies.verifyRouting ?? verifyRouting;
+  const outputWriter = dependencies.writeJsonOutput ?? writeJsonOutput;
+  const writeStdout = dependencies.writeStdout ?? ((value) => process.stdout.write(value));
+  const writeStderr = dependencies.writeStderr ?? ((value) => process.stderr.write(value));
+  let options;
 
   try {
-    const result = await verifyRouting();
-    process.stdout.write(`${JSON.stringify(result)}\n`);
+    options = parseVerifyRoutingArguments(argv);
+    if (options.outputPath !== null && isPathInside(REPOSITORY_ROOT, options.outputPath)) {
+      throw new Error("--output must be outside the repository so live verification leaves Git unchanged.");
+    }
+    const result = await verify();
+    await outputWriter(options.outputPath, result);
+    writeStdout(`${JSON.stringify(result)}\n`);
     return 0;
   } catch (error) {
-    process.stderr.write(`${JSON.stringify({ status: "failed", summary: error.message })}\n`);
+    const result = {
+      status: "failed",
+      platform: getPlatformName(),
+      architecture: process.arch,
+      node_version: process.version,
+      codex_version: null,
+      summary: error.message,
+    };
+    if (options?.outputPath && !isPathInside(REPOSITORY_ROOT, options.outputPath)) {
+      try {
+        await outputWriter(options.outputPath, result);
+      } catch (outputError) {
+        result.summary = `${result.summary} Output failed: ${outputError.message}`;
+      }
+    }
+    writeStderr(`${JSON.stringify(result)}\n`);
     return 2;
   }
 }

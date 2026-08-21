@@ -1,0 +1,61 @@
+name: Live cross-platform verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    name: Live routing · ${{ matrix.name }}
+    if: github.ref == 'refs/heads/master'
+    environment: codex-live
+    runs-on:
+      - self-hosted
+      - ${{ matrix.runner_label }}
+      - codex-live
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            runner_label: windows
+          - name: linux
+            runner_label: linux
+          - name: macos
+            runner_label: macOS
+    concurrency:
+      group: sol-luna-live-${{ matrix.name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install supported Codex CLI
+        run: npm install --global @openai/codex@0.147.0
+      - name: Run unit tests
+        run: npm test
+      - name: Install global orchestration
+        run: npm run install:global
+      - name: Verify platform integration
+        run: npm run verify:platform -- --expected-codex-version 0.147.0 --output "${{ runner.temp }}/platform-verification.json"
+      - name: Verify live routing
+        run: npm run verify:live -- --output "${{ runner.temp }}/live-routing-verification.json"
+      - name: Verify clean checkout
+        if: always()
+        run: node -e "const {execFileSync}=require('node:child_process');const status=execFileSync('git',['status','--porcelain=v1','--untracked-files=all']);if(status.length){process.stderr.write(status);process.exit(1)}"
+      - name: Show orchestration gate after failure
+        if: failure()
+        run: node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs status --cwd .
+      - name: Upload live evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-routing-${{ matrix.name }}
+          path: |
+            ${{ runner.temp }}/platform-verification.json
+            ${{ runner.temp }}/live-routing-verification.json
+          if-no-files-found: warn

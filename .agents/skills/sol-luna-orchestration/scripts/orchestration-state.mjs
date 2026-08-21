@@ -128,10 +128,11 @@ export function getRepositoryKey(repository, platform = process.platform) {
   return createHash("sha256").update(keyed).digest("hex");
 }
 
-export function getCodexHome(environment = process.env, homeDirectory = homedir()) {
+export function getCodexHome(environment = process.env, homeDirectory) {
+  const resolvedHomeDirectory = homeDirectory ?? environment.HOME ?? homedir();
   return environment.CODEX_HOME
     ? resolve(environment.CODEX_HOME)
-    : resolve(homeDirectory, ".codex");
+    : resolve(resolvedHomeDirectory, ".codex");
 }
 
 export async function getRepositoryState(

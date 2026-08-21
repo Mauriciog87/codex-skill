@@ -49,6 +49,7 @@ test("package scripts and skill policy expose the supported interfaces", async (
     "ultra:gate":
       "node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs",
     test: "node --test",
+    "verify:platform": "node scripts/verify-platform.mjs",
     "verify:live": "node scripts/verify-routing.mjs",
   });
 
@@ -141,5 +142,84 @@ test("profile registry and operational guidance stay aligned", async () => {
     assert.match(content, /thread\/settings\/updated/);
     assert.match(content, /priority/);
     assert.match(content, /default/);
+  }
+});
+
+test("cross-platform workflows keep offline and live verification separated", async () => {
+  const offlineWorkflow = await readFile(
+    ".github/workflows/cross-platform.yml",
+    "utf8",
+  );
+  for (const value of [
+    "pull_request:",
+    "push:",
+    "workflow_dispatch:",
+    "schedule:",
+    "windows-latest",
+    "ubuntu-latest",
+    "macos-latest",
+    "node-version: 22",
+    "@openai/codex@0.147.0",
+    "@openai/codex@latest",
+    "npm test",
+    "npm run verify:platform",
+    "--expected-codex-version 0.147.0",
+    "fail-fast: false",
+    "continue-on-error: true",
+    "contents: read",
+  ]) {
+    assert.match(offlineWorkflow, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+
+  const liveWorkflow = await readFile(
+    ".github/workflows/live-cross-platform.yml",
+    "utf8",
+  );
+  for (const value of [
+    "workflow_dispatch:",
+    "github.ref == 'refs/heads/master'",
+    "self-hosted",
+    "runner_label: windows",
+    "runner_label: linux",
+    "runner_label: macOS",
+    "codex-live",
+    "npm run install:global",
+    "npm run verify:platform",
+    "npm run verify:live",
+    "actions/upload-artifact@v4",
+    "orchestration-gate.mjs status",
+    "contents: read",
+  ]) {
+    assert.match(liveWorkflow, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+  assert.doesNotMatch(liveWorkflow, /pull_request:|schedule:|OPENAI_API_KEY|secrets\.|orchestration-gate\.mjs recover/);
+});
+
+test("platform smoke and documentation expose the same portability contract", async () => {
+  const runner = await readFile("scripts/verify-platform.mjs", "utf8");
+  assert.match(runner, /--expected-codex-version/);
+  assert.match(runner, /--output/);
+  assert.match(runner, /--strict-config/);
+  assert.match(runner, /verifyAppServerSchema/);
+  assert.match(runner, /installGlobalOrchestration/);
+  assert.match(runner, /temporary_state:removed/);
+  assert.doesNotMatch(runner, /invokeExecutor|invokeUltra|runAppServerTurn|turn\/start/);
+
+  const liveRunner = await readFile("scripts/verify-routing.mjs", "utf8");
+  assert.match(liveRunner, /parseVerifyRoutingArguments/);
+  assert.match(liveRunner, /codex_version/);
+  assert.match(liveRunner, /writeJsonOutput/);
+
+  for (const path of [
+    "README.md",
+    ".agents/skills/sol-luna-orchestration/SKILL.md",
+  ]) {
+    const content = await readFile(path, "utf8");
+    assert.match(content, /verify:platform/);
+    assert.match(content, /Windows/);
+    assert.match(content, /Linux/);
+    assert.match(content, /macOS/);
+    assert.match(content, /codex-live/);
+    assert.match(content, /Pending|pending/);
   }
 });

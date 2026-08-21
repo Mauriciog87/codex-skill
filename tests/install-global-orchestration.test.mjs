@@ -20,6 +20,8 @@ import {
   MANAGED_HOOKS_START,
   SKILL_NAME,
   TERRA_LEGACY_SKILL_NAME,
+  canonicalPathKey,
+  getSkillLinkType,
   installGlobalOrchestration,
   updateGlobalConfig,
   updateGlobalInstructions,
@@ -28,6 +30,28 @@ import {
 const NEW_DISPLAY_NAME = "Sol-Luna Orchestration";
 const LEGACY_DISPLAY_NAME = "Sol-Sol Orchestration";
 const TERRA_LEGACY_DISPLAY_NAME = "Sol-Terra Orchestration";
+
+test("skill link selection is explicit for every supported platform", () => {
+  assert.equal(getSkillLinkType("win32"), "junction");
+  assert.equal(getSkillLinkType("linux"), "symlink");
+  assert.equal(getSkillLinkType("darwin"), "symlink");
+  assert.throws(() => getSkillLinkType("freebsd"), /Unsupported platform/);
+});
+
+test("canonical path comparison normalizes Windows casing only", () => {
+  assert.equal(
+    canonicalPathKey("C:\\Users\\MAURI\\Repo", "win32"),
+    canonicalPathKey("c:\\users\\mauri\\repo", "win32"),
+  );
+  assert.notEqual(
+    canonicalPathKey("/Users/Mauri/Repo", "darwin"),
+    canonicalPathKey("/Users/mauri/repo", "darwin"),
+  );
+  assert.notEqual(
+    canonicalPathKey("/home/Mauri/Repo", "linux"),
+    canonicalPathKey("/home/mauri/repo", "linux"),
+  );
+});
 
 async function createSkill(
   skillDirectory,

@@ -2,7 +2,7 @@
 
 This repository provides a small, dependency-free orchestration layer for Codex. It keeps planning and integration on GPT-5.6 Sol, moves bounded work to verified Sol or Luna profiles, and checks the effective model, reasoning effort, and service tier before accepting a result.
 
-The launchers use the experimental Codex App Server over local stdio JSON-RPC instead of native subagent routing. App Server applies and reports each route explicitly while native multi-agent execution remains disabled. There is deliberately no fallback to the legacy execution path: an incompatible protocol fails closed with exit code `2`.
+The launchers use the [experimental Codex App Server](https://developers.openai.com/codex/app-server) over local stdio JSON-RPC instead of native subagent routing. App Server applies and reports each route explicitly while native multi-agent execution remains disabled. There is deliberately no fallback to the legacy execution path: an incompatible protocol fails closed with exit code `2`.
 
 ## Roles
 
@@ -39,6 +39,29 @@ The installer is idempotent and performs a complete preflight before changing an
 - refuses unrelated destinations, malformed managed markers, and ambiguous TOML.
 
 Repository-specific Codex instructions still take precedence over the global defaults.
+
+## Platform support
+
+| System | Global skill link | Offline CI | Live routing |
+|---|---|---|---|
+| Windows | Junction | Required on `windows-latest` | Pending |
+| Linux | Directory symlink | Required on `ubuntu-latest` | Pending |
+| macOS | Directory symlink | Required on `macos-latest` | Pending |
+
+The required [GitHub Actions matrix](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations) runs on Node.js 22 with Codex CLI `0.147.0`. A weekly and manually triggered advisory matrix probes `@openai/codex@latest` without blocking `master`, because App Server compatibility can change in newer releases.
+
+The offline smoke test does not start model turns or require authentication:
+
+```text
+npm run verify:platform
+npm run verify:platform -- --expected-codex-version 0.147.0 --output <path-outside-the-repository>
+```
+
+It creates isolated temporary HOME and `CODEX_HOME` directories, checks strict configuration and generated App Server schemas, installs twice, verifies the native link type and target, and removes the temporary state. Its JSON result is written to stdout; diagnostics use stderr.
+
+Live status remains `Pending` until a successful artifact exists for that operating system. Live checks run only from `master` through the manual `live-cross-platform.yml` workflow on dedicated self-hosted runners labeled `codex-live` plus `windows`, `linux`, or `macOS`. Configure the GitHub environment named `codex-live` with required reviewers before enabling the workflow. Each runner must use an isolated OS account, be authenticated in Codex beforehand, and have the stdio Playwright MCP enabled. The workflow does not copy personal tokens or use API-key secrets.
+
+Windows can still report `codex-windows-sandbox-setup.exe: Access is denied` on machines where the sandbox helper cannot initialize. That platform remains pending when this occurs; the verification never reduces permissions or enables a bypass.
 
 ## Running an executor
 
@@ -145,7 +168,8 @@ node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs recove
 
 ```text
 npm test
+npm run verify:platform
 npm run verify:live
 ```
 
-The unit suite covers JSON-RPC ordering and failures, profile routing, structured results, tiers, terminal colors, capacity races, Ultra locks, Playwright preflight and tool evidence, installer rollback, and migration behavior. Live verification generates the installed App Server schemas, checks the root and every profile against protocol and rollout evidence, uses temporary repositories for write tests, and confirms that read-only checks do not alter this repository.
+The unit suite covers JSON-RPC ordering and failures, profile routing, structured results, tiers, terminal colors, capacity races, Ultra locks, Playwright preflight and tool evidence, installer rollback, migration behavior, and platform-specific path rules. `verify:platform` is the authentication-free compatibility gate. Live verification generates the installed App Server schemas, checks the root and every profile against protocol and rollout evidence, uses temporary repositories for write tests, and confirms that read-only checks do not alter this repository. Add `--output <path-outside-the-repository>` to either verification command when an evidence artifact is required.

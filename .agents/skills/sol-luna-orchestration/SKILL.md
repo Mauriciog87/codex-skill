@@ -33,6 +33,17 @@ All roles use low output verbosity. Fast profiles force `features.fast_mode = tr
 
 The launcher requires Codex CLI 0.147.0 or a later compatible version and uses the experimental Codex App Server over local stdio JSON-RPC. It deliberately has no fallback to the legacy execution path. App Server protocol `priority` maps to public `fast`, and protocol `default` maps to public `standard`.
 
+## Platform verification
+
+Windows uses a junction for the global skill. Linux and macOS use directory symlinks. Treat portability as two separate gates:
+
+```text
+npm run verify:platform
+npm run verify:live
+```
+
+`verify:platform` is the required authentication-free gate on Windows, Linux, and macOS. It must verify Codex CLI compatibility, strict configuration, generated App Server schemas, an idempotent isolated global installation, the native link type and canonical target, temporary cleanup, and unchanged Git state. `verify:live` is a manual authenticated gate that must verify root, every executor profile, Playwright, Ultra, locks, recovery, isolation, capacity, and unchanged repository state. Record a platform as live verified only after its self-hosted `codex-live` artifact succeeds. A sandbox failure keeps the platform pending and never justifies a bypass or weaker sandbox.
+
 ## Launcher
 
 The canonical interface is:
@@ -111,4 +122,4 @@ node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs recove
 
 ## Completion criteria
 
-Complete the root task only after every used profile has verified routing, results are integrated without conflicts, relevant checks pass, Playwright usage is verified when requested, every Ultra lock is released or reported as recovery-required, and unresolved limitations are disclosed.
+Complete the root task only after every used profile has verified routing, results are integrated without conflicts, relevant checks pass, Playwright usage is verified when requested, every Ultra lock is released or reported as recovery-required, platform verification appropriate to the change passes, and unresolved portability or sandbox limitations are disclosed.
