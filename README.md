@@ -22,7 +22,7 @@ Routing requires two matching sources of evidence. `thread/settings/updated` con
 
 ## Installation
 
-The project requires only the Node.js runtime bundled with Codex and Codex CLI 0.147.0 or a later compatible release. App Server and `thread/settings/update` are experimental interfaces, so upgrades must pass the included schema and live verification before they are trusted.
+**Minimum supported Codex CLI version: `0.147.0`.** Older releases are not supported because the launchers depend on the experimental App Server protocol and `thread/settings/update` behavior validated against that version. The only other runtime required is the Node.js runtime bundled with Codex. Because these interfaces remain experimental, newer Codex releases must still pass the included schema and live verification before they are trusted.
 
 ```text
 npm run install:global
