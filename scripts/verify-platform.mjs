@@ -7,6 +7,10 @@ import {
   isCompatibleCodexVersion,
 } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
 import {
+  createProcessIdentity,
+  inspectProcessIdentity,
+} from "../.agents/skills/sol-luna-orchestration/scripts/process-identity.mjs";
+import {
   canonicalPathKey,
   getSkillLinkType,
   installGlobalOrchestration,
@@ -39,6 +43,7 @@ export function createPlatformVerificationResult(overrides = {}) {
     strict_config_verified: false,
     app_server_schema_verified: false,
     schema_file_count: 0,
+    process_identity_verified: false,
     installation_idempotent: false,
     git_unchanged: false,
     checks: [],
@@ -152,6 +157,8 @@ export async function verifyPlatform(options = {}, dependencies = {}) {
   const repositoryRoot = resolve(dependencies.repositoryRoot ?? REPOSITORY_ROOT);
   const commandRunner = dependencies.commandRunner ?? runCommand;
   const schemaVerifier = dependencies.schemaVerifier ?? verifyAppServerSchema;
+  const processIdentityCreator = dependencies.processIdentityCreator ?? createProcessIdentity;
+  const processIdentityInspector = dependencies.processIdentityInspector ?? inspectProcessIdentity;
   const installer = dependencies.installer ?? installGlobalOrchestration;
   const gitStatusReader = dependencies.gitStatusReader ?? readGitStatus;
   const temporaryDirectoryFactory = dependencies.temporaryDirectoryFactory
@@ -221,6 +228,14 @@ export async function verifyPlatform(options = {}, dependencies = {}) {
     result.app_server_schema_verified = true;
     result.schema_file_count = schema.generated_files;
     result.checks.push("app_server_schema:verified");
+
+    const processIdentity = await processIdentityCreator();
+    const processStatus = await processIdentityInspector(processIdentity);
+    if (processStatus.status !== "same") {
+      throw new Error(`Process identity verification returned ${processStatus.status ?? "invalid"}.`);
+    }
+    result.process_identity_verified = true;
+    result.checks.push("process_identity:verified");
 
     const installOptions = {
       repositoryRoot,

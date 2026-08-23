@@ -1,9 +1,11 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  ORCHESTRATION_GENERATION_ENV,
   ORCHESTRATION_LOCK_ENV,
   OrchestrationStateError,
   getOrchestrationStatus,
+  readOrchestrationHistory,
   readUltraLock,
   recoverUltraLock,
 } from "./orchestration-state.mjs";
@@ -27,32 +29,54 @@ function requireValue(argv, index, option) {
 
 export function parseGateArguments(argv, baseDirectory = process.cwd()) {
   const command = argv[0];
-  if (!["status", "recover", "hook"].includes(command)) {
-    throw new GateInvocationError("Command must be status, recover, or hook.");
+  if (!["status", "recover", "history", "hook"].includes(command)) {
+    throw new GateInvocationError("Command must be status, recover, history, or hook.");
   }
   if (command === "hook") {
     if (argv.length !== 1) {
       throw new GateInvocationError("hook does not accept options.");
     }
-    return { command, cwd: null, lockId: null };
+    return {
+      command,
+      cwd: null,
+      lockId: null,
+      limit: null,
+      confirmLegacyRecovery: false,
+    };
   }
-  const parsed = { command, cwd: null, lockId: null };
+  const parsed = {
+    command,
+    cwd: null,
+    lockId: null,
+    limit: command === "history" ? 50 : null,
+    confirmLegacyRecovery: false,
+  };
   const seen = new Set();
   for (let index = 1; index < argv.length; index += 1) {
     const option = argv[index];
-    if (!["--cwd", "--lock-id"].includes(option)) {
+    if (!["--cwd", "--lock-id", "--limit", "--confirm-legacy-recovery"].includes(option)) {
       throw new GateInvocationError(`Unknown option: ${option}`);
     }
     if (seen.has(option)) {
       throw new GateInvocationError(`Duplicate option: ${option}`);
     }
     seen.add(option);
+    if (option === "--confirm-legacy-recovery") {
+      parsed.confirmLegacyRecovery = true;
+      continue;
+    }
     const value = requireValue(argv, index, option);
     index += 1;
     if (option === "--cwd") {
       parsed.cwd = resolve(baseDirectory, value);
-    } else {
+    } else if (option === "--lock-id") {
       parsed.lockId = value;
+    } else {
+      const limit = Number(value);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+        throw new GateInvocationError("--limit must be an integer between 1 and 200.");
+      }
+      parsed.limit = limit;
     }
   }
   if (parsed.cwd === null) {
@@ -61,8 +85,17 @@ export function parseGateArguments(argv, baseDirectory = process.cwd()) {
   if (command === "status" && parsed.lockId !== null) {
     throw new GateInvocationError("status does not accept --lock-id.");
   }
+  if (command === "status" && (seen.has("--limit") || parsed.confirmLegacyRecovery)) {
+    throw new GateInvocationError("status accepts only --cwd.");
+  }
   if (command === "recover" && parsed.lockId === null) {
     throw new GateInvocationError("recover requires --lock-id.");
+  }
+  if (command === "recover" && seen.has("--limit")) {
+    throw new GateInvocationError("recover does not accept --limit.");
+  }
+  if (command === "history" && (parsed.lockId !== null || parsed.confirmLegacyRecovery)) {
+    throw new GateInvocationError("history accepts only --cwd and --limit.");
   }
   return parsed;
 }
@@ -123,23 +156,39 @@ export async function evaluateHook(
       ? blockedPreToolUse(reason)
       : sessionContext(reason);
   }
+  const inheritedLockId = environment[ORCHESTRATION_LOCK_ENV] ?? null;
+  const inheritedGeneration = environment[ORCHESTRATION_GENERATION_ENV] ?? null;
   if (lock === null) {
-    return null;
+    if (inheritedLockId === null && inheritedGeneration === null) {
+      return null;
+    }
+    const reason = inheritedLockId === null || inheritedGeneration === null
+      ? "Session has incomplete Ultra ownership variables without an active repository lock."
+      : "Session has stale Ultra ownership variables without an active repository lock.";
+    return input.hook_event_name === "PreToolUse"
+      ? blockedPreToolUse(reason)
+      : sessionContext(reason);
   }
-  const ownsLock =
-    lock.state === "active" && environment[ORCHESTRATION_LOCK_ENV] === lock.lock_id;
+  const legacy = lock.version === 1;
+  const ownsLock = lock.state === "active" && inheritedLockId === lock.lock_id && (
+    legacy
+      ? inheritedGeneration === null
+      : inheritedGeneration === String(lock.generation)
+  );
   if (input.hook_event_name === "SessionStart") {
     return sessionContext(
       ownsLock
-        ? `This session owns exclusive Sol Ultra takeover ${lock.lock_id} for ${lock.repository}.`
-        : `Repository ${lock.repository} is paused by exclusive Sol Ultra takeover ${lock.lock_id}. Do not plan, delegate, edit, or run tools until the lock is released.`,
+        ? legacy
+          ? `This session owns legacy-unfenced Sol Ultra takeover ${lock.lock_id} for ${lock.repository}. Drain it without starting new executors.`
+          : `This session owns exclusive Sol Ultra takeover ${lock.lock_id} generation ${lock.generation} for ${lock.repository}.`
+        : `Repository ${lock.repository} is paused by exclusive Sol Ultra takeover ${lock.lock_id}${legacy ? " legacy-unfenced" : ` generation ${lock.generation}`} in state ${lock.state}. Do not plan, delegate, edit, or run tools until the lock is released.`,
     );
   }
   if (ownsLock) {
     return null;
   }
   return blockedPreToolUse(
-    `Repository is blocked by exclusive Sol Ultra takeover ${lock.lock_id} in state ${lock.state}.`,
+    `Repository is blocked by exclusive Sol Ultra takeover ${lock.lock_id}${legacy ? " legacy-unfenced" : ` generation ${lock.generation}`} in state ${lock.state}.`,
   );
 }
 
@@ -155,7 +204,13 @@ export async function main(argv = process.argv.slice(2)) {
     }
     const output = options.command === "status"
       ? await getOrchestrationStatus(options.cwd)
-      : await recoverUltraLock({ cwd: options.cwd, lockId: options.lockId });
+      : options.command === "history"
+        ? await readOrchestrationHistory(options.cwd, { limit: options.limit })
+        : await recoverUltraLock({
+            cwd: options.cwd,
+            lockId: options.lockId,
+            confirmLegacyRecovery: options.confirmLegacyRecovery,
+          });
     process.stdout.write(`${JSON.stringify(output)}\n`);
     return 0;
   } catch (error) {

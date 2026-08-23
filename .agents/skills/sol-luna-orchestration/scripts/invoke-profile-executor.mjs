@@ -20,6 +20,7 @@ import {
   abandonExecutorRun,
   beginExecutorRun,
   finishExecutorRun,
+  registerExecutorProcess,
 } from "./orchestration-state.mjs";
 import {
   executorLaunchMessage,
@@ -660,6 +661,7 @@ async function runExecutor({
   signal,
   appServerRunner = runAppServerTurn,
   playwrightMcpVerifier = verifyPlaywrightMcp,
+  onAppServerStarted,
 }) {
   if (typeof briefing !== "string" || briefing.trim().length === 0) {
     throw new ExecutorInvocationError("An executor briefing is required.");
@@ -719,6 +721,7 @@ async function runExecutor({
         outputSchema,
         timeoutMs: options.timeoutSeconds * 1000,
         signal,
+        onProcessStarted: onAppServerStarted,
       });
     } catch (error) {
       if (!(error instanceof AppServerError)) {
@@ -914,14 +917,25 @@ export async function invokeExecutor(input) {
     const message = error instanceof Error ? error.message : String(error);
     return configurationFailure(message, input.options);
   }
+  let execution;
   try {
-    const execution = await runExecutor({ ...input, environment });
-    await finishExecutorRun(lease, execution);
-    return execution;
+    execution = await runExecutor({
+      ...input,
+      environment,
+      onAppServerStarted: async ({ pid }) => {
+        await registerExecutorProcess(lease, {
+          kind: "app-server",
+          pid,
+          processIdentityProvider: input.coordinationOptions?.processIdentityProvider,
+        });
+      },
+    });
   } catch (error) {
-    await abandonExecutorRun(lease, error);
+    await abandonExecutorRun(lease, error, input.coordinationOptions);
     throw error;
   }
+  await finishExecutorRun(lease, execution, input.coordinationOptions);
+  return execution;
 }
 
 export async function main(argv = process.argv.slice(2)) {

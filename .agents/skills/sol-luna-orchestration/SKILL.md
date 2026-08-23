@@ -42,7 +42,7 @@ npm run verify:platform
 npm run verify:live
 ```
 
-`verify:platform` is the required authentication-free gate on Windows, Linux, and macOS. It must verify Codex CLI compatibility, strict configuration, generated App Server schemas, an idempotent isolated global installation, the native link type and canonical target, temporary cleanup, and unchanged Git state. `verify:live` is a manual authenticated gate that must verify root, every executor profile, Playwright, Ultra, locks, recovery, isolation, capacity, and unchanged repository state. Record a platform as live verified only after its self-hosted `codex-live` artifact succeeds. A sandbox failure keeps the platform pending and never justifies a bypass or weaker sandbox.
+`verify:platform` is the required authentication-free gate on Windows, Linux, and macOS. It must verify Codex CLI compatibility, strict configuration, generated App Server schemas, the current process fingerprint, an idempotent isolated global installation, the native link type and canonical target, temporary cleanup, and unchanged Git state. `verify:live` is a manual authenticated gate that must verify root, every executor profile, Playwright, Ultra, locks, recovery, isolation, capacity, and unchanged repository state. Record a platform as live verified only after its self-hosted `codex-live` artifact succeeds. A sandbox failure keeps the platform pending and never justifies a bypass or weaker sandbox.
 
 ## Launcher
 
@@ -102,13 +102,17 @@ Use Sol `ultra` on Standard only when a named architecture, security, concurrenc
 briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs --cwd <repository> --reason <reason> --confirm-exclusive-takeover --sandbox read-only
 ```
 
-Workspace writing requires an explicit `--sandbox workspace-write`. Ultra replaces the root temporarily, disables native multi-agent execution, and delegates only through verified profiles. Its executors inherit `CODEX_ORCHESTRATION_LOCK_ID`, consume the normal capacity pools, and serialize overlapping writes.
+Workspace writing requires an explicit `--sandbox workspace-write`. Ultra replaces the root temporarily, disables native multi-agent execution, and delegates only through verified profiles. Its executors inherit the exact `CODEX_ORCHESTRATION_LOCK_ID` and monotonic `CODEX_ORCHESTRATION_GENERATION`, consume the normal capacity pools, and serialize overlapping writes. The public executor result remains unchanged; the Ultra result includes its integer `generation`.
 
-A verified terminal result releases the lock. Timeout, interruption, process failure, invalid output, or routing failure leaves `recovery-required`. Recover only after the owner process stops and only with the exact lock id:
+A verified terminal result releases the lock. Timeout, interruption, process failure, invalid output, or routing failure leaves `recovery-required`. State v2 registers the Ultra launcher/App Server and every executor launcher/App Server with a portable process-start fingerprint. Recover only with the exact lock id and only after every registered identity is confirmed `dead` or `reused`; a live or `unknown` identity fails closed, and recovery never kills it:
 
 ```text
+node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs status --cwd <repository>
+node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs history --cwd <repository> --limit 50
 node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs recover --cwd <repository> --lock-id <exact-lock-id>
 ```
+
+Active version 1 state remains `legacy-unfenced` and is never silently converted. After its owners stop, recover it only with the additional `--confirm-legacy-recovery`; a v1-only repository then starts v2 at generation 1. History is immutable, sanitized, targets 1,000 events while protecting the active generation, and never serves as lock authority.
 
 ## Guardrails
 
@@ -119,7 +123,9 @@ node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs recove
 - Do not infer model, effort, or tier from configuration or executor prose. Require matching `thread/settings/updated` model, effort, and tier plus rollout `turn_context` model and effort.
 - Do not manually edit or delete orchestration state.
 - Treat hooks as defense in depth, not complete enforcement across every tool path.
+- Do not add TTLs, heartbeats, automatic recovery, dependency fallbacks, worktrees, or `shell: true`.
+- Disclose that unregistered descendants cannot be identified portably and that fencing cannot atomically cancel an arbitrary workspace mutation already in progress.
 
 ## Completion criteria
 
-Complete the root task only after every used profile has verified routing, results are integrated without conflicts, relevant checks pass, Playwright usage is verified when requested, every Ultra lock is released or reported as recovery-required, platform verification appropriate to the change passes, and unresolved portability or sandbox limitations are disclosed.
+Complete the root task only after every used profile has verified routing, results are integrated without conflicts, relevant checks pass, Playwright usage is verified when requested, every Ultra generation is released or reported as recovery-required, platform verification appropriate to the change passes, and unresolved portability, descendant-registration, or sandbox limitations are disclosed.

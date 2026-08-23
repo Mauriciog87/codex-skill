@@ -58,6 +58,7 @@ function runMock(scenario = {}, overrides = {}) {
       ?? (async (command, { environment }) => ({ executable: command, environment })),
     spawnImplementation: overrides.spawnImplementation
       ?? spawnMock(scenario, overrides.capturePath),
+    onProcessStarted: overrides.onProcessStarted,
   });
 }
 
@@ -105,6 +106,29 @@ test("App Server launches the resolved native Codex executable", async () => {
   assert.equal(invocation.options.env, environment);
   assert.equal(invocation.options.windowsHide, true);
   assert.deepEqual(invocation.options.stdio, ["pipe", "pipe", "pipe"]);
+});
+
+test("App Server exposes its process before protocol work begins", async () => {
+  let started = null;
+  const result = await runMock({}, {
+    onProcessStarted: async (processInfo) => {
+      started = processInfo;
+    },
+  });
+  assert.equal(result.turnStatus, "completed");
+  assert.ok(Number.isInteger(started.pid));
+  assert.ok(started.pid > 0);
+});
+
+test("App Server stops when process registration fails", async () => {
+  await assert.rejects(
+    runMock({}, {
+      onProcessStarted: async () => {
+        throw new Error("registration failed");
+      },
+    }),
+    (error) => error instanceof AppServerProtocolError && /registration failed/.test(error.message),
+  );
 });
 
 test("App Server reports native Codex resolution failures as protocol errors", async () => {

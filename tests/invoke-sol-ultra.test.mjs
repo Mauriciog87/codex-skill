@@ -14,10 +14,12 @@ import {
   parseUltraArguments,
 } from "../.agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs";
 import {
+  ORCHESTRATION_GENERATION_ENV,
   ORCHESTRATION_LOCK_ENV,
   SOL_MODEL_VERBOSITY,
   beginExecutorRun,
   finishExecutorRun,
+  readOrchestrationHistory,
   readUltraLock,
 } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
 import { AppServerTimeoutError } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
@@ -82,6 +84,18 @@ function ultraOptions(cwd, overrides = {}) {
   };
 }
 
+function processIdentityProvider() {
+  let sequence = 0;
+  return async ({ pid }) => ({
+    pid,
+    instance_id: `test-process-${pid}-${sequence += 1}`,
+    start_fingerprint: `start-${pid}`,
+    hostname: "test-host",
+    platform: process.platform,
+    architecture: process.arch,
+  });
+}
+
 test("Ultra arguments require a reason and explicit human confirmation", () => {
   const baseDirectory = resolve("fixture");
   assert.deepEqual(
@@ -126,9 +140,10 @@ test("Ultra arguments allow only explicit workspace write", () => {
 });
 
 test("Ultra command and instructions pin the exclusive Sol runtime", () => {
-  const instructions = createUltraDeveloperInstructions("lock-123");
+  const instructions = createUltraDeveloperInstructions("lock-123", 7);
   assert.match(instructions, /^CODEX_ORCHESTRATION_ROLE=ultra-orchestrator$/m);
   assert.match(instructions, /^CODEX_ORCHESTRATION_LOCK_ID=lock-123$/m);
+  assert.match(instructions, /^CODEX_ORCHESTRATION_GENERATION=7$/m);
   assert.match(instructions, /Do not use native spawn_agent/);
   assert.match(instructions, /invoke-profile-executor\.mjs/);
   assert.match(instructions, /implement-lite\|playwright/);
@@ -152,6 +167,7 @@ test("Ultra result preserves the public key order", () => {
     "status",
     "mode",
     "lock_id",
+    "generation",
     "thread_id",
     "model",
     "reasoning_effort",
@@ -184,9 +200,39 @@ test("verified Ultra completion releases its repository lock", async (context) =
   assert.equal(execution.result.reasoning_effort, "ultra");
   assert.equal(execution.result.service_tier, "standard");
   assert.equal(execution.result.routing_verified, true);
+  assert.equal(execution.result.generation, 1);
   assert.equal(
     await readUltraLock(fixture.repository, { homeDirectory: fixture.homeDirectory }),
     null,
+  );
+});
+
+test("Ultra registers its App Server before accepting protocol results", async (context) => {
+  const fixture = await createFixture(context);
+  const threadId = "ultra-process-registered";
+  await writeRoutingMetadata(fixture.sessionsRoot, threadId, "ultra");
+  const execution = await invokeUltra({
+    briefing: "Verify process registration.",
+    options: ultraOptions(fixture.repository),
+    sessionRoots: [fixture.sessionsRoot],
+    appServerRunner: createRunner(threadId, completedPayload(), async (runnerOptions) => {
+      assert.equal(typeof runnerOptions.onProcessStarted, "function");
+      await runnerOptions.onProcessStarted({ pid: 9_876 });
+    }),
+    coordinationOptions: {
+      homeDirectory: fixture.homeDirectory,
+      processIdentityProvider: processIdentityProvider(),
+      processInspector: async () => ({ status: "dead" }),
+    },
+  });
+  assert.equal(execution.exitCode, 0);
+  const history = await readOrchestrationHistory(fixture.repository, {
+    homeDirectory: fixture.homeDirectory,
+    limit: 200,
+  });
+  assert.equal(
+    history.events.some((event) => event.reason_code === "ultra-app-server-registered"),
+    true,
   );
 });
 
@@ -231,6 +277,10 @@ test("Ultra reconstructs verified executors from registered leases", async (cont
       assert.equal(
         runnerOptions.environment[ORCHESTRATION_LOCK_ENV],
         lease.lock_id,
+      );
+      assert.equal(
+        runnerOptions.environment[ORCHESTRATION_GENERATION_ENV],
+        String(lease.generation),
       );
       await finishExecutorRun(lease, {
         exitCode: 0,

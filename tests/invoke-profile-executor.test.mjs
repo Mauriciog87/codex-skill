@@ -672,6 +672,7 @@ test("invokeExecutor returns stable exit code 2 while Ultra owns the repository"
     await releaseUltraLock({
       cwd: temporaryRoot,
       lockId: lock.lock_id,
+      generation: lock.generation,
       homeDirectory: temporaryRoot,
     });
   }

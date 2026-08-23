@@ -107,6 +107,7 @@ test("profile registry and operational guidance stay aligned", async () => {
   assert.match(appServerClient, /features\.multi_agent=false/);
   assert.match(appServerClient, /agents\.max_depth=1/);
   assert.match(appServerClient, /agents\.max_threads=1/);
+  assert.match(appServerClient, /onProcessStarted/);
   assert.doesNotMatch(appServerClient, /"exec"|--json|output-last-message/);
 
   const ultraLauncher = await readFile(
@@ -117,7 +118,32 @@ test("profile registry and operational guidance stay aligned", async () => {
   assert.match(ultraLauncher, /ULTRA_SERVICE_TIER/);
   assert.match(ultraLauncher, /--confirm-exclusive-takeover/);
   assert.match(ultraLauncher, /CODEX_ORCHESTRATION_LOCK_ID/);
+  assert.match(ultraLauncher, /CODEX_ORCHESTRATION_GENERATION/);
   assert.doesNotMatch(ultraLauncher, /"exec"|--json|output-last-message/);
+
+  const orchestrationState = await readFile(
+    ".agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs",
+    "utf8",
+  );
+  assert.match(orchestrationState, /ORCHESTRATION_STATE_VERSION = 2/);
+  assert.match(orchestrationState, /HISTORY_RETENTION_LIMIT = 1_000/);
+  assert.match(orchestrationState, /stale-generation-rejected/);
+
+  const processIdentity = await readFile(
+    ".agents/skills/sol-luna-orchestration/scripts/process-identity.mjs",
+    "utf8",
+  );
+  assert.match(processIdentity, /\/proc\/sys\/kernel\/random\/boot_id/);
+  assert.match(processIdentity, /Win32_Process/);
+  assert.match(processIdentity, /lstart=/);
+  assert.doesNotMatch(processIdentity, /shell\s*:\s*true/);
+
+  const gate = await readFile(
+    ".agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs",
+    "utf8",
+  );
+  assert.match(gate, /history/);
+  assert.match(gate, /--confirm-legacy-recovery/);
 
   for (const path of [
     "AGENTS.md",
@@ -137,6 +163,9 @@ test("profile registry and operational guidance stay aligned", async () => {
     assert.match(content, /10/);
     assert.match(content, /14/);
     assert.match(content, /recovery-required/);
+    assert.match(content, /generation/);
+    assert.match(content, /history/);
+    assert.match(content, /legacy-unfenced/);
     assert.match(content, /experimental Codex App Server/);
     assert.match(content, /0\.147\.0/);
     assert.match(content, /thread\/settings\/updated/);
@@ -202,12 +231,14 @@ test("platform smoke and documentation expose the same portability contract", as
   assert.match(runner, /--strict-config/);
   assert.match(runner, /verifyAppServerSchema/);
   assert.match(runner, /installGlobalOrchestration/);
+  assert.match(runner, /process_identity:verified/);
   assert.match(runner, /temporary_state:removed/);
   assert.doesNotMatch(runner, /invokeExecutor|invokeUltra|runAppServerTurn|turn\/start/);
 
   const liveRunner = await readFile("scripts/verify-routing.mjs", "utf8");
   assert.match(liveRunner, /parseVerifyRoutingArguments/);
   assert.match(liveRunner, /codex_version/);
+  assert.match(liveRunner, /"generation"/);
   assert.match(liveRunner, /writeJsonOutput/);
 
   for (const path of [

@@ -5,12 +5,22 @@ import {
   evaluateHook,
   parseGateArguments,
 } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs";
-import { ORCHESTRATION_LOCK_ENV } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
+import {
+  ORCHESTRATION_GENERATION_ENV,
+  ORCHESTRATION_LOCK_ENV,
+} from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
 
 const lock = {
+  version: 2,
   lock_id: "lock-123",
+  generation: 7,
   repository: "C:\\repository",
   state: "active",
+};
+
+const ownerEnvironment = {
+  [ORCHESTRATION_LOCK_ENV]: lock.lock_id,
+  [ORCHESTRATION_GENERATION_ENV]: String(lock.generation),
 };
 
 test("gate arguments require explicit repository and recovery id", () => {
@@ -19,10 +29,39 @@ test("gate arguments require explicit repository and recovery id", () => {
     command: "status",
     cwd: repository,
     lockId: null,
+    limit: null,
+    confirmLegacyRecovery: false,
   });
   assert.deepEqual(
     parseGateArguments(["recover", "--cwd", ".", "--lock-id", "abc"], repository),
-    { command: "recover", cwd: repository, lockId: "abc" },
+    {
+      command: "recover",
+      cwd: repository,
+      lockId: "abc",
+      limit: null,
+      confirmLegacyRecovery: false,
+    },
+  );
+  assert.deepEqual(
+    parseGateArguments(["history", "--cwd", ".", "--limit", "12"], repository),
+    {
+      command: "history",
+      cwd: repository,
+      lockId: null,
+      limit: 12,
+      confirmLegacyRecovery: false,
+    },
+  );
+  assert.equal(
+    parseGateArguments([
+      "recover",
+      "--cwd",
+      ".",
+      "--lock-id",
+      "abc",
+      "--confirm-legacy-recovery",
+    ], repository).confirmLegacyRecovery,
+    true,
   );
   assert.throws(() => parseGateArguments(["status"]), /--cwd is required/);
   assert.throws(
@@ -39,7 +78,7 @@ test("SessionStart reports ownership and pauses unrelated sessions", async () =>
   const owner = await evaluateHook(
     { cwd: "C:\\repository", hook_event_name: "SessionStart" },
     {
-      environment: { [ORCHESTRATION_LOCK_ENV]: lock.lock_id },
+      environment: ownerEnvironment,
       readLock: async () => lock,
     },
   );
@@ -59,7 +98,7 @@ test("PreToolUse allows the owner and denies other sessions", async () => {
   };
   assert.equal(
     await evaluateHook(input, {
-      environment: { [ORCHESTRATION_LOCK_ENV]: lock.lock_id },
+      environment: ownerEnvironment,
       readLock: async () => lock,
     }),
     null,
@@ -76,7 +115,7 @@ test("recovery-required state denies tools even with the former lock id", async 
   const blocked = await evaluateHook(
     { cwd: "C:\\repository", hook_event_name: "PreToolUse", tool_name: "Bash" },
     {
-      environment: { [ORCHESTRATION_LOCK_ENV]: lock.lock_id },
+      environment: ownerEnvironment,
       readLock: async () => ({ ...lock, state: "recovery-required" }),
     },
   );
@@ -104,6 +143,61 @@ test("hooks remain silent when no repository lock exists", async () => {
     await evaluateHook(
       { cwd: "C:\\repository", hook_event_name: "PreToolUse" },
       { environment: {}, readLock: async () => null },
+    ),
+    null,
+  );
+});
+
+test("hooks deny stale or incomplete ownership variables even without a lock", async () => {
+  for (const environment of [
+    ownerEnvironment,
+    { [ORCHESTRATION_LOCK_ENV]: lock.lock_id },
+    { [ORCHESTRATION_GENERATION_ENV]: String(lock.generation) },
+  ]) {
+    const blocked = await evaluateHook(
+      { cwd: "C:\\repository", hook_event_name: "PreToolUse" },
+      { environment, readLock: async () => null },
+    );
+    assert.equal(blocked.hookSpecificOutput.permissionDecision, "deny");
+    assert.match(blocked.hookSpecificOutput.permissionDecisionReason, /stale|incomplete/);
+  }
+});
+
+test("hooks reject an old or future generation for the matching lock id", async () => {
+  for (const generation of [lock.generation - 1, lock.generation + 1]) {
+    const blocked = await evaluateHook(
+      { cwd: "C:\\repository", hook_event_name: "PreToolUse" },
+      {
+        environment: {
+          [ORCHESTRATION_LOCK_ENV]: lock.lock_id,
+          [ORCHESTRATION_GENERATION_ENV]: String(generation),
+        },
+        readLock: async () => lock,
+      },
+    );
+    assert.equal(blocked.hookSpecificOutput.permissionDecision, "deny");
+    assert.match(blocked.hookSpecificOutput.permissionDecisionReason, /generation/);
+  }
+});
+
+test("legacy v1 owners remain compatible but are identified as unfenced", async () => {
+  const legacy = { ...lock, version: 1 };
+  delete legacy.generation;
+  const session = await evaluateHook(
+    { cwd: "C:\\repository", hook_event_name: "SessionStart" },
+    {
+      environment: { [ORCHESTRATION_LOCK_ENV]: legacy.lock_id },
+      readLock: async () => legacy,
+    },
+  );
+  assert.match(session.hookSpecificOutput.additionalContext, /legacy-unfenced/);
+  assert.equal(
+    await evaluateHook(
+      { cwd: "C:\\repository", hook_event_name: "PreToolUse" },
+      {
+        environment: { [ORCHESTRATION_LOCK_ENV]: legacy.lock_id },
+        readLock: async () => legacy,
+      },
     ),
     null,
   );

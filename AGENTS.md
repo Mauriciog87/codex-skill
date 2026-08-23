@@ -46,12 +46,15 @@ Use Ultra only for a named decision that root Sol/xhigh cannot resolve responsib
 node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs
 ```
 
-The repository lock has no time-based expiry. Normal executors and unrelated sessions stop while it exists. Ultra may run only verified profiles carrying the matching `CODEX_ORCHESTRATION_LOCK_ID`; those executors consume the normal capacity pools and still serialize overlapping writes. A verified terminal result releases the lock. Timeout, interruption, process, contract, or routing failure leaves `recovery-required`.
+The repository lock has no time-based expiry. Every Ultra epoch receives a repository-persistent monotonic generation. Normal executors and unrelated sessions stop while it exists. Ultra may run only verified profiles carrying the matching `CODEX_ORCHESTRATION_LOCK_ID` and `CODEX_ORCHESTRATION_GENERATION`; those executors consume the normal capacity pools and still serialize overlapping writes. State and result transitions revalidate both values. A verified terminal result releases the lock. Timeout, interruption, process, contract, or routing failure leaves `recovery-required`.
+
+State v2 registers launcher and App Server process identities for Ultra and its executors. Recovery succeeds only when every registered identity is confirmed dead or reused; live and unknown identities fail closed, and recovery never kills a process. Version 1 state remains `legacy-unfenced` until explicitly recovered with `--confirm-legacy-recovery`. History is immutable, sanitized, retention-bounded evidence and is not lock authority. There is no TTL, heartbeat, automatic recovery, worktree isolation, dependency fallback, or `shell: true`. Descendants outside registered launcher/App Server paths cannot be identified portably or atomically stopped.
 
 Inspect or recover only through:
 
 ```text
 node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs status --cwd <repository>
+node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs history --cwd <repository> --limit 50
 node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs recover --cwd <repository> --lock-id <exact-lock-id>
 ```
 

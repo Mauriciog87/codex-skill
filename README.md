@@ -57,7 +57,7 @@ npm run verify:platform
 npm run verify:platform -- --expected-codex-version 0.147.0 --output <path-outside-the-repository>
 ```
 
-It creates isolated temporary HOME and `CODEX_HOME` directories, checks strict configuration and generated App Server schemas, installs twice, verifies the native link type and target, and removes the temporary state. Its JSON result is written to stdout; diagnostics use stderr.
+It creates isolated temporary HOME and `CODEX_HOME` directories, checks strict configuration and generated App Server schemas, verifies portable process fingerprints, installs twice, verifies the native link type and target, and removes the temporary state. Its JSON result is written to stdout; diagnostics use stderr.
 
 Live status remains `Pending` until a successful artifact exists for that operating system. Live checks run only from `master` through the manual `live-cross-platform.yml` workflow on dedicated self-hosted runners labeled `codex-live` plus `windows`, `linux`, or `macOS`. Configure the GitHub environment named `codex-live` with required reviewers before enabling the workflow. Each runner must use an isolated OS account, be authenticated in Codex beforehand, and have the stdio Playwright MCP enabled. The workflow does not copy personal tokens or use API-key secrets.
 
@@ -112,6 +112,8 @@ Machine-readable JSON remains the only stdout output. `NO_COLOR`, `TERM=dumb`, a
 
 The executor supplies only task fields. The launcher adds the profile and observed routing metadata. `routing_verified` becomes true only when App Server settings confirm model, effort, and tier and rollout `turn_context` independently confirms model and effort.
 
+The executor result contract remains unchanged. Ultra uses the same shared fields and adds `mode: "ultra"`, `lock_id`, integer `generation`, and `executors`. The generation is allocated once per Ultra epoch and is included even in terminal failures after acquisition.
+
 Exit codes are stable:
 
 - `0`: completed with verified routing;
@@ -137,7 +139,7 @@ Inspect active leases and capacity with:
 node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs status --cwd .
 ```
 
-Dead leases are removed only after their process is confirmed stopped. Corrupt state fails closed.
+Dead leases are removed only after their registered process identity is confirmed stopped or reused. An identity that cannot be inspected fails closed. Corrupt authority state also fails closed.
 
 ## Playwright profile
 
@@ -155,14 +157,23 @@ Ultra is not an executor profile. It temporarily replaces the root for one repos
 briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs --cwd . --reason "Named exceptional decision" --confirm-exclusive-takeover --sandbox read-only
 ```
 
-The lock blocks normal sessions and has no automatic expiry. Ultra may delegate only through the verified profiles, which inherit its lock id and consume the normal capacity pools.
+The lock blocks normal sessions and has no automatic expiry. Every Ultra acquisition receives a repository-persistent, monotonically increasing generation shared by that epoch. Ultra may delegate only through the verified profiles, which inherit both `CODEX_ORCHESTRATION_LOCK_ID` and `CODEX_ORCHESTRATION_GENERATION` and consume the normal capacity pools. State and result transitions revalidate both values, so a stale epoch cannot finish, abandon, release, or publish results into a newer epoch.
+
+State v2 registers the Ultra launcher and App Server plus each executor launcher and App Server. Each registration uses a PID, process-start fingerprint, instance id, host, platform, and architecture. Recovery is fail-closed: it succeeds only when every registered identity is `dead` or `reused`; `same` and `unknown` identities reject recovery. Recovery never terminates processes.
 
 A verified terminal result releases the lock. Timeout, interruption, process, contract, or routing failure leaves `recovery-required`. Check and recover it only through the gate:
 
 ```text
 node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs status --cwd .
+node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs history --cwd . --limit 50
 node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs recover --cwd . --lock-id <exact-lock-id>
 ```
+
+Version 1 state is never silently upgraded while active. The gate reports it as `legacy-unfenced`; after all legacy owners have stopped, recovery additionally requires `--confirm-legacy-recovery`. In a v1-only repository, the next Ultra acquisition starts generation 1.
+
+History is append-only and stores sanitized coordination metadata rather than briefings, model responses, or raw errors. Retention targets 1,000 events and prunes only terminal generations; the active generation is protected and can temporarily keep the count above that target. History corruption is reported as a warning and is never used as lock authority.
+
+There is no TTL, heartbeat, automatic recovery, worktree isolation, dependency fallback, or `shell: true` execution. Descendants not launched through the registered launcher/App Server paths cannot be identified portably. Fencing prevents stale orchestration transitions and result publication, but it cannot atomically cancel an arbitrary unregistered descendant that is already mutating the workspace.
 
 ## Verification
 
@@ -172,4 +183,4 @@ npm run verify:platform
 npm run verify:live
 ```
 
-The unit suite covers JSON-RPC ordering and failures, profile routing, structured results, tiers, terminal colors, capacity races, Ultra locks, Playwright preflight and tool evidence, installer rollback, migration behavior, and platform-specific path rules. `verify:platform` is the authentication-free compatibility gate. Live verification generates the installed App Server schemas, checks the root and every profile against protocol and rollout evidence, uses temporary repositories for write tests, and confirms that read-only checks do not alter this repository. Add `--output <path-outside-the-repository>` to either verification command when an evidence artifact is required.
+The unit suite covers JSON-RPC ordering and failures, profile routing, structured results, tiers, terminal colors, capacity races, Ultra fencing generations, portable process identity, fail-closed recovery, immutable redacted history and retention, safe version 1 migration, Playwright preflight and tool evidence, installer rollback, and platform-specific path rules. `verify:platform` is the authentication-free compatibility gate and includes a live fingerprint check for the current process. Live verification generates the installed App Server schemas, checks the root and every profile against protocol and rollout evidence, uses temporary repositories for write tests, and confirms that read-only checks do not alter this repository. Add `--output <path-outside-the-repository>` to either verification command when an evidence artifact is required.

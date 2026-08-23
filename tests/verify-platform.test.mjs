@@ -75,6 +75,7 @@ test("platform result property order remains stable", () => {
     "strict_config_verified",
     "app_server_schema_verified",
     "schema_file_count",
+    "process_identity_verified",
     "installation_idempotent",
     "git_unchanged",
     "checks",
@@ -96,6 +97,7 @@ test("platform smoke installs twice and verifies the native link", async () => {
   assert.equal(result.strict_config_verified, true);
   assert.equal(result.app_server_schema_verified, true);
   assert.equal(result.schema_file_count, 7);
+  assert.equal(result.process_identity_verified, true);
   assert.equal(result.installation_idempotent, true);
   assert.equal(result.git_unchanged, true);
   assert.deepEqual(result.warnings, []);

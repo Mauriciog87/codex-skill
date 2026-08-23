@@ -419,7 +419,7 @@ function managedBlockLines() {
     "",
     "For every new substantive root task, explicitly invoke `$sol-luna-orchestration` before planning, delegating, or editing. The root uses Sol/xhigh/Standard. Verified executors use the profile registry; Luna has capacity 10, Sol has capacity 4, and Playwright has a global sublimit of 2. Capacity is not a fan-out target.",
     "",
-    "A human-confirmed Sol Ultra takeover owns its repository exclusively while its lock is active. Other root sessions must pause, and only executors carrying the matching `CODEX_ORCHESTRATION_LOCK_ID` may run. Never remove lock state manually; inspect or recover it through the orchestration gate.",
+    "A human-confirmed Sol Ultra takeover owns its repository exclusively while its lock is active. Other root sessions must pause, and only executors carrying the matching `CODEX_ORCHESTRATION_LOCK_ID` and `CODEX_ORCHESTRATION_GENERATION` may run. Recovery fails closed while a registered process is live or unknown. Never remove lock state manually; inspect history or recover it through the orchestration gate.",
     MANAGED_BLOCK_END,
   ];
 }

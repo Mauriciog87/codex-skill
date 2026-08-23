@@ -544,6 +544,7 @@ export async function runAppServerTurn({
   commandResolver = resolveCodexInvocation,
   spawnImplementation = spawnChildProcess,
   minimumVersion = MINIMUM_CODEX_VERSION,
+  onProcessStarted,
 }) {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new AppServerProtocolError("timeoutMs must be a positive number.");
@@ -574,6 +575,12 @@ export async function runAppServerTurn({
   let threadId = null;
   let turnId = null;
   try {
+    if (typeof onProcessStarted === "function") {
+      if (!Number.isInteger(child.pid) || child.pid < 1) {
+        throw new AppServerProtocolError("Codex App Server did not expose a valid process id.");
+      }
+      await onProcessStarted({ pid: child.pid });
+    }
     await connection.request("initialize", {
       clientInfo: { name: "sol-luna-orchestration", version: "1.0.0" },
       capabilities: { experimentalApi: true },

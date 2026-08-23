@@ -220,6 +220,7 @@ function verifyUltraResultSchema(result) {
     "status",
     "mode",
     "lock_id",
+    "generation",
     "thread_id",
     "model",
     "reasoning_effort",
@@ -239,6 +240,7 @@ function verifyUltraResultSchema(result) {
   if (
     result.mode !== "ultra" ||
     typeof result.routing_verified !== "boolean" ||
+    !(result.generation === null || (Number.isInteger(result.generation) && result.generation >= 1)) ||
     !Array.isArray(result.executors)
   ) {
     throw new Error("The Ultra result contains invalid fixed properties.");
@@ -259,6 +261,7 @@ function verifyUltraRouting(result, sandboxMode) {
     result.reasoning_effort !== "ultra" ||
     result.service_tier !== "standard" ||
     result.routing_verified !== true ||
+    !Number.isInteger(result.generation) ||
     result.sandbox_mode !== sandboxMode
   ) {
     throw new Error("The Ultra probe returned unexpected routing metadata.");
@@ -635,7 +638,11 @@ async function runLockedExecutorProbe(sessionRoots) {
     }
     return executor.result;
   } finally {
-    await releaseUltraLock({ cwd: repository, lockId: lock.lock_id });
+    await releaseUltraLock({
+      cwd: repository,
+      lockId: lock.lock_id,
+      generation: lock.generation,
+    });
     await rm(repository, { recursive: true, force: true });
   }
 }
@@ -750,6 +757,12 @@ async function runTimeoutRecoveryProbe() {
     if (status.lock?.state !== "recovery-required") {
       throw new Error("The Sol Ultra timeout probe did not require recovery.");
     }
+    if (
+      launcherResult.lock_id !== status.lock.lock_id ||
+      launcherResult.generation !== status.lock.generation
+    ) {
+      throw new Error("The Sol Ultra timeout result did not preserve its fenced lock generation.");
+    }
     const { stdout } = await execFileAsync(
       process.execPath,
       [
@@ -797,8 +810,16 @@ async function runRepositoryIsolationProbe() {
       reason: "Second isolation probe",
       sandboxMode: "read-only",
     });
-    await releaseUltraLock({ cwd: firstRepository, lockId: first.lock_id });
-    await releaseUltraLock({ cwd: secondRepository, lockId: second.lock_id });
+    await releaseUltraLock({
+      cwd: firstRepository,
+      lockId: first.lock_id,
+      generation: first.generation,
+    });
+    await releaseUltraLock({
+      cwd: secondRepository,
+      lockId: second.lock_id,
+      generation: second.generation,
+    });
     return { independent: true };
   } finally {
     await rm(firstRepository, { recursive: true, force: true });

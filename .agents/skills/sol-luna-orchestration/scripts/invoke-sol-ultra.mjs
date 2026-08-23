@@ -16,6 +16,7 @@ import {
   runAppServerTurn,
 } from "./codex-app-server-client.mjs";
 import {
+  ORCHESTRATION_GENERATION_ENV,
   ORCHESTRATION_LOCK_ENV,
   ORCHESTRATION_ROLE_ENV,
   SOL_MODEL_VERBOSITY,
@@ -26,6 +27,7 @@ import {
   ULTRA_SERVICE_TIER,
   acquireUltraLock,
   listUltraExecutorResults,
+  registerUltraProcess,
   releaseUltraLock,
   updateUltraLock,
 } from "./orchestration-state.mjs";
@@ -129,10 +131,11 @@ export function parseUltraArguments(argv, baseDirectory = process.cwd()) {
   return parsed;
 }
 
-export function createUltraDeveloperInstructions(lockId) {
+export function createUltraDeveloperInstructions(lockId, generation) {
   return [
     `CODEX_ORCHESTRATION_ROLE=${ULTRA_ORCHESTRATOR_ROLE}`,
     `CODEX_ORCHESTRATION_LOCK_ID=${lockId}`,
+    `CODEX_ORCHESTRATION_GENERATION=${generation}`,
     "Act as the exclusive GPT-5.6 Sol Ultra root orchestrator for the supplied briefing.",
     "Own planning, bounded delegation, integration, verification, and the terminal result while the repository lock is active.",
     "Do not use native spawn_agent or any native multi-agent tool and do not start another Ultra takeover.",
@@ -156,6 +159,7 @@ export function buildUltraAppServerArguments() {
 export function createStableUltraResult({
   status,
   lockId = null,
+  generation = null,
   threadId = null,
   model = null,
   reasoningEffort = null,
@@ -173,6 +177,7 @@ export function createStableUltraResult({
     status,
     mode: "ultra",
     lock_id: lockId,
+    generation,
     thread_id: threadId,
     model,
     reasoning_effort: reasoningEffort,
@@ -219,6 +224,7 @@ function failureResult(message, options, details = {}) {
     result: createStableUltraResult({
       status: "failed",
       lockId: details.lockId ?? null,
+      generation: details.generation ?? null,
       threadId: details.threadId ?? null,
       model: details.model ?? null,
       reasoningEffort: details.reasoningEffort ?? null,
@@ -233,11 +239,19 @@ function failureResult(message, options, details = {}) {
   };
 }
 
-async function markRecoveryRequired(options, lockId, threadId, environment, coordinationOptions) {
+async function markRecoveryRequired(
+  options,
+  lockId,
+  generation,
+  threadId,
+  environment,
+  coordinationOptions,
+) {
   try {
     await updateUltraLock({
       cwd: options.cwd,
       lockId,
+      generation,
       state: "recovery-required",
       threadId,
       environment,
@@ -288,6 +302,7 @@ export async function invokeUltra({
         ...environment,
         [ORCHESTRATION_ROLE_ENV]: ULTRA_ORCHESTRATOR_ROLE,
         [ORCHESTRATION_LOCK_ENV]: lock.lock_id,
+        [ORCHESTRATION_GENERATION_ENV]: String(lock.generation),
       },
       model: ULTRA_MODEL,
       reasoningEffort: ULTRA_REASONING_EFFORT,
@@ -295,11 +310,22 @@ export async function invokeUltra({
       configuredServiceTier: ULTRA_CONFIGURED_SERVICE_TIER,
       fastMode: false,
       sandboxMode: options.sandboxMode,
-      developerInstructions: createUltraDeveloperInstructions(lock.lock_id),
+      developerInstructions: createUltraDeveloperInstructions(lock.lock_id, lock.generation),
       briefing: briefing.trim(),
       outputSchema,
       timeoutMs: options.timeoutSeconds * 1000,
       signal,
+      onProcessStarted: async ({ pid }) => {
+        await registerUltraProcess({
+          cwd: options.cwd,
+          lockId: lock.lock_id,
+          generation: lock.generation,
+          kind: "app-server",
+          pid,
+          environment,
+          ...coordinationOptions,
+        });
+      },
     });
     threadId = appServerResult.threadId;
     actualModel = appServerResult.model;
@@ -310,6 +336,7 @@ export async function invokeUltra({
       await updateUltraLock({
         cwd: options.cwd,
         lockId: lock.lock_id,
+        generation: lock.generation,
         threadId,
         environment,
         ...coordinationOptions,
@@ -339,6 +366,7 @@ export async function invokeUltra({
       await listUltraExecutorResults({
         cwd: options.cwd,
         lockId: lock.lock_id,
+        generation: lock.generation,
         environment,
         ...coordinationOptions,
       }),
@@ -347,6 +375,7 @@ export async function invokeUltra({
       const result = createStableUltraResult({
         status: "blocked",
         lockId: lock.lock_id,
+        generation: lock.generation,
         threadId,
         model: actualModel,
         reasoningEffort: actualReasoningEffort,
@@ -361,6 +390,7 @@ export async function invokeUltra({
       await releaseUltraLock({
         cwd: options.cwd,
         lockId: lock.lock_id,
+        generation: lock.generation,
         environment,
         ...coordinationOptions,
       });
@@ -371,6 +401,7 @@ export async function invokeUltra({
       const result = createStableUltraResult({
         status: "failed",
         lockId: lock.lock_id,
+        generation: lock.generation,
         threadId,
         model: actualModel,
         reasoningEffort: actualReasoningEffort,
@@ -385,6 +416,7 @@ export async function invokeUltra({
       await releaseUltraLock({
         cwd: options.cwd,
         lockId: lock.lock_id,
+        generation: lock.generation,
         environment,
         ...coordinationOptions,
       });
@@ -397,6 +429,7 @@ export async function invokeUltra({
     const result = createStableUltraResult({
       status: payload.status,
       lockId: lock.lock_id,
+      generation: lock.generation,
       threadId,
       model: actualModel,
       reasoningEffort: actualReasoningEffort,
@@ -413,6 +446,7 @@ export async function invokeUltra({
     await releaseUltraLock({
       cwd: options.cwd,
       lockId: lock.lock_id,
+      generation: lock.generation,
       environment,
       ...coordinationOptions,
     });
@@ -435,6 +469,7 @@ export async function invokeUltra({
     const recoveryWarning = await markRecoveryRequired(
       options,
       lock.lock_id,
+      lock.generation,
       threadId,
       environment,
       coordinationOptions,
@@ -442,6 +477,7 @@ export async function invokeUltra({
     const message = error instanceof Error ? error.message : String(error);
     return failureResult(message, options, {
       lockId: lock.lock_id,
+      generation: lock.generation,
       threadId,
       model: actualModel,
       reasoningEffort: actualReasoningEffort,
