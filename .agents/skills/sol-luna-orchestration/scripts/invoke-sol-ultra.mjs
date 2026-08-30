@@ -164,7 +164,7 @@ export function createUltraDeveloperInstructions(lockId, generation) {
     "Use only useful independent executor scopes, respect the verified Luna and Sol capacity pools, and never overlap write roots.",
     "Use read-only executors by default. Every implement-lite or implement assignment requires workspace-write plus at least one explicit --write-root and runs in a controller-created isolated worktree.",
     `Use node ${JSON.stringify(resolve(SCRIPT_DIRECTORY, "orchestration-control.mjs"))} to claim, review, approve, integrate, complete explicit delivery, acknowledge, archive, retry, abandon, and clean durable assignments with exact state revisions.`,
-    "Delivery defaults to manual. Enable commit or push only when the original user authorization covers it, and name the exact commit message, configured remote, and existing branch. The controller never force-pushes.",
+    "New writer assignments follow the configured automatic-delivery default. An explicit user boundary against commits or pushes takes precedence, so pass --delivery manual for that assignment. Explicit commit or push overrides still require the exact message and destination. The controller never force-pushes.",
     "Do not return while an assignment from this lock id and generation remains unfinished. Accepted candidates require every configured gate and completed delivery; work that cannot finish must be explicitly archived and abandoned.",
     "Do not alter approval policy, sandbox policy, orchestration configuration, or use bypasses.",
     "Preserve unrelated changes and do not exceed the authority granted in the original briefing.",

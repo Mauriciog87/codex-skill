@@ -42,6 +42,9 @@ import {
   releaseUltraLock,
 } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
 import {
+  readDeliveryConfiguration,
+} from "../.agents/skills/sol-luna-orchestration/scripts/delivery-configuration.mjs";
+import {
   LEGACY_SKILL_NAME,
   SKILL_NAME,
   TERRA_LEGACY_SKILL_NAME,
@@ -165,6 +168,10 @@ async function verifySkillDiscovery(repositoryRoot) {
       "The global Codex configuration does not enforce Sol xhigh, low verbosity, and hooks.",
     );
   }
+  const deliveryConfiguration = await readDeliveryConfiguration({ codexHome });
+  if (!deliveryConfiguration.exists) {
+    throw new Error("The global automatic-delivery configuration is not installed.");
+  }
   const globalInstructions = await activeGlobalInstructions(codexHome);
   if (updateGlobalInstructions(globalInstructions.content).changed) {
     throw new Error("The active global instructions do not contain the managed Sol-Luna block.");
@@ -187,6 +194,7 @@ async function verifySkillDiscovery(repositoryRoot) {
     repository: repositorySkill,
     global: globalSkill,
     global_config: globalConfigPath,
+    delivery_config: deliveryConfiguration.path,
     global_instructions: globalInstructions.path,
     global_hooks: join(codexHome, "hooks.json"),
     same_target: true,

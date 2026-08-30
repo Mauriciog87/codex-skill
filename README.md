@@ -94,6 +94,16 @@ Machine-readable JSON remains the only stdout output. `NO_COLOR`, `TERM=dumb`, a
 
 An assignment stores its briefing separately from its public status and binds all execution to a full Git base revision. Its contract includes priority, allowed and forbidden write roots, required checks, declared artifacts, review policy, operator approval, explicit symlink or submodule capabilities, and a `manual`, `commit`, or `push` delivery policy. State lives outside the repository under Codex home.
 
+The global installer creates `$CODEX_HOME/sol-luna-orchestration/config.json` with automatic delivery enabled:
+
+```json
+{
+  "automatic_delivery": true
+}
+```
+
+This is an opt-out default for new writer assignments. After validation and root or Ultra integration, the controller creates an exact candidate-only commit. When the checked-out branch has a same-named configured upstream, it also records that remote and branch in the assignment and performs the normal fast-forward push; without one, delivery stops after the local commit. Set `automatic_delivery` to `false` to restore unstaged manual integration. An explicit `--delivery manual|commit|push` takes precedence for one new assignment. Resumed and already-created assignments always retain their stored policy, and read-only or review profiles remain manual.
+
 Persist work without starting it, inspect the residual plan, and run every currently safe assignment:
 
 ```text
@@ -112,9 +122,9 @@ The residual planner starts disjoint write scopes in parallel and retains active
 
 Worktrees and sandboxing solve different problems and are both enforced. `workspace-write` limits the executor process; the detached worktree keeps its Git changes away from the main checkout. Before publication, the controller verifies the actual changed paths, rejects executor commits or HEAD changes, checks symlink and submodule policy, runs the declared commands without a shell, and copies only declared in-scope artifacts.
 
-The controller then creates an immutable hidden candidate ref through Git plumbing. The executor never stages or commits. Candidate identity binds the base revision, tree diff, contract, checks, and artifact manifest. Reusing an attempt with different content is rejected. Delivery still defaults to manual, unstaged integration.
+The controller then creates an immutable hidden candidate ref through Git plumbing. The executor never stages or commits. Candidate identity binds the base revision, tree diff, contract, checks, and artifact manifest. Reusing an attempt with different content is rejected. New writer assignments resolve their delivery policy once from the global opt-out configuration unless the launcher receives an explicit override.
 
-When commit delivery is explicitly selected, the controller builds a temporary index from the current branch, applies only the validated candidate, creates a candidate-bound commit, updates the checked-out branch with compare-and-swap semantics, and synchronizes only those candidate paths in the real index. Unrelated staged and unstaged work is preserved. Push delivery additionally requires a configured remote name and an existing branch named in the assignment. It requires the delivery commit's parent to be present remotely, verifies ancestry, pushes the exact delivery commit noninteractively without `--force`, and verifies the remote result. It therefore neither chooses a destination implicitly nor publishes unrelated local parent commits.
+For commit delivery, the controller builds a temporary index from the current branch, applies only the validated candidate, creates a candidate-bound commit, updates the checked-out branch with compare-and-swap semantics, and synchronizes only those candidate paths in the real index. Unrelated staged and unstaged work is preserved. Automatic push discovery reads only the checked-out branch's configured same-named upstream and snapshots it into the assignment; explicit push delivery still requires a named configured remote and existing branch. Push requires the delivery commit's parent to be present remotely, verifies ancestry, publishes the exact delivery commit noninteractively without `--force`, and verifies the remote result. It never publishes unrelated local parent commits.
 
 The deterministic plumbing commit does not execute repository commit hooks or create a signed commit. Put mandatory validation in `required_checks`; repositories that require interactive hooks or signed commits should keep delivery `manual`.
 
@@ -245,4 +255,4 @@ npm run verify:platform
 npm run verify:live
 ```
 
-The unit suite covers JSON-RPC ordering and failures, profile routing, durable state transitions, action idempotency, resource leases, worktree isolation, immutable candidates, manual integration, exact candidate-only commits, fast-forward push delivery, delivery blocking and retry, required checks and artifacts, independent review, operator gates, dashboard security, deterministic fault simulation, tiers, terminal colors, capacity races, Ultra fencing generations, portable process identity, fail-closed recovery, immutable redacted history and retention, safe version 1 migration, Playwright preflight and tool evidence, installer rollback, and platform-specific path rules. `verify:platform` is the authentication-free compatibility gate and includes a live fingerprint check for the current process. Live verification generates the installed App Server schemas, checks the root and every profile against protocol and rollout evidence, uses temporary repositories for write tests, and confirms that read-only checks do not alter this repository. Add `--output <path-outside-the-repository>` to either verification command when an evidence artifact is required.
+The unit suite covers JSON-RPC ordering and failures, profile routing, durable state transitions, action idempotency, resource leases, worktree isolation, immutable candidates, automatic-delivery configuration and precedence, manual integration, exact candidate-only commits, fast-forward push delivery, delivery blocking and retry, required checks and artifacts, independent review, operator gates, dashboard security, deterministic fault simulation, tiers, terminal colors, capacity races, Ultra fencing generations, portable process identity, fail-closed recovery, immutable redacted history and retention, safe version 1 migration, Playwright preflight and tool evidence, installer rollback, and platform-specific path rules. `verify:platform` is the authentication-free compatibility gate and includes a live fingerprint check for the current process. Live verification generates the installed App Server schemas, checks the root and every profile against protocol and rollout evidence, uses temporary repositories for write tests, and confirms that read-only checks do not alter this repository. Add `--output <path-outside-the-repository>` to either verification command when an evidence artifact is required.

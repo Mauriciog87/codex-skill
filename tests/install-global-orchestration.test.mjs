@@ -78,6 +78,7 @@ async function createFixture(context, prefix) {
   const codexHome = join(homeDirectory, ".codex");
   const canonicalSkill = join(repositoryRoot, ".agents", "skills", SKILL_NAME);
   const configPath = join(codexHome, "config.toml");
+  const deliveryConfigPath = join(codexHome, "sol-luna-orchestration", "config.json");
   const agentsPath = join(codexHome, "AGENTS.md");
   const hooksPath = join(codexHome, "hooks.json");
   await createSkill(canonicalSkill);
@@ -105,6 +106,7 @@ async function createFixture(context, prefix) {
     codexHome,
     canonicalSkill,
     configPath,
+    deliveryConfigPath,
     agentsPath,
     hooksPath,
   };
@@ -208,6 +210,7 @@ test("installGlobalOrchestration is idempotent and removes a validated legacy co
   });
   assert.equal(first.already_linked, false);
   assert.equal(first.configuration_changed, true);
+  assert.equal(first.delivery_configuration_changed, true);
   assert.equal(first.instructions_changed, true);
   assert.deepEqual(first.legacy_removed, [legacySkill, terraLegacySkill]);
   assert.equal(await realpath(first.global_skill), await realpath(fixture.canonicalSkill));
@@ -217,12 +220,17 @@ test("installGlobalOrchestration is idempotent and removes a validated legacy co
   assert.match(await readFile(fixture.configPath, "utf8"), /^model_verbosity = "low"$/m);
   assert.match(await readFile(fixture.configPath, "utf8"), /^codex_hooks = true$/m);
   assert.match(await readFile(fixture.configPath, "utf8"), /^\[\[hooks\.PreToolUse\]\]$/m);
+  assert.equal(
+    await readFile(fixture.deliveryConfigPath, "utf8"),
+    '{\n  "automatic_delivery": true\n}\n',
+  );
   assert.match(await readFile(fixture.agentsPath, "utf8"), /Preserve this text/);
   assert.equal(
     await readFile(fixture.hooksPath, "utf8"),
     '{\r\n  "context-mode": true\r\n}\r\n',
   );
 
+  await writeFile(fixture.deliveryConfigPath, '{"automatic_delivery":false}\n');
   const second = await installGlobalOrchestration({
     repositoryRoot: fixture.repositoryRoot,
     homeDirectory: fixture.homeDirectory,
@@ -230,8 +238,36 @@ test("installGlobalOrchestration is idempotent and removes a validated legacy co
   });
   assert.equal(second.already_linked, true);
   assert.equal(second.configuration_changed, false);
+  assert.equal(second.delivery_configuration_changed, false);
   assert.equal(second.instructions_changed, false);
   assert.deepEqual(second.legacy_removed, []);
+  assert.equal(
+    await readFile(fixture.deliveryConfigPath, "utf8"),
+    '{"automatic_delivery":false}\n',
+  );
+});
+
+test("installGlobalOrchestration rejects an invalid delivery configuration before changing files", async (context) => {
+  const fixture = await createFixture(context, "sol-luna-install-delivery-config-");
+  const originalConfig = await readFile(fixture.configPath, "utf8");
+  const originalAgents = await readFile(fixture.agentsPath, "utf8");
+  await mkdir(join(fixture.codexHome, "sol-luna-orchestration"), { recursive: true });
+  await writeFile(fixture.deliveryConfigPath, '{"automatic_delivery":"yes"}\n');
+
+  await assert.rejects(
+    installGlobalOrchestration({
+      repositoryRoot: fixture.repositoryRoot,
+      homeDirectory: fixture.homeDirectory,
+      codexHome: fixture.codexHome,
+    }),
+    /automatic_delivery must be true or false/,
+  );
+  await assert.rejects(
+    lstat(join(fixture.homeDirectory, ".agents", "skills", SKILL_NAME)),
+    { code: "ENOENT" },
+  );
+  assert.equal(await readFile(fixture.configPath, "utf8"), originalConfig);
+  assert.equal(await readFile(fixture.agentsPath, "utf8"), originalAgents);
 });
 
 test("installGlobalOrchestration rejects damaged hook markers without partial changes", async (context) => {

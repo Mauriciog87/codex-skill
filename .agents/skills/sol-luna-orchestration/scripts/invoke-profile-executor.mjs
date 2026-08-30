@@ -10,6 +10,7 @@ import {
   MODEL_VERBOSITY,
   getExecutorProfile,
 } from "./executor-profiles.mjs";
+import { readDeliveryConfiguration } from "./delivery-configuration.mjs";
 import {
   AppServerError,
   buildAppServerArguments,
@@ -85,6 +86,27 @@ function requireOptionValue(argv, index, option) {
     throw new ExecutorInvocationError(`${option} requires a value.`);
   }
   return value;
+}
+
+function validateDeliveryOptions(parsed, profile) {
+  if (parsed.deliveryMode === "manual") {
+    if (parsed.commitMessage !== null || parsed.pushRemote !== null || parsed.pushBranch !== null) {
+      throw new ExecutorInvocationError("Manual delivery cannot declare commit or push options.");
+    }
+    return;
+  }
+  if (profile.workspaceStrategy !== "isolated-worktree") {
+    throw new ExecutorInvocationError("Only workspace-write profiles support automatic delivery.");
+  }
+  if (parsed.commitMessage === null) {
+    throw new ExecutorInvocationError("Automatic delivery requires --commit-message.");
+  }
+  if (parsed.deliveryMode === "push" && (parsed.pushRemote === null || parsed.pushBranch === null)) {
+    throw new ExecutorInvocationError("Push delivery requires --push-remote and --push-branch.");
+  }
+  if (parsed.deliveryMode === "commit" && (parsed.pushRemote !== null || parsed.pushBranch !== null)) {
+    throw new ExecutorInvocationError("Commit delivery cannot declare push options.");
+  }
 }
 
 export function parseArguments(argv, baseDirectory = process.cwd()) {
@@ -312,24 +334,7 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
   if (parsed.enqueueOnly && parsed.assignmentId !== null) {
     throw new ExecutorInvocationError("--enqueue-only cannot resume an existing assignment.");
   }
-  if (parsed.deliveryMode === "manual") {
-    if (parsed.commitMessage !== null || parsed.pushRemote !== null || parsed.pushBranch !== null) {
-      throw new ExecutorInvocationError("Manual delivery cannot declare commit or push options.");
-    }
-  } else {
-    if (profile.workspaceStrategy !== "isolated-worktree") {
-      throw new ExecutorInvocationError("Only workspace-write profiles support automatic delivery.");
-    }
-    if (parsed.commitMessage === null) {
-      throw new ExecutorInvocationError("Automatic delivery requires --commit-message.");
-    }
-    if (parsed.deliveryMode === "push" && (parsed.pushRemote === null || parsed.pushBranch === null)) {
-      throw new ExecutorInvocationError("Push delivery requires --push-remote and --push-branch.");
-    }
-    if (parsed.deliveryMode === "commit" && (parsed.pushRemote !== null || parsed.pushBranch !== null)) {
-      throw new ExecutorInvocationError("Commit delivery cannot declare push options.");
-    }
-  }
+  validateDeliveryOptions(parsed, profile);
 
   return parsed;
 }
@@ -491,6 +496,111 @@ export async function runProcess(
 
     child.stdin.end(input);
   });
+}
+
+export function createAutomaticCommitMessage(briefing) {
+  const firstLine = briefing
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+  const normalized = (firstLine ?? "complete validated orchestration task")
+    .replace(/^#+\s*/u, "")
+    .replace(/^(?:[-*+]|\d+\.)\s+/u, "")
+    .replace(/[\u0000-\u001f\u007f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  const message = /^(?:build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(?:\([^\r\n)]+\))?!?:\s/u.test(
+    normalized,
+  )
+    ? normalized
+    : `chore: ${normalized || "complete validated orchestration task"}`;
+  return message.slice(0, 200).trimEnd();
+}
+
+function gitInspectionValue(result) {
+  if (result.timedOut || result.aborted) {
+    throw new ExecutorConfigurationError("Git inspection for automatic delivery did not complete.");
+  }
+  return result.exitCode === 0 ? result.stdout.trim() : null;
+}
+
+export async function resolveAutomaticPushDestination(
+  cwd,
+  {
+    environment = process.env,
+    processRunner = runProcess,
+  } = {},
+) {
+  const branchResult = await processRunner(
+    "git",
+    ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    { cwd, environment, timeoutMs: 10_000 },
+  );
+  const branch = gitInspectionValue(branchResult);
+  if (branch === null || branch.length === 0) {
+    return null;
+  }
+  const [remoteResult, mergeResult] = await Promise.all([
+    processRunner("git", ["config", "--get", `branch.${branch}.remote`], {
+      cwd,
+      environment,
+      timeoutMs: 10_000,
+    }),
+    processRunner("git", ["config", "--get", `branch.${branch}.merge`], {
+      cwd,
+      environment,
+      timeoutMs: 10_000,
+    }),
+  ]);
+  const remote = gitInspectionValue(remoteResult);
+  const mergeRef = gitInspectionValue(mergeResult);
+  if (
+    remote === null ||
+    remote.length === 0 ||
+    remote === "." ||
+    mergeRef === null ||
+    !mergeRef.startsWith("refs/heads/")
+  ) {
+    return null;
+  }
+  const upstreamBranch = mergeRef.slice("refs/heads/".length);
+  if (upstreamBranch !== branch) {
+    return null;
+  }
+  return { remote, branch };
+}
+
+export async function applyAutomaticDeliveryConfiguration({
+  options,
+  briefing,
+  deliveryExplicit = false,
+  environment = process.env,
+  homeDirectory,
+  configurationReader = readDeliveryConfiguration,
+  pushDestinationResolver = resolveAutomaticPushDestination,
+} = {}) {
+  const profile = getExecutorProfile(options.profile);
+  if (
+    deliveryExplicit ||
+    options.assignmentId !== null ||
+    profile?.workspaceStrategy !== "isolated-worktree"
+  ) {
+    return options;
+  }
+  const configuration = await configurationReader({ environment, homeDirectory });
+  if (!configuration.automatic_delivery) {
+    return options;
+  }
+  const destination = await pushDestinationResolver(options.cwd, { environment });
+  const configured = {
+    ...options,
+    deliveryMode: destination === null ? "commit" : "push",
+    commitMessage: createAutomaticCommitMessage(briefing),
+    pushRemote: destination?.remote ?? null,
+    pushBranch: destination?.branch ?? null,
+  };
+  validateDeliveryOptions(configured, profile);
+  return configured;
 }
 
 export async function verifyPlaywrightMcp({
@@ -1169,6 +1279,11 @@ export async function main(argv = process.argv.slice(2)) {
   try {
     options = parseArguments(argv);
     const briefing = options.assignmentId === null ? await readBriefing() : "";
+    options = await applyAutomaticDeliveryConfiguration({
+      options,
+      briefing,
+      deliveryExplicit: argv.includes("--delivery"),
+    });
     const profile = requireExecutorProfile(options.profile, options.sandboxMode);
     writeStatusMessage(
       executorLaunchMessage({

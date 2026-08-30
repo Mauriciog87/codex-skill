@@ -11,6 +11,9 @@ import {
   inspectProcessIdentity,
 } from "../.agents/skills/sol-luna-orchestration/scripts/process-identity.mjs";
 import {
+  parseDeliveryConfiguration,
+} from "../.agents/skills/sol-luna-orchestration/scripts/delivery-configuration.mjs";
+import {
   canonicalPathKey,
   getSkillLinkType,
   installGlobalOrchestration,
@@ -132,9 +135,11 @@ async function validateInstallation({
   if (
     first.already_linked ||
     !first.configuration_changed ||
+    !first.delivery_configuration_changed ||
     !first.instructions_changed ||
     !second.already_linked ||
     second.configuration_changed ||
+    second.delivery_configuration_changed ||
     second.instructions_changed
   ) {
     throw new Error("The global installer is not idempotent in the isolated home.");
@@ -143,6 +148,10 @@ async function validateInstallation({
   const hookScriptPath = join(first.global_skill, "scripts", "orchestration-gate.mjs");
   if (updateGlobalConfig(config, { hookScriptPath }).changed) {
     throw new Error("The temporary global Codex configuration is incomplete.");
+  }
+  const deliveryConfig = await readFile(first.delivery_config, "utf8");
+  if (!parseDeliveryConfiguration(deliveryConfig, first.delivery_config).automatic_delivery) {
+    throw new Error("The temporary automatic-delivery configuration is not enabled by default.");
   }
   const instructions = await readFile(first.global_instructions, "utf8");
   if (updateGlobalInstructions(instructions).changed) {

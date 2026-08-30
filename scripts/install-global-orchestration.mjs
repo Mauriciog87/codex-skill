@@ -20,6 +20,11 @@ import {
   SOL_MODEL_VERBOSITY,
   getCodexHome,
 } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
+import {
+  DEFAULT_DELIVERY_CONFIGURATION_CONTENT,
+  getDeliveryConfigurationPath,
+  parseDeliveryConfiguration,
+} from "../.agents/skills/sol-luna-orchestration/scripts/delivery-configuration.mjs";
 
 export const SKILL_NAME = "sol-luna-orchestration";
 export const LEGACY_SKILL_NAME = "sol-sol-orchestration";
@@ -419,7 +424,7 @@ function managedBlockLines() {
     "",
     "For every new substantive root task, explicitly invoke `$sol-luna-orchestration` before planning, delegating, or editing. The root uses Sol/xhigh/Standard. Verified executors use the profile registry; Luna has capacity 10, Sol has capacity 4, and Playwright has a global sublimit of 2. Capacity is not a fan-out target.",
     "",
-    "Writer profiles keep `workspace-write` sandboxing and run only in controller-created isolated worktrees with explicit write roots. Results become immutable candidates; root or Ultra owns review, approval, integration, explicit `manual|commit|push` delivery, acknowledgement, and cleanup. Automatic delivery commits only the validated candidate, pushes only to its declared existing remote branch without force, and stops in `delivery_blocked` until an explicit retry. Never fall back to a writable shared checkout.",
+    "Writer profiles keep `workspace-write` sandboxing and run only in controller-created isolated worktrees with explicit write roots. Results become immutable candidates; root or Ultra owns review, approval, integration, delivery, acknowledgement, and cleanup. New writer assignments use automatic delivery by default: the controller commits only the validated candidate and pushes only to the matching configured upstream branch without force. Set `automatic_delivery` to `false` in the Sol-Luna configuration file to opt out, or use an explicit `--delivery` mode for one assignment. A delivery failure stops in `delivery_blocked` until an explicit retry. Never fall back to a writable shared checkout.",
     "",
     "A human-confirmed Sol Ultra takeover owns its repository exclusively while its lock is active. Other root sessions must pause, and only executors carrying the matching `CODEX_ORCHESTRATION_LOCK_ID` and `CODEX_ORCHESTRATION_GENERATION` may run. Recovery fails closed while a registered process is live or unknown. Never remove lock state manually; inspect history or recover it through the orchestration gate.",
     MANAGED_BLOCK_END,
@@ -574,6 +579,7 @@ export async function installGlobalOrchestration({
   const globalHookScript = join(destination, "scripts", "orchestration-gate.mjs");
   const defaultCodexHome = resolve(homeDirectory, ".codex");
   const configPath = join(codexHome, "config.toml");
+  const deliveryConfigPath = getDeliveryConfigurationPath({ codexHome });
 
   await validateSkillIdentity(canonicalDirectory);
   const hookScriptMetadata = await stat(canonicalHookScript);
@@ -622,12 +628,17 @@ export async function installGlobalOrchestration({
   }
 
   const originalConfig = await readOptional(configPath);
+  const originalDeliveryConfig = await readOptional(deliveryConfigPath);
+  if (originalDeliveryConfig !== null) {
+    parseDeliveryConfiguration(originalDeliveryConfig, deliveryConfigPath);
+  }
   const configUpdate = updateGlobalConfig(originalConfig, { hookScriptPath: globalHookScript });
   const globalInstructions = await selectGlobalInstructions(codexHome);
   const instructionsUpdate = updateGlobalInstructions(globalInstructions.content);
 
   let linkCreated = false;
   let configWritten = false;
+  let deliveryConfigWritten = false;
   let instructionsWritten = false;
   try {
     await mkdir(globalSkillsDirectory, { recursive: true });
@@ -643,6 +654,10 @@ export async function installGlobalOrchestration({
       await atomicWrite(configPath, configUpdate.content);
       configWritten = true;
     }
+    if (originalDeliveryConfig === null) {
+      await atomicWrite(deliveryConfigPath, DEFAULT_DELIVERY_CONFIGURATION_CONTENT);
+      deliveryConfigWritten = true;
+    }
     if (instructionsUpdate.changed) {
       await atomicWrite(globalInstructions.path, instructionsUpdate.content);
       instructionsWritten = true;
@@ -650,6 +665,9 @@ export async function installGlobalOrchestration({
   } catch (error) {
     if (instructionsWritten) {
       await restoreFile(globalInstructions.path, globalInstructions.content);
+    }
+    if (deliveryConfigWritten) {
+      await restoreFile(deliveryConfigPath, originalDeliveryConfig);
     }
     if (configWritten) {
       await restoreFile(configPath, originalConfig);
@@ -673,8 +691,10 @@ export async function installGlobalOrchestration({
     link_type: linkType,
     already_linked: destinationState.linked,
     global_config: configPath,
+    delivery_config: deliveryConfigPath,
     global_instructions: globalInstructions.path,
     configuration_changed: configUpdate.changed,
+    delivery_configuration_changed: deliveryConfigWritten,
     instructions_changed: instructionsUpdate.changed,
     legacy_removed: legacyRemoved,
   };
