@@ -1209,9 +1209,9 @@ export async function pushCommittedCandidate(record, targetCwd, options = {}) {
   };
 }
 
-function assertControlledWorktreePath(state, path) {
-  const root = resolve(state.worktreesDirectory);
-  const target = resolve(path);
+async function assertControlledWorktreePath(state, path) {
+  const root = await realpath(state.worktreesDirectory);
+  const target = await realpath(path);
   const relativePath = relative(root, target);
   if (
     relativePath.length === 0 ||
@@ -1230,7 +1230,7 @@ export async function archiveAssignmentWorktree(record, options = {}) {
   }
   const state = await getRepositoryState(record.repository, options);
   await ensureWorktreesDirectory(state);
-  const source = assertControlledWorktreePath(state, record.workspace.path);
+  const source = await assertControlledWorktreePath(state, record.workspace.path);
   const destination = join(
     state.worktreesDirectory,
     "archive",
@@ -1247,7 +1247,7 @@ export async function cleanupAssignmentWorktree(record, options = {}) {
   }
   const state = await getRepositoryState(record.repository, options);
   await ensureWorktreesDirectory(state);
-  const path = assertControlledWorktreePath(state, record.workspace.archive_path ?? record.workspace.path);
+  const path = await assertControlledWorktreePath(state, record.workspace.archive_path ?? record.workspace.path);
   await runGit(["worktree", "remove", "--force", path], {
     ...options,
     cwd: record.repository,

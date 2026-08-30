@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -270,6 +270,29 @@ test("worktree cleanup refuses unmanaged paths and treats null setup paths as em
       cleanupAssignmentWorktree({ ...record, workspace: { path: fixture.repository } }, fixture.options),
       (error) => error instanceof GitWorkspaceError && error.code === "unmanaged-worktree",
     );
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("worktree cleanup accepts canonical paths beneath an aliased state root", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    const aliasedHome = join(fixture.root, "aliased-home");
+    await symlink(fixture.home, aliasedHome, process.platform === "win32" ? "junction" : "dir");
+    const aliasedOptions = {
+      ...fixture.options,
+      environment: {
+        ...fixture.options.environment,
+        HOME: aliasedHome,
+        CODEX_HOME: join(aliasedHome, ".codex"),
+      },
+      homeDirectory: aliasedHome,
+    };
+    const record = await createWriterAssignment({ ...fixture, options: aliasedOptions });
+    const workspace = await createAssignmentWorktree(record, aliasedOptions);
+    const cleanup = await cleanupAssignmentWorktree({ ...record, workspace }, aliasedOptions);
+    assert.equal(cleanup.cleaned, true);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
