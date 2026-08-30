@@ -1,11 +1,11 @@
 ---
 name: sol-luna-orchestration
-description: Coordinate substantive software work with GPT-5.6 Sol as the low-verbosity root, verified Sol and Luna executor profiles, durable assignments, isolated writer worktrees, candidate review, explicit validated delivery, and an exceptional human-confirmed Sol Ultra takeover. Invoke explicitly before planning, delegating, coordinating, or validating independent work.
+description: Coordinate substantive software work with GPT-5.6 Sol at the root and verified Sol and Luna executor profiles. Covers durable assignments, isolated writer worktrees, candidate review, validated delivery, and human-confirmed Sol Ultra takeovers. Invoke it before planning, delegating, coordinating, or validating independent work.
 ---
 
 # Sol-Luna Orchestration
 
-Run this workflow once before the first substantive request in a root task. Do not run it inside a session whose developer instructions contain `CODEX_ORCHESTRATION_ROLE=executor`. A session marked `CODEX_ORCHESTRATION_ROLE=ultra-orchestrator` already owns the exceptional takeover workflow and must not acquire another lock.
+Use this workflow once, before the first substantive request in a root task. Do not run it inside a session whose developer instructions contain `CODEX_ORCHESTRATION_ROLE=executor`. A session marked `CODEX_ORCHESTRATION_ROLE=ultra-orchestrator` already owns the takeover workflow and must not acquire another lock.
 
 ## Workflow
 
@@ -42,7 +42,9 @@ npm run verify:platform
 npm run verify:live
 ```
 
-`verify:platform` is the required authentication-free gate on Windows, Linux, and macOS. It must verify Codex CLI compatibility, strict configuration, generated App Server schemas, the current process fingerprint, an idempotent isolated global installation, the native link type and canonical target, temporary cleanup, and unchanged Git state. `verify:live` is a manual authenticated gate that must verify root, every executor profile, Playwright, Ultra, locks, recovery, isolation, capacity, and unchanged repository state. Record a platform as live verified only after its self-hosted `codex-live` artifact succeeds. A sandbox failure keeps the platform pending and never justifies a bypass or weaker sandbox.
+`verify:platform` is the required authentication-free gate on Windows, Linux, and macOS. It verifies Codex CLI compatibility, strict configuration, generated App Server schemas, the current process fingerprint, an idempotent isolated global installation, the native link type and canonical target, temporary cleanup, and unchanged Git state.
+
+`verify:live` is a manual authenticated gate. It verifies root, every executor profile, Playwright, Ultra, locks, recovery, isolation, capacity, and unchanged repository state. Mark a platform as live verified only after its self-hosted `codex-live` artifact succeeds. A sandbox failure keeps the platform pending and never justifies a bypass or weaker sandbox.
 
 ## Launcher
 
@@ -64,7 +66,13 @@ briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-exe
 
 `npm run executor` remains a convenience entry point. Use the direct command for exact option forwarding and exit codes. Code `0` means completed with verified routing, `1` means blocked or failed, and `2` means invocation, capacity, timeout, configuration, contract, MCP, or routing verification failed.
 
-The default control plane and result format are both v2. Add `--enqueue-only` to persist work without starting it, or resume it with the stored contract through `--assignment-id <id>`. Repeat `--write-root`, `--forbid-root`, `--check-json`, and `--artifact-json` as needed. Use `--review-policy independent`, `--require-operator-approval`, and `--candidate-id <id>` only when those gates are required. New writer assignments default to automatic delivery through `$CODEX_HOME/sol-luna-orchestration/config.json`; set `automatic_delivery` to `false` there to opt out globally. Automatic delivery commits the validated candidate and additionally selects push only when the checked-out branch has a matching configured upstream. An explicit `--delivery manual`, `--delivery commit --commit-message <message>`, or `--delivery push --commit-message <message> --push-remote <configured-name> --push-branch <existing-branch>` overrides the configuration for one new assignment. Read-only profiles and resumed assignments do not re-resolve the setting. The launcher emits a colored route banner to stderr when the terminal supports color and reserves stdout for one JSON result. It respects `NO_COLOR`, `TERM=dumb`, and `FORCE_COLOR`.
+The default control plane and result format are both v2. Use `--enqueue-only` to persist work without starting it, then resume the stored contract with `--assignment-id <id>`. Repeat `--write-root`, `--forbid-root`, `--check-json`, and `--artifact-json` as needed. Add `--review-policy independent`, `--require-operator-approval`, or `--candidate-id <id>` only when the assignment needs those gates.
+
+New writer assignments read their automatic-delivery default from `$CODEX_HOME/sol-luna-orchestration/config.json`. Set `automatic_delivery` to `false` to opt out globally. When enabled, the controller commits the validated candidate and also selects push if the checked-out branch has a matching configured upstream.
+
+For one new assignment, override the configuration with `--delivery manual`, `--delivery commit --commit-message <message>`, or `--delivery push --commit-message <message> --push-remote <configured-name> --push-branch <existing-branch>`. Read-only profiles and resumed assignments do not resolve the setting again.
+
+The launcher writes a colored route banner to stderr when the terminal supports color and reserves stdout for one JSON result. It respects `NO_COLOR`, `TERM=dumb`, and `FORCE_COLOR`.
 
 Read [the assignment schema](references/assignment-request.schema.json) when constructing a durable contract, [the executor task schema](references/executor-result.schema.json) when changing model-facing output, and [the v2 envelope schema](references/executor-result-v2.schema.json) when consuming controller results.
 
@@ -72,7 +80,9 @@ Read [the assignment schema](references/assignment-request.schema.json) when con
 
 Assignment records and sanitized action events live outside the repository under Codex state. Every mutation carries an action id, expected state revision, and authority. Replays with the same action are idempotent; stale revisions, reused action ids with changed content, stale Ultra generations, and overlapping writer leases fail closed.
 
-Writer worktrees complement the sandbox; they do not replace it. The executor can write only inside its isolated worktree, the controller verifies the declared paths, symlink and submodule capabilities, required checks, and artifact boundaries, then creates an immutable candidate commit without letting the executor stage or commit. Root or Ultra alone may integrate the verified candidate. Manual delivery leaves that integration unstaged. Commit delivery constructs a commit from a temporary index containing only the candidate paths and preserves unrelated staged and working changes. Push delivery uses the remote and branch snapshotted in the assignment, requires the delivery parent to be present remotely, verifies ancestry, and performs a normal noninteractive push without force. It never publishes unrelated local parent commits. There is no fallback to writing the shared checkout.
+Writer worktrees complement the sandbox; they do not replace it. The executor can write only inside its isolated worktree. The controller verifies the declared paths, symlink and submodule capabilities, required checks, and artifact boundaries before creating an immutable candidate commit. The executor never stages or commits, and only root or Ultra may integrate the candidate.
+
+Manual delivery leaves the integration unstaged. Commit delivery uses a temporary index containing only the candidate paths and preserves unrelated staged and working changes. Push delivery uses the remote and branch stored in the assignment, requires the delivery parent to exist remotely, verifies ancestry, and performs a normal noninteractive push without force. It never publishes unrelated local parent commits. There is no fallback to a shared writable checkout.
 
 Controller commits use deterministic Git plumbing and do not run commit hooks or create signed commits. Express mandatory validation as required checks, and use manual delivery when repository policy requires hooks or signing.
 
@@ -92,7 +102,9 @@ npm run control -- retry-delivery --cwd <repository> --assignment-id <id> --revi
 npm run control -- ack --cwd <repository> --assignment-id <id> --revision <n>
 ```
 
-Mutations require the exact current revision. `reconcile` performs pending commit, push, acknowledgement, and cleanup steps mechanically. A Git delivery failure records only a sanitized error, enters `delivery_blocked`, and waits for an explicit `retry-delivery`; it never retries a failing push in a loop. Independent review runs `review` against `--candidate-id <id>` and publishes a verdict bound to that candidate revision. Operator questions, approval, and delivery retry remain explicit dashboard or CLI actions; the controller never invents an answer.
+Mutations require the exact current revision. `reconcile` mechanically performs any pending commit, push, acknowledgement, and cleanup steps. A Git delivery failure records only a sanitized error, enters `delivery_blocked`, and waits for an explicit `retry-delivery`. It does not retry a failing push in a loop.
+
+Independent review runs `review` against `--candidate-id <id>` and publishes a verdict bound to that candidate revision. Operator questions, approvals, and delivery retries remain explicit dashboard or CLI actions. The controller never invents an answer.
 
 The optional dashboard binds only to loopback, uses a one-time URL token, an HttpOnly session cookie, origin and CSRF checks, and exposes only the redacted status projection plus operator answer/approval actions:
 
@@ -129,7 +141,9 @@ node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs status
 
 `review` returns `APPROVE` or `COMMENT` with completed status, or `REQUEST_CHANGES` with blocked status and at least one blocker. It never changes files.
 
-`playwright` requires an installed and enabled stdio Playwright MCP. The launcher gives it an isolated temporary browser profile and output directory, verifies that a Playwright MCP tool was actually used, and removes temporary artifacts. Full interaction is allowed only on localhost and explicitly named development or test environments. External sites are observation-only unless the briefing explicitly authorizes a named state-changing action and destination. Purchases, deletion, publishing, messaging, account or security changes, production mutation, and `browser_run_code_unsafe` are prohibited.
+`playwright` requires an installed and enabled stdio Playwright MCP. The launcher gives it an isolated temporary browser profile and output directory, verifies that a Playwright MCP tool was used, and removes the temporary artifacts.
+
+Full interaction is allowed only on localhost and explicitly named development or test environments. External sites are observation-only unless the briefing authorizes a named state-changing action and destination. Purchases, deletion, publishing, messaging, account or security changes, production mutation, and `browser_run_code_unsafe` are prohibited.
 
 ## Exclusive Ultra takeover
 
@@ -139,9 +153,13 @@ Use Sol `ultra` on Standard only when a named architecture, security, concurrenc
 briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs --cwd <repository> --reason <reason> --confirm-exclusive-takeover --sandbox read-only
 ```
 
-Workspace writing requires an explicit `--sandbox workspace-write`. Ultra replaces the root temporarily, disables native multi-agent execution, and delegates only through verified profiles. Its executors inherit the exact `CODEX_ORCHESTRATION_LOCK_ID` and monotonic `CODEX_ORCHESTRATION_GENERATION`, consume the normal capacity pools, and never overlap write roots. New Ultra-owned writer assignments inherit the operator-controlled automatic-delivery setting, but an explicit user boundary against commits or pushes takes precedence and requires `--delivery manual`. Durable executor output uses the v2 envelope; the Ultra result includes its integer `generation`.
+Workspace writing requires an explicit `--sandbox workspace-write`. Ultra temporarily replaces the root, disables native multi-agent execution, and delegates only through verified profiles. Its executors inherit the exact `CODEX_ORCHESTRATION_LOCK_ID` and monotonic `CODEX_ORCHESTRATION_GENERATION`. They consume the normal capacity pools and never overlap write roots.
 
-A verified terminal result releases the lock. Timeout, interruption, process failure, invalid output, or routing failure leaves `recovery-required`. State v2 registers the Ultra launcher/App Server and every executor launcher/App Server with a portable process-start fingerprint. Recover only with the exact lock id and only after every registered identity is confirmed `dead` or `reused`; a live or `unknown` identity fails closed, and recovery never kills it:
+New Ultra-owned writer assignments inherit the operator-controlled automatic-delivery setting. An explicit user boundary against commits or pushes takes precedence and requires `--delivery manual`. Durable executor output uses the v2 envelope; the Ultra result includes its integer `generation`.
+
+A verified terminal result releases the lock. Timeout, interruption, process failure, invalid output, or routing failure leaves it in `recovery-required`. State v2 registers the Ultra launcher and App Server, plus every executor launcher and App Server, with a portable process-start fingerprint.
+
+Recover only with the exact lock id and only after every registered identity is confirmed `dead` or `reused`. A live or `unknown` identity fails closed, and recovery never kills it:
 
 ```text
 node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs status --cwd <repository>
@@ -149,7 +167,7 @@ node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs histor
 node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs recover --cwd <repository> --lock-id <exact-lock-id>
 ```
 
-Active version 1 state remains `legacy-unfenced` and is never silently converted. After its owners stop, recover it only with the additional `--confirm-legacy-recovery`; a v1-only repository then starts v2 at generation 1. History is immutable, sanitized, targets 1,000 events while protecting the active generation, and never serves as lock authority.
+Active version 1 state remains `legacy-unfenced` and is never converted silently. After its owners stop, recovery also requires `--confirm-legacy-recovery`; a v1-only repository then starts v2 at generation 1. History is immutable and sanitized. Retention targets 1,000 events while protecting the active generation, but history does not determine lock ownership.
 
 ## Guardrails
 
@@ -165,4 +183,13 @@ Active version 1 state remains `legacy-unfenced` and is never silently converted
 
 ## Completion criteria
 
-Complete the root task only after every used profile has verified routing, every accepted candidate has the required review and approvals, integration is conflict-free, its explicit delivery is complete, relevant checks pass, durable assignments are acknowledged and worktrees cleaned or explicitly archived, Playwright usage is verified when requested, every Ultra generation is released or reported as recovery-required, platform verification appropriate to the change passes, and unresolved portability, descendant-registration, or sandbox limitations are disclosed.
+A root task is complete only when every applicable condition below is met:
+
+- Every used profile has verified routing.
+- Every accepted candidate has the required review and approvals.
+- Integration is conflict-free and the declared delivery is complete.
+- Relevant checks and platform verification pass.
+- Durable assignments are acknowledged and their worktrees are cleaned or explicitly archived.
+- Playwright use is verified when requested.
+- Every Ultra generation is released or reported as `recovery-required`.
+- Any unresolved portability, descendant-registration, or sandbox limitation is disclosed.

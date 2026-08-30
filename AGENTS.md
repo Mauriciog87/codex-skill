@@ -1,6 +1,6 @@
 # Sol-Luna orchestration
 
-The root Codex session is the orchestrator. At the beginning of every new substantive task, explicitly invoke `$sol-luna-orchestration` before planning, delegating, or editing. A session whose developer instructions contain `CODEX_ORCHESTRATION_ROLE=executor` is an executor and must not invoke the skill or apply the root workflow. A session marked `CODEX_ORCHESTRATION_ROLE=ultra-orchestrator` owns an already authorized exclusive takeover and must not acquire another one.
+The root Codex session is the orchestrator. Invoke `$sol-luna-orchestration` at the start of every substantive task, before planning, delegating, or editing. A session with `CODEX_ORCHESTRATION_ROLE=executor` in its developer instructions is an executor; it must not invoke the skill or apply the root workflow. A session marked `CODEX_ORCHESTRATION_ROLE=ultra-orchestrator` already owns an authorized exclusive takeover and must not acquire another one.
 
 ## Model roles
 
@@ -24,15 +24,23 @@ All executor work must use:
 node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile explore|implement-lite|playwright|implement|review [options]
 ```
 
-The briefing is read from stdin. The profile fixes model, reasoning effort, tier, sandbox, workspace strategy, and capabilities. Writer profiles require at least one `--write-root`; the worktree is additional isolation and never replaces `workspace-write`. Do not use native `spawn_agent` or custom agent TOML for executor routing. Reconsider native spawning only after it exposes role-specific routing and live tests prove every required model, effort, and tier.
+The briefing comes from stdin. The selected profile fixes the model, reasoning effort, tier, sandbox, workspace strategy, and capabilities. Writer profiles require at least one `--write-root`. Their worktree adds isolation but does not replace `workspace-write`. Do not use native `spawn_agent` or custom agent TOML for executor routing. Reconsider native spawning only when it supports role-specific routing and live tests prove every required model, effort, and tier.
 
 ## Durable control plane
 
-Control plane v2 and result format v2 are the defaults. Every assignment binds the base revision, allowed and forbidden write roots, required checks, artifacts, review policy, operator approval policy, and an explicit `manual`, `commit`, or `push` delivery policy. State transitions require an action id, exact state revision, and authorized actor. Replays are idempotent; stale revisions, changed action replays, overlapping writer leases, and stale Ultra generations fail closed.
+Control plane v2 and result format v2 are the defaults. Every assignment binds the base revision, allowed and forbidden write roots, required checks, artifacts, review policy, operator approval policy, and an explicit `manual`, `commit`, or `push` delivery policy. Each state transition requires an action id, the exact state revision, and an authorized actor. Exact replays are idempotent. Stale revisions, changed replays, overlapping writer leases, and stale Ultra generations fail closed.
 
-Writer profiles run in controller-created detached worktrees outside the repository. Executors never stage, commit, change HEAD, create branches, or push. The controller validates actual Git changes and declared artifacts, runs required checks without a shell, and creates an immutable candidate ref. New writer assignments use automatic delivery by default. The global `$CODEX_HOME/sol-luna-orchestration/config.json` switch can disable it, and an explicit `--delivery` overrides it for one assignment. An explicit user boundary against commits or pushes always requires the corresponding manual override. Automatic delivery commits only the exact integrated candidate and pushes only when the checked-out branch has a matching configured upstream; it never force-pushes. The resolved policy is stored immutably in the assignment. Only root or Ultra may claim, approve, integrate, acknowledge, archive, or retry a writer assignment. Independent `review` runs against the exact candidate revision. Operator questions and approvals are never inferred.
+Writer profiles run in detached worktrees created by the controller outside the repository. Executors never stage, commit, change HEAD, create branches, or push. The controller validates the actual Git changes and declared artifacts, runs required checks without a shell, and creates an immutable candidate ref.
 
-Use `orchestration-control.mjs status|next|reconcile` for residual work and its revision-fenced mutation commands for claim, review, approval, integration, commit delivery, push delivery, acknowledgement, answers, delivery retry, assignment retry, abandonment, archival, and cleanup. A failed automatic delivery enters `delivery_blocked` and requires an explicit retry; the controller does not loop blindly. The local dashboard is projection-only, loopback-bound, one-time authenticated, CSRF protected, and limited to operator answers, approvals, and delivery retries. The deterministic simulator mutates neither Git nor durable state.
+New writer assignments use automatic delivery by default. Set `automatic_delivery` to `false` in `$CODEX_HOME/sol-luna-orchestration/config.json` to disable it, or use an explicit `--delivery` override for one assignment. A user boundary against commits or pushes always requires the matching manual override.
+
+Automatic delivery commits only the integrated candidate and pushes only when the checked-out branch has a matching configured upstream. It never force-pushes. The resolved policy is stored in the assignment and does not change later.
+
+Only root or Ultra may claim, approve, integrate, acknowledge, archive, or retry a writer assignment. Independent `review` runs against the exact candidate revision. Operator questions and approvals must remain explicit.
+
+Use `orchestration-control.mjs status|next|reconcile` to inspect and resume residual work. Its revision-fenced mutation commands handle claim, review, approval, integration, delivery, acknowledgement, answers, retries, abandonment, archival, and cleanup. A failed automatic delivery enters `delivery_blocked` and waits for an explicit retry; the controller does not keep retrying on its own.
+
+The local dashboard is projection-only, bound to loopback, protected by a one-time authentication token, and guarded against CSRF. It allows only operator answers, approvals, and delivery retries. The deterministic simulator changes neither Git nor durable state.
 
 ## Concurrency
 
@@ -54,9 +62,15 @@ Use Ultra only for a named decision that root Sol/xhigh cannot resolve responsib
 node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs
 ```
 
-The repository lock has no time-based expiry. Every Ultra epoch receives a repository-persistent monotonic generation. Normal executors and unrelated sessions stop while it exists. Ultra may run only verified profiles carrying the matching `CODEX_ORCHESTRATION_LOCK_ID` and `CODEX_ORCHESTRATION_GENERATION`; those executors consume the normal capacity pools and still serialize overlapping writes. State and result transitions revalidate both values. A verified terminal result releases the lock. Timeout, interruption, process, contract, or routing failure leaves `recovery-required`.
+The repository lock has no time-based expiry. Every Ultra epoch receives a monotonic generation that persists for the repository. Normal executors and unrelated sessions stop while the lock exists. Ultra may run only verified profiles carrying the matching `CODEX_ORCHESTRATION_LOCK_ID` and `CODEX_ORCHESTRATION_GENERATION`.
 
-State v2 registers launcher and App Server process identities for Ultra and its executors. Recovery succeeds only when every registered identity is confirmed dead or reused; live and unknown identities fail closed, and recovery never kills a process. Version 1 state remains `legacy-unfenced` until explicitly recovered with `--confirm-legacy-recovery`. History is immutable, sanitized, retention-bounded evidence and is not lock authority. There is no TTL, heartbeat, automatic recovery, shared-checkout write fallback, dependency fallback, or `shell: true`. Descendants outside registered launcher/App Server paths cannot be identified portably or atomically stopped. Ultra cannot release while an assignment from its lock id and generation remains unfinished.
+Those executors consume the normal capacity pools and still serialize overlapping writes. State and result transitions revalidate the lock id and generation. A verified terminal result releases the lock. Timeout, interruption, process, contract, or routing failure leaves it in `recovery-required`.
+
+State v2 registers the launcher and App Server process identities for Ultra and each executor. Recovery succeeds only when every registered identity is confirmed dead or reused. Live and unknown identities fail closed, and recovery never kills a process.
+
+Version 1 state remains `legacy-unfenced` until it is explicitly recovered with `--confirm-legacy-recovery`. History is immutable, sanitized, and retention-bounded, but it does not determine lock ownership.
+
+There is no TTL, heartbeat, automatic recovery, shared-checkout write fallback, dependency fallback, or `shell: true`. Descendants outside the registered launcher and App Server paths cannot be identified portably or stopped atomically. Ultra cannot release while an assignment from its lock id and generation remains unfinished.
 
 Inspect or recover only through:
 

@@ -1,8 +1,8 @@
 # Verified Sol-Luna orchestration for Codex
 
-This repository provides a dependency-free orchestration layer for Codex. It keeps planning and integration on GPT-5.6 Sol, moves bounded work to verified Sol or Luna profiles, persists assignments through interruption, isolates writers in Git worktrees, checks the effective model, reasoning effort, and service tier before accepting a candidate, and can explicitly commit or push only after that candidate clears every configured gate.
+This repository adds a dependency-free orchestration layer to Codex. GPT-5.6 Sol owns planning and integration, while verified Sol and Luna profiles handle bounded assignments. Assignments survive interruptions, and writer tasks run in isolated Git worktrees. Before accepting a candidate, the controller verifies the effective model, reasoning effort, service tier, and every configured gate. It can then commit or push that exact candidate.
 
-The launchers use the [experimental Codex App Server](https://developers.openai.com/codex/app-server) over local stdio JSON-RPC instead of native subagent routing. App Server applies and reports each route explicitly while native multi-agent execution remains disabled. There is deliberately no fallback to the legacy execution path: an incompatible protocol fails closed with exit code `2`.
+The launchers talk to the [experimental Codex App Server](https://developers.openai.com/codex/app-server) over local stdio JSON-RPC instead of using native subagent routing. App Server applies and reports each route explicitly, while native multi-agent execution stays disabled. There is no legacy fallback. An incompatible protocol fails closed with exit code `2`.
 
 ## Roles
 
@@ -22,7 +22,7 @@ Routing requires two matching sources of evidence. `thread/settings/updated` con
 
 ## Installation
 
-**Minimum supported Codex CLI version: `0.147.0`.** Older releases are not supported because the launchers depend on the experimental App Server protocol and `thread/settings/update` behavior validated against that version. The only other runtime required is the Node.js runtime bundled with Codex. Because these interfaces remain experimental, newer Codex releases must still pass the included schema and live verification before they are trusted.
+Codex CLI `0.147.0` is the minimum supported version. The launchers rely on the experimental App Server protocol and the `thread/settings/update` behavior validated against that release. The only other requirement is the Node.js runtime bundled with Codex. Newer Codex releases are accepted only after they pass the included schema and live verification.
 
 ```text
 npm run install:global
@@ -59,7 +59,9 @@ npm run verify:platform -- --expected-codex-version 0.147.0 --output <path-outsi
 
 It creates isolated temporary HOME and `CODEX_HOME` directories, checks strict configuration and generated App Server schemas, verifies portable process fingerprints, installs twice, verifies the native link type and target, and removes the temporary state. Its JSON result is written to stdout; diagnostics use stderr.
 
-Live status remains `Pending` until a successful artifact exists for that operating system. Live checks run only from `master` through the manual `live-cross-platform.yml` workflow on dedicated self-hosted runners labeled `codex-live` plus `windows`, `linux`, or `macOS`. Configure the GitHub environment named `codex-live` with required reviewers before enabling the workflow. Each runner must use an isolated OS account, be authenticated in Codex beforehand, and have the stdio Playwright MCP enabled. The workflow does not copy personal tokens or use API-key secrets.
+Live status remains `Pending` until that operating system has a successful artifact. Run live checks only from `master`, through the manual `live-cross-platform.yml` workflow, on dedicated self-hosted runners labeled `codex-live` plus `windows`, `linux`, or `macOS`.
+
+Before enabling the workflow, configure the GitHub environment named `codex-live` with required reviewers. Each runner needs an isolated OS account, an existing Codex login, and the stdio Playwright MCP. The workflow does not copy personal tokens or use API-key secrets.
 
 Windows can still report `codex-windows-sandbox-setup.exe: Access is denied` on machines where the sandbox helper cannot initialize. That platform remains pending when this occurs; the verification never reduces permissions or enables a bypass.
 
@@ -92,7 +94,7 @@ Machine-readable JSON remains the only stdout output. `NO_COLOR`, `TERM=dumb`, a
 
 ## Durable assignments
 
-An assignment stores its briefing separately from its public status and binds all execution to a full Git base revision. Its contract includes priority, allowed and forbidden write roots, required checks, declared artifacts, review policy, operator approval, explicit symlink or submodule capabilities, and a `manual`, `commit`, or `push` delivery policy. State lives outside the repository under Codex home.
+Each assignment keeps its briefing separate from public status and binds execution to a full Git base revision. The contract records priority, allowed and forbidden write roots, required checks, declared artifacts, review policy, operator approval, explicit symlink or submodule capabilities, and a `manual`, `commit`, or `push` delivery policy. State lives outside the repository under Codex home.
 
 The global installer creates `$CODEX_HOME/sol-luna-orchestration/config.json` with automatic delivery enabled:
 
@@ -102,7 +104,9 @@ The global installer creates `$CODEX_HOME/sol-luna-orchestration/config.json` wi
 }
 ```
 
-This is an opt-out default for new writer assignments. After validation and root or Ultra integration, the controller creates an exact candidate-only commit. When the checked-out branch has a same-named configured upstream, it also records that remote and branch in the assignment and performs the normal fast-forward push; without one, delivery stops after the local commit. Set `automatic_delivery` to `false` to restore unstaged manual integration. An explicit `--delivery manual|commit|push` takes precedence for one new assignment. Resumed and already-created assignments always retain their stored policy, and read-only or review profiles remain manual.
+Automatic delivery is the default for new writer assignments, but it can be turned off. After root or Ultra validates and integrates a candidate, the controller commits only that candidate. If the checked-out branch has a configured upstream with the same name, the assignment records it and the controller performs a normal fast-forward push. Without a matching upstream, delivery stops after the local commit.
+
+Set `automatic_delivery` to `false` to return to unstaged manual integration. An explicit `--delivery manual|commit|push` overrides the setting for one new assignment. Existing and resumed assignments keep their stored policy. Read-only and review profiles always remain manual.
 
 Persist work without starting it, inspect the residual plan, and run every currently safe assignment:
 
@@ -114,17 +118,21 @@ npm run control -- next --cwd .
 npm run control -- reconcile --cwd .
 ```
 
-The lifecycle is revision fenced: `queued`, `running`, `result_ready`, `claimed`, optional review and approval, `integration_pending`, then delivery. Manual delivery uses `integrated`; automatic delivery advances through `commit_pending` and `committed`, plus `push_pending` and `published` for push, before `acknowledged`. A Git failure enters `delivery_blocked` and requires an explicit retry instead of looping. Blocked, failed, and recovery-required execution attempts can be archived and retried separately. Every mutation carries a unique action id, expected state revision, and authority; exact replays are idempotent, while altered replays and stale revisions fail closed.
+Every state change is revision-fenced. An assignment moves through `queued`, `running`, `result_ready`, `claimed`, optional review and approval, `integration_pending`, and then delivery. Manual delivery uses `integrated`. Automatic delivery adds `commit_pending` and `committed`, plus `push_pending` and `published` when a push is required, before reaching `acknowledged`.
+
+A Git failure moves the assignment to `delivery_blocked` and waits for an explicit retry. It does not loop. Blocked, failed, and recovery-required attempts can be archived and retried separately. Every mutation includes a unique action id, the expected state revision, and its authority. Exact replays are idempotent; altered replays and stale revisions fail closed.
 
 The residual planner starts disjoint write scopes in parallel and retains active leases across blocked or failed attempts. It never uses capacity as a fan-out target and never falls back to a shared writable checkout.
 
 ## Worktrees, candidates, and review
 
-Worktrees and sandboxing solve different problems and are both enforced. `workspace-write` limits the executor process; the detached worktree keeps its Git changes away from the main checkout. Before publication, the controller verifies the actual changed paths, rejects executor commits or HEAD changes, checks symlink and submodule policy, runs the declared commands without a shell, and copies only declared in-scope artifacts.
+Worktrees and sandboxing cover different risks, so both stay enabled. `workspace-write` limits the executor process. The detached worktree keeps Git changes away from the main checkout. Before publication, the controller verifies the actual changed paths, rejects executor commits or HEAD changes, checks symlink and submodule policy, runs declared commands without a shell, and copies only declared in-scope artifacts.
 
-The controller then creates an immutable hidden candidate ref through Git plumbing. The executor never stages or commits. Candidate identity binds the base revision, tree diff, contract, checks, and artifact manifest. Reusing an attempt with different content is rejected. New writer assignments resolve their delivery policy once from the global opt-out configuration unless the launcher receives an explicit override.
+After validation, the controller creates an immutable hidden candidate ref through Git plumbing. The executor never stages or commits. The candidate id binds the base revision, tree diff, contract, checks, and artifact manifest. Reusing an attempt with different content is rejected. A new writer assignment resolves its delivery policy once from the global configuration unless the launcher receives an explicit override.
 
-For commit delivery, the controller builds a temporary index from the current branch, applies only the validated candidate, creates a candidate-bound commit, updates the checked-out branch with compare-and-swap semantics, and synchronizes only those candidate paths in the real index. Unrelated staged and unstaged work is preserved. Automatic push discovery reads only the checked-out branch's configured same-named upstream and snapshots it into the assignment; explicit push delivery still requires a named configured remote and existing branch. Push requires the delivery commit's parent to be present remotely, verifies ancestry, publishes the exact delivery commit noninteractively without `--force`, and verifies the remote result. It never publishes unrelated local parent commits.
+For commit delivery, the controller builds a temporary index from the current branch and applies only the validated candidate. It creates a candidate-bound commit, updates the checked-out branch with compare-and-swap semantics, and synchronizes only the candidate paths in the real index. Unrelated staged and unstaged work is preserved.
+
+Automatic push discovery reads only the checked-out branch's configured upstream with the same name and stores it in the assignment. Explicit push delivery still requires a named configured remote and an existing branch. Before pushing, the controller checks that the delivery commit's parent exists remotely and verifies ancestry. It then publishes the exact commit without `--force` and verifies the remote result. Unrelated local parent commits are never published.
 
 The deterministic plumbing commit does not execute repository commit hooks or create a signed commit. Put mandatory validation in `required_checks`; repositories that require interactive hooks or signed commits should keep delivery `manual`.
 
@@ -142,7 +150,9 @@ npm run control -- retry-delivery --cwd . --assignment-id <id> --revision <n>
 npm run control -- ack --cwd . --assignment-id <id> --revision <n>
 ```
 
-An independent verdict is bound to the exact candidate id and revision. Optional operator approval is a separate authority. Integration rechecks candidate integrity and path drift and refuses conflicts with local work. `reconcile` can perform the declared commit, push, acknowledgement, and cleanup steps after integration. A blocked delivery records a sanitized reason and waits for `retry-delivery`; assignment retry remains a separate operation that archives the prior worktree first. Acknowledged and abandoned workspaces can then be cleaned safely.
+An independent verdict is bound to the exact candidate id and revision. Optional operator approval is a separate authority. Before integration, the controller rechecks candidate integrity and path drift and refuses conflicts with local work.
+
+After integration, `reconcile` can perform the declared commit, push, acknowledgement, and cleanup. A blocked delivery records a sanitized reason and waits for `retry-delivery`. Retrying the assignment is a separate operation that first archives the previous worktree. Acknowledged and abandoned workspaces can then be cleaned safely.
 
 ## Local control dashboard and simulator
 
@@ -255,4 +265,6 @@ npm run verify:platform
 npm run verify:live
 ```
 
-The unit suite covers JSON-RPC ordering and failures, profile routing, durable state transitions, action idempotency, resource leases, worktree isolation, immutable candidates, automatic-delivery configuration and precedence, manual integration, exact candidate-only commits, fast-forward push delivery, delivery blocking and retry, required checks and artifacts, independent review, operator gates, dashboard security, deterministic fault simulation, tiers, terminal colors, capacity races, Ultra fencing generations, portable process identity, fail-closed recovery, immutable redacted history and retention, safe version 1 migration, Playwright preflight and tool evidence, installer rollback, and platform-specific path rules. `verify:platform` is the authentication-free compatibility gate and includes a live fingerprint check for the current process. Live verification generates the installed App Server schemas, checks the root and every profile against protocol and rollout evidence, uses temporary repositories for write tests, and confirms that read-only checks do not alter this repository. Add `--output <path-outside-the-repository>` to either verification command when an evidence artifact is required.
+The unit suite covers the control plane from routing through delivery. It tests JSON-RPC ordering and failures, profile routing, durable state transitions, action replay, resource leases, worktree isolation, immutable candidates, automatic-delivery precedence, manual integration, candidate-only commits, push delivery, delivery retry, required checks and artifacts, independent review, and operator gates. It also exercises dashboard security, deterministic fault simulation, tiers and terminal colors, capacity races, Ultra fencing, process identity, fail-closed recovery, history retention, version 1 migration, Playwright evidence, installer rollback, and platform-specific paths.
+
+`verify:platform` is the authentication-free compatibility gate and includes a live fingerprint check for the current process. Live verification generates the installed App Server schemas, checks the root and every profile against protocol and rollout evidence, uses temporary repositories for write tests, and confirms that read-only checks leave this repository unchanged. Add `--output <path-outside-the-repository>` to either command when an evidence artifact is required.
