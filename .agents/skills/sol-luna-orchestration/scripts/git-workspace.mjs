@@ -335,11 +335,13 @@ export async function createCandidateReviewWorktree(record, options = {}) {
   };
 }
 
+function normalizedPath(value, platform = process.platform) {
+  const normalized = normalizeRepositoryPath(value);
+  return platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
 function normalizedSet(values, platform = process.platform) {
-  return new Set(values.map((value) => {
-    const normalized = normalizeRepositoryPath(value);
-    return platform === "win32" ? normalized.toLowerCase() : normalized;
-  }));
+  return new Set(values.map((value) => normalizedPath(value, platform)));
 }
 
 async function pathGitMode(cwd, revision, path, options = {}) {
@@ -611,6 +613,12 @@ export async function createCandidate(record, workspacePath, {
       operator_approval_required: record.operator_approval_required,
       allow_symlinks: record.allow_symlinks,
       allow_submodules: record.allow_submodules,
+      delivery: {
+        mode: record.delivery.mode,
+        commit_message: record.delivery.commit_message,
+        remote: record.delivery.remote,
+        branch: record.delivery.branch,
+      },
     }));
     const diffDigest = sha256(patch.stdout);
     const candidateId = sha256(canonicalJson({
@@ -727,6 +735,477 @@ export async function integrateCandidate(record, targetCwd, options = {}) {
     candidate_id: record.candidate.candidate_id,
     target_revision_before: target.head,
     applied_diff_sha256: patchDigest,
+  };
+}
+
+function deliveryPublicationRef(record) {
+  return `refs/codex-orchestration/deliveries/${record.assignment_id}/${record.attempt}`;
+}
+
+function normalizedPathsEqual(first, second, platform = process.platform) {
+  const left = normalizedSet(first, platform);
+  const right = normalizedSet(second, platform);
+  return left.size === right.size && [...left].every((path) => right.has(path));
+}
+
+function parseNullSeparatedPaths(buffer) {
+  return buffer
+    .toString("utf8")
+    .split("\0")
+    .filter((path) => path.length > 0)
+    .map(normalizeRepositoryPath)
+    .sort();
+}
+
+async function currentBranchRef(repository, options) {
+  const result = await runGit(["symbolic-ref", "-q", "HEAD"], {
+    ...options,
+    cwd: repository,
+    allowFailure: true,
+  });
+  const branchRef = result.stdoutText.trim();
+  if (result.exitCode !== 0 || !branchRef.startsWith("refs/heads/")) {
+    throw new GitWorkspaceError("Automatic delivery requires a checked-out local branch.", "delivery-detached-head");
+  }
+  const valid = await runGit(["check-ref-format", branchRef], {
+    ...options,
+    cwd: repository,
+    allowFailure: true,
+  });
+  if (valid.exitCode !== 0) {
+    throw new GitWorkspaceError("Automatic delivery branch is invalid.", "delivery-branch-invalid");
+  }
+  return branchRef;
+}
+
+async function assertConfiguredPushDestination(record, repository, branchRef, options) {
+  if (record.delivery.mode !== "push") {
+    return;
+  }
+  if (branchRef !== `refs/heads/${record.delivery.branch}`) {
+    throw new GitWorkspaceError(
+      `Checked-out branch does not match delivery branch ${record.delivery.branch}.`,
+      "delivery-branch-mismatch",
+    );
+  }
+  const environment = {
+    ...(options.environment ?? process.env),
+    GIT_TERMINAL_PROMPT: "0",
+    GCM_INTERACTIVE: "Never",
+  };
+  const configured = await runGit(["remote", "get-url", "--push", record.delivery.remote], {
+    ...options,
+    cwd: repository,
+    environment,
+    allowFailure: true,
+  });
+  if (configured.exitCode !== 0 || configured.stdoutText.trim().length === 0) {
+    throw new GitWorkspaceError("Automatic delivery remote is not configured for push.", "delivery-remote-invalid");
+  }
+}
+
+async function inspectPublicationCommit(record, revision, branchRef, options) {
+  const repository = record.repository;
+  const type = await runGit(["cat-file", "-t", revision], {
+    ...options,
+    cwd: repository,
+    allowFailure: true,
+  });
+  if (type.exitCode !== 0 || type.stdoutText.trim() !== "commit") {
+    throw new GitWorkspaceError("Delivery publication ref is not a commit.", "publication-ref-invalid");
+  }
+  const message = (await runGit(["show", "-s", "--format=%B", revision], {
+    ...options,
+    cwd: repository,
+  })).stdoutText.split(/\r?\n/);
+  if (
+    !message.includes(`Codex-Assignment-ID: ${record.assignment_id}`) ||
+    !message.includes(`Codex-Candidate-ID: ${record.candidate.candidate_id}`)
+  ) {
+    throw new GitWorkspaceError("Delivery commit does not belong to this candidate.", "publication-ref-invalid");
+  }
+  const parentRevision = (await runGit(["rev-parse", `${revision}^`], {
+    ...options,
+    cwd: repository,
+  })).stdoutText.trim().toLowerCase();
+  const paths = parseNullSeparatedPaths((await runGit(
+    ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", parentRevision, revision],
+    { ...options, cwd: repository },
+  )).stdout);
+  if (!normalizedPathsEqual(paths, record.candidate.changed_paths, options.platform ?? process.platform)) {
+    throw new GitWorkspaceError("Delivery commit contains paths outside the candidate.", "publication-ref-invalid");
+  }
+  const content = await runGit(
+    ["diff", "--quiet", record.candidate.candidate_revision, revision, "--", ...record.candidate.changed_paths],
+    { ...options, cwd: repository, allowFailure: true },
+  );
+  if (content.exitCode !== 0) {
+    throw new GitWorkspaceError("Delivery commit content differs from the candidate.", "publication-ref-invalid");
+  }
+  return {
+    candidate_id: record.candidate.candidate_id,
+    commit_revision: revision,
+    parent_revision: parentRevision,
+    branch_ref: branchRef,
+    publication_ref: deliveryPublicationRef(record),
+  };
+}
+
+async function synchronizeDeliveryIndex(record, revision, repository, options) {
+  await runGit(["reset", "--mixed", revision, "--", ...record.candidate.changed_paths], {
+    ...options,
+    cwd: repository,
+  });
+  const cached = await runGit(["diff", "--cached", "--quiet", "--", ...record.candidate.changed_paths], {
+    ...options,
+    cwd: repository,
+    allowFailure: true,
+  });
+  const working = await runGit(["diff", "--quiet", "--", ...record.candidate.changed_paths], {
+    ...options,
+    cwd: repository,
+    allowFailure: true,
+  });
+  if (cached.exitCode !== 0 || working.exitCode !== 0) {
+    throw new GitWorkspaceError("Delivery commit could not synchronize the candidate paths.", "delivery-index-sync-failed");
+  }
+}
+
+export async function commitIntegratedCandidate(record, targetCwd, options = {}) {
+  if (record.candidate === null || record.integration === null || !new Set(["commit", "push"]).has(record.delivery?.mode)) {
+    throw new GitWorkspaceError("Assignment is not ready for automatic commit delivery.", "delivery-not-ready");
+  }
+  const target = await inspectGitRepository(targetCwd, options);
+  if (resolve(target.repository) !== resolve(record.repository)) {
+    throw new GitWorkspaceError("Commit target belongs to another repository.", "repository-mismatch");
+  }
+  const branchRef = await currentBranchRef(target.repository, options);
+  await assertConfiguredPushDestination(record, target.repository, branchRef, options);
+  const publicationRef = deliveryPublicationRef(record);
+  const existing = await runGit(["rev-parse", "--verify", publicationRef], {
+    ...options,
+    cwd: target.repository,
+    allowFailure: true,
+  });
+  if (existing.exitCode === 0) {
+    const revision = existing.stdoutText.trim().toLowerCase();
+    const evidence = await inspectPublicationCommit(record, revision, branchRef, options);
+    const branchRevision = (await runGit(["rev-parse", branchRef], {
+      ...options,
+      cwd: target.repository,
+    })).stdoutText.trim().toLowerCase();
+    if (branchRevision === revision) {
+      await synchronizeDeliveryIndex(record, revision, target.repository, options);
+    } else {
+      const ancestor = await runGit(["merge-base", "--is-ancestor", revision, branchRevision], {
+        ...options,
+        cwd: target.repository,
+        allowFailure: true,
+      });
+      if (ancestor.exitCode !== 0) {
+        throw new GitWorkspaceError("Delivery branch diverged from the recorded commit.", "publication-branch-diverged");
+      }
+    }
+    return { ...evidence, idempotent: true };
+  }
+  const candidatePaths = record.candidate.changed_paths;
+  const staged = await runGit(["diff", "--cached", "--quiet", "--", ...candidatePaths], {
+    ...options,
+    cwd: target.repository,
+    allowFailure: true,
+  });
+  if (staged.exitCode !== 0) {
+    throw new GitWorkspaceError("Candidate paths contain staged changes before delivery.", "delivery-index-dirty");
+  }
+  for (const path of candidatePaths) {
+    const changed = await runGit(["diff", "--quiet", record.base_revision, target.head, "--", path], {
+      ...options,
+      cwd: target.repository,
+      allowFailure: true,
+    });
+    if (changed.exitCode !== 0) {
+      throw new GitWorkspaceError(`Delivery path changed in HEAD after assignment base: ${path}`, "delivery-stale-path");
+    }
+  }
+  const patch = await runGit(
+    ["diff", "--binary", "--full-index", record.base_revision, record.candidate.candidate_revision],
+    { ...options, cwd: target.repository },
+  );
+  if (sha256(patch.stdout) !== record.candidate.diff_sha256) {
+    throw new GitWorkspaceError("Candidate diff failed delivery integrity validation.", "candidate-integrity-failed");
+  }
+  const state = await getRepositoryState(record.repository, options);
+  await ensureWorktreesDirectory(state);
+  const temporaryIndex = join(
+    state.worktreesDirectory,
+    `.delivery-index-${record.assignment_id.replaceAll("-", "").slice(0, 12)}-${record.attempt}-${randomUUID().replaceAll("-", "").slice(0, 8)}`,
+  );
+  const environment = { ...(options.environment ?? process.env), GIT_INDEX_FILE: temporaryIndex };
+  try {
+    await runGit(["read-tree", record.candidate.candidate_revision], {
+      ...options,
+      cwd: target.repository,
+      environment,
+    });
+    const candidateTrackedPaths = parseNullSeparatedPaths((await runGit(
+      ["ls-files", "-z", "--", ...candidatePaths],
+      { ...options, cwd: target.repository, environment },
+    )).stdout);
+    const trackedPathSet = normalizedSet(candidateTrackedPaths, options.platform ?? process.platform);
+    const unexpectedPaths = [];
+    for (const path of candidatePaths) {
+      if (
+        !trackedPathSet.has(normalizedPath(path, options.platform ?? process.platform)) &&
+        (await getEntry(resolveContainedPath(target.repository, path))) !== null
+      ) {
+        unexpectedPaths.push(path);
+      }
+    }
+    const capture = candidateTrackedPaths.length === 0
+      ? { exitCode: 0 }
+      : await runGit(["add", "-A", "--", ...candidateTrackedPaths], {
+          ...options,
+          cwd: target.repository,
+          environment,
+          allowFailure: true,
+        });
+    const expectedCandidateTree = (await runGit(
+      ["rev-parse", `${record.candidate.candidate_revision}^{tree}`],
+      { ...options, cwd: target.repository },
+    )).stdoutText.trim().toLowerCase();
+    const capturedCandidateTree = capture.exitCode === 0
+      ? (await runGit(["write-tree"], {
+          ...options,
+          cwd: target.repository,
+          environment,
+        })).stdoutText.trim().toLowerCase()
+      : null;
+    if (unexpectedPaths.length > 0 || capturedCandidateTree !== expectedCandidateTree) {
+      throw new GitWorkspaceError(
+        "Integrated candidate paths changed before delivery.",
+        "delivery-path-dirty",
+        {
+          capture_failed: capture.exitCode !== 0,
+          tree_mismatch: capturedCandidateTree !== expectedCandidateTree,
+          unexpected_paths: unexpectedPaths,
+        },
+      );
+    }
+    await runGit(["read-tree", target.head], { ...options, cwd: target.repository, environment });
+    await runGit(["apply", "--cached", "--binary", "-"], {
+      ...options,
+      cwd: target.repository,
+      environment,
+      input: patch.stdout,
+    });
+    const tree = (await runGit(["write-tree"], {
+      ...options,
+      cwd: target.repository,
+      environment,
+    })).stdoutText.trim().toLowerCase();
+    const committedPaths = parseNullSeparatedPaths((await runGit(
+      ["diff", "--name-only", "-z", target.head, tree],
+      { ...options, cwd: target.repository },
+    )).stdout);
+    if (!normalizedPathsEqual(committedPaths, candidatePaths, options.platform ?? process.platform)) {
+      throw new GitWorkspaceError("Automatic commit tree differs from the candidate path set.", "delivery-tree-mismatch");
+    }
+    const commitMessage = [
+      record.delivery.commit_message,
+      "",
+      `Codex-Assignment-ID: ${record.assignment_id}`,
+      `Codex-Candidate-ID: ${record.candidate.candidate_id}`,
+      "",
+    ].join("\n");
+    const commitRevision = (await runGit(["commit-tree", tree, "-p", target.head], {
+      ...options,
+      cwd: target.repository,
+      environment,
+      input: commitMessage,
+    })).stdoutText.trim().toLowerCase();
+    const refUpdate = await runGit(
+      ["update-ref", publicationRef, commitRevision, "0".repeat(commitRevision.length)],
+      { ...options, cwd: target.repository, allowFailure: true },
+    );
+    if (refUpdate.exitCode !== 0) {
+      throw new GitWorkspaceError("Delivery publication ref already exists.", "publication-ref-exists");
+    }
+    const branchUpdate = await runGit(["update-ref", branchRef, commitRevision, target.head], {
+      ...options,
+      cwd: target.repository,
+      allowFailure: true,
+    });
+    if (branchUpdate.exitCode !== 0) {
+      throw new GitWorkspaceError("Delivery branch moved while the commit was being published.", "publication-branch-diverged");
+    }
+    await synchronizeDeliveryIndex(record, commitRevision, target.repository, options);
+    return inspectPublicationCommit(record, commitRevision, branchRef, options);
+  } finally {
+    await rm(temporaryIndex, { force: true });
+  }
+}
+
+async function remoteBranchRevision(remote, remoteRef, repository, options) {
+  const environment = {
+    ...(options.environment ?? process.env),
+    GIT_TERMINAL_PROMPT: "0",
+    GCM_INTERACTIVE: "Never",
+  };
+  const result = await runGit(["ls-remote", "--refs", remote, remoteRef], {
+    ...options,
+    cwd: repository,
+    environment,
+  });
+  const lines = result.stdoutText.trim().split(/\r?\n/).filter((line) => line.length > 0);
+  if (lines.length !== 1) {
+    throw new GitWorkspaceError("Automatic push requires one existing remote branch.", "remote-branch-missing");
+  }
+  const [revision, ref] = lines[0].split(/\s+/);
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(revision) || ref !== remoteRef) {
+    throw new GitWorkspaceError("Remote branch returned an invalid revision.", "remote-branch-invalid");
+  }
+  return revision.toLowerCase();
+}
+
+async function fetchRemoteRevision(remote, remoteRef, repository, options) {
+  const environment = {
+    ...(options.environment ?? process.env),
+    GIT_TERMINAL_PROMPT: "0",
+    GCM_INTERACTIVE: "Never",
+  };
+  await runGit(["fetch", "--no-tags", "--quiet", remote, remoteRef], {
+    ...options,
+    cwd: repository,
+    environment,
+  });
+  return (await runGit(["rev-parse", "FETCH_HEAD"], {
+    ...options,
+    cwd: repository,
+  })).stdoutText.trim().toLowerCase();
+}
+
+export async function pushCommittedCandidate(record, targetCwd, options = {}) {
+  if (record.delivery?.mode !== "push" || record.delivery.commit === null || record.candidate === null) {
+    throw new GitWorkspaceError("Assignment is not ready for automatic push delivery.", "delivery-not-ready");
+  }
+  const target = await inspectGitRepository(targetCwd, options);
+  if (resolve(target.repository) !== resolve(record.repository)) {
+    throw new GitWorkspaceError("Push target belongs to another repository.", "repository-mismatch");
+  }
+  const branchRef = await currentBranchRef(target.repository, options);
+  await assertConfiguredPushDestination(record, target.repository, branchRef, options);
+  const commitRevision = record.delivery.commit.commit_revision;
+  const localContains = await runGit(["merge-base", "--is-ancestor", commitRevision, target.head], {
+    ...options,
+    cwd: target.repository,
+    allowFailure: true,
+  });
+  if (localContains.exitCode !== 0) {
+    throw new GitWorkspaceError("Delivery commit is not reachable from the checked-out branch.", "delivery-commit-unreachable");
+  }
+  const remoteRef = `refs/heads/${record.delivery.branch}`;
+  let remoteBefore = await remoteBranchRevision(
+    record.delivery.remote,
+    remoteRef,
+    target.repository,
+    options,
+  );
+  if (remoteBefore === commitRevision) {
+    return {
+      candidate_id: record.candidate.candidate_id,
+      commit_revision: commitRevision,
+      remote: record.delivery.remote,
+      branch: record.delivery.branch,
+      remote_ref: remoteRef,
+      remote_revision_before: remoteBefore,
+      remote_revision_after: remoteBefore,
+      idempotent: true,
+    };
+  }
+  remoteBefore = await fetchRemoteRevision(
+    record.delivery.remote,
+    remoteRef,
+    target.repository,
+    options,
+  );
+  const alreadyPublished = await runGit(["merge-base", "--is-ancestor", commitRevision, remoteBefore], {
+    ...options,
+    cwd: target.repository,
+    allowFailure: true,
+  });
+  if (alreadyPublished.exitCode === 0) {
+    return {
+      candidate_id: record.candidate.candidate_id,
+      commit_revision: commitRevision,
+      remote: record.delivery.remote,
+      branch: record.delivery.branch,
+      remote_ref: remoteRef,
+      remote_revision_before: remoteBefore,
+      remote_revision_after: remoteBefore,
+      idempotent: true,
+    };
+  }
+  const parentPublished = await runGit(
+    ["merge-base", "--is-ancestor", record.delivery.commit.parent_revision, remoteBefore],
+    {
+      ...options,
+      cwd: target.repository,
+      allowFailure: true,
+    },
+  );
+  if (parentPublished.exitCode !== 0) {
+    throw new GitWorkspaceError(
+      "Remote branch does not contain the delivery commit parent.",
+      "push-parent-not-published",
+    );
+  }
+  const fastForward = await runGit(["merge-base", "--is-ancestor", remoteBefore, commitRevision], {
+    ...options,
+    cwd: target.repository,
+    allowFailure: true,
+  });
+  if (fastForward.exitCode !== 0) {
+    throw new GitWorkspaceError("Remote branch diverged from the delivery commit.", "push-non-fast-forward");
+  }
+  const environment = {
+    ...(options.environment ?? process.env),
+    GIT_TERMINAL_PROMPT: "0",
+    GCM_INTERACTIVE: "Never",
+  };
+  await runGit(
+    ["push", "--porcelain", record.delivery.remote, `${commitRevision}:${remoteRef}`],
+    { ...options, cwd: target.repository, environment },
+  );
+  const remoteAfter = await remoteBranchRevision(
+    record.delivery.remote,
+    remoteRef,
+    target.repository,
+    options,
+  );
+  if (remoteAfter !== commitRevision) {
+    const fetchedAfter = await fetchRemoteRevision(
+      record.delivery.remote,
+      remoteRef,
+      target.repository,
+      options,
+    );
+    const contains = await runGit(["merge-base", "--is-ancestor", commitRevision, fetchedAfter], {
+      ...options,
+      cwd: target.repository,
+      allowFailure: true,
+    });
+    if (contains.exitCode !== 0) {
+      throw new GitWorkspaceError("Remote branch does not contain the delivery commit.", "push-verification-failed");
+    }
+  }
+  return {
+    candidate_id: record.candidate.candidate_id,
+    commit_revision: commitRevision,
+    remote: record.delivery.remote,
+    branch: record.delivery.branch,
+    remote_ref: remoteRef,
+    remote_revision_before: remoteBefore,
+    remote_revision_after: remoteAfter,
   };
 }
 

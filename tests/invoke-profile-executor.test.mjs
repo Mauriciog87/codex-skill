@@ -126,6 +126,10 @@ test("parseArguments requires a profile and applies safe defaults", () => {
     allowSymlinks: false,
     allowSubmodules: false,
     candidateId: null,
+    deliveryMode: "manual",
+    commitMessage: null,
+    pushRemote: null,
+    pushBranch: null,
   });
   assert.throws(() => parseArguments([], baseDirectory), ExecutorInvocationError);
 });
@@ -167,8 +171,35 @@ test("parseArguments accepts supported profile-specific options", () => {
       allowSymlinks: false,
       allowSubmodules: false,
       candidateId: null,
+      deliveryMode: "manual",
+      commitMessage: null,
+      pushRemote: null,
+      pushBranch: null,
     },
   );
+});
+
+test("parseArguments accepts explicit automatic push delivery", () => {
+  const parsed = parseArguments([
+    "--profile",
+    "implement",
+    "--sandbox",
+    "workspace-write",
+    "--write-root",
+    "src",
+    "--delivery",
+    "push",
+    "--commit-message",
+    "feat: publish validated candidate",
+    "--push-remote",
+    "origin",
+    "--push-branch",
+    "master",
+  ]);
+  assert.equal(parsed.deliveryMode, "push");
+  assert.equal(parsed.commitMessage, "feat: publish validated candidate");
+  assert.equal(parsed.pushRemote, "origin");
+  assert.equal(parsed.pushBranch, "master");
 });
 
 test("parseArguments rejects unsafe, ambiguous, and mismatched invocations", () => {
@@ -182,6 +213,8 @@ test("parseArguments rejects unsafe, ambiguous, and mismatched invocations", () 
     ["--profile", "playwright", "--sandbox", "workspace-write"],
     ["--profile", "implement-lite"],
     ["--profile", "implement"],
+    ["--profile", "implement", "--sandbox", "workspace-write", "--write-root", "src", "--delivery", "push"],
+    ["--profile", "explore", "--delivery", "commit", "--commit-message", "feat: invalid"],
     ["--profile", "explore", "--timeout-seconds", "0"],
     ["--profile", "explore", "--unknown", "value"],
   ]) {

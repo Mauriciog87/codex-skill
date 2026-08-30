@@ -28,11 +28,11 @@ The briefing is read from stdin. The profile fixes model, reasoning effort, tier
 
 ## Durable control plane
 
-Control plane v2 and result format v2 are the defaults. Every assignment binds the base revision, allowed and forbidden write roots, required checks, artifacts, review policy, and operator approval policy. State transitions require an action id, exact state revision, and authorized actor. Replays are idempotent; stale revisions, changed action replays, overlapping writer leases, and stale Ultra generations fail closed.
+Control plane v2 and result format v2 are the defaults. Every assignment binds the base revision, allowed and forbidden write roots, required checks, artifacts, review policy, operator approval policy, and an explicit `manual`, `commit`, or `push` delivery policy. State transitions require an action id, exact state revision, and authorized actor. Replays are idempotent; stale revisions, changed action replays, overlapping writer leases, and stale Ultra generations fail closed.
 
-Writer profiles run in controller-created detached worktrees outside the repository. Executors never stage, commit, change HEAD, create branches, or push. The controller validates actual Git changes and declared artifacts, runs required checks without a shell, creates an immutable candidate ref, and leaves final integration unstaged in the main checkout. Only root or Ultra may claim, approve, integrate, acknowledge, archive, or retry a writer assignment. Independent `review` runs against the exact candidate revision. Operator questions and approvals are never inferred.
+Writer profiles run in controller-created detached worktrees outside the repository. Executors never stage, commit, change HEAD, create branches, or push. The controller validates actual Git changes and declared artifacts, runs required checks without a shell, and creates an immutable candidate ref. Delivery defaults to unstaged manual integration. An opted-in controller delivery may commit only the exact integrated candidate and may push it only to the declared existing remote branch with a normal fast-forward push; it never force-pushes. Only root or Ultra may claim, approve, integrate, acknowledge, archive, or retry a writer assignment. Independent `review` runs against the exact candidate revision. Operator questions and approvals are never inferred.
 
-Use `orchestration-control.mjs status|next|reconcile` for residual work and its revision-fenced mutation commands for claim, review, approval, integration, acknowledgement, answers, retry, abandonment, archival, and cleanup. The local dashboard is projection-only, loopback-bound, one-time authenticated, CSRF protected, and limited to operator answers and approvals. The deterministic simulator mutates neither Git nor durable state.
+Use `orchestration-control.mjs status|next|reconcile` for residual work and its revision-fenced mutation commands for claim, review, approval, integration, commit delivery, push delivery, acknowledgement, answers, delivery retry, assignment retry, abandonment, archival, and cleanup. A failed automatic delivery enters `delivery_blocked` and requires an explicit retry; the controller does not loop blindly. The local dashboard is projection-only, loopback-bound, one-time authenticated, CSRF protected, and limited to operator answers, approvals, and delivery retries. The deterministic simulator mutates neither Git nor durable state.
 
 ## Concurrency
 
@@ -75,7 +75,7 @@ node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs recove
 5. Use `playwright` for isolated browser evidence and authorized test interactions.
 6. Use `implement` for bounded changes needing stronger engineering judgment.
 7. Use `review` for independent critique of a named plan or high-risk Git change.
-8. Claim the durable result, bind review and approval to its candidate id, integrate only after every gate passes, then acknowledge and clean the worktree.
+8. Claim the durable result, bind review and approval to its candidate id, integrate only after every gate passes, complete its declared delivery, then acknowledge and clean the worktree.
 9. Inspect executor evidence instead of repeating discovery unless verification requires it.
 10. Request Ultra only for an explicit exceptional reason and pause while it owns the repository.
 

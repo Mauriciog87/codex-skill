@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -20,7 +20,10 @@ import {
   rootsOverlap,
   validateAssignmentRequest,
 } from "../.agents/skills/sol-luna-orchestration/scripts/control-plane.mjs";
-import { acquireUltraLock } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
+import {
+  acquireUltraLock,
+  getRepositoryState,
+} from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
 import { reconcileReviewAssignment } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-control.mjs";
 
 async function createFixture() {
@@ -108,6 +111,12 @@ test("assignment contracts bind profile capabilities and require writer roots", 
   assert.equal(validated.writer, true);
   assert.equal(validated.workspace_strategy, "isolated-worktree");
   assert.ok(validated.capabilities.includes("workspace-write"));
+  assert.deepEqual(validated.delivery, {
+    mode: "manual",
+    commit_message: null,
+    remote: null,
+    branch: null,
+  });
   assert.throws(
     () => validateAssignmentRequest(request({ allowed_write_roots: [] })),
     /require at least one allowed_write_root/,
@@ -120,6 +129,64 @@ test("assignment contracts bind profile capabilities and require writer roots", 
     () => validateAssignmentRequest(request({ allowed_write_root: ["src"] })),
     /unexpected properties/,
   );
+});
+
+test("automatic delivery requires an explicit writer destination and commit message", () => {
+  const delivery = {
+    mode: "push",
+    commit_message: "feat: publish validated candidate",
+    remote: "origin",
+    branch: "master",
+  };
+  assert.deepEqual(validateAssignmentRequest(request({ delivery })).delivery, delivery);
+  for (const invalid of [
+    { mode: "push", commit_message: "feat: publish", remote: "origin" },
+    { mode: "push", commit_message: "feat: publish", remote: "-origin", branch: "master" },
+    { mode: "push", commit_message: "feat: publish", remote: "origin", branch: "feature//invalid" },
+    { mode: "push", commit_message: "feat: publish", remote: "origin", branch: "feature/.hidden" },
+    { mode: "push", commit_message: "feat: publish", remote: "origin", branch: "feature/release.lock" },
+    { mode: "commit", commit_message: "feat: publish", remote: "origin", branch: null },
+    { mode: "manual", commit_message: "unexpected", remote: null, branch: null },
+  ]) {
+    assert.throws(() => validateAssignmentRequest(request({ delivery: invalid })), ControlPlaneError);
+  }
+  assert.throws(
+    () => validateAssignmentRequest(request({
+      profile: "explore",
+      allowed_write_roots: [],
+      delivery,
+    })),
+    /Only workspace-write assignments may publish/,
+  );
+});
+
+test("persisted assignments without delivery remain backward-compatible manual work", async () => {
+  const fixture = await createFixture();
+  try {
+    const created = await createAssignment({
+      cwd: fixture.repository,
+      request: request(),
+      briefing: "Legacy assignment.",
+      ...fixture.options,
+    });
+    const state = await getRepositoryState(fixture.repository, fixture.options);
+    const recordPath = join(state.assignmentsDirectory, created.assignment_id, "record.json");
+    const persisted = JSON.parse(await readFile(recordPath, "utf8"));
+    delete persisted.delivery;
+    await writeFile(recordPath, `${JSON.stringify(persisted)}\n`, "utf8");
+    const restored = await readAssignment(fixture.repository, created.assignment_id, fixture.options);
+    assert.deepEqual(restored.delivery, {
+      mode: "manual",
+      commit_message: null,
+      remote: null,
+      branch: null,
+      commit: null,
+      push: null,
+      last_error: null,
+    });
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
 });
 
 test("root lifecycle requires claim, candidate approval, integration, and acknowledgement", async () => {
@@ -155,6 +222,113 @@ test("root lifecycle requires claim, candidate approval, integration, and acknow
     record = await transition(fixture, record, "acknowledge_assignment", "root");
     assert.equal(record.state, "acknowledged");
     assert.equal(record.resource_lease_active, false);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("push delivery cannot acknowledge until the exact commit and remote publication are recorded", async () => {
+  const fixture = await createFixture();
+  try {
+    let record = await createAssignment({
+      cwd: fixture.repository,
+      request: request({
+        delivery: {
+          mode: "push",
+          commit_message: "feat: publish validated candidate",
+          remote: "origin",
+          branch: "master",
+        },
+      }),
+      briefing: "Implement and publish the bounded change.",
+      ...fixture.options,
+    });
+    record = await transition(fixture, record, "start_assignment", "root", {
+      workspace: { path: join(fixture.root, "worktree"), cleaned: false },
+    });
+    const publishedCandidate = candidate(record);
+    record = await transition(fixture, record, "publish_result", "executor", {
+      result: result(),
+      candidate: publishedCandidate,
+      operator_requests: [],
+    });
+    record = await transition(fixture, record, "claim_result", "root");
+    record = await transition(fixture, record, "approve_candidate", "root", {
+      candidate_id: publishedCandidate.candidate_id,
+      kind: "root",
+    });
+    record = await transition(fixture, record, "integrate_candidate", "root", {
+      candidate_id: publishedCandidate.candidate_id,
+      target_revision_before: "a".repeat(40),
+      applied_diff_sha256: publishedCandidate.diff_sha256,
+    });
+    assert.equal(record.state, "commit_pending");
+    await assert.rejects(
+      transition(fixture, record, "acknowledge_assignment", "root"),
+      /cannot run while/,
+    );
+    record = await transition(fixture, record, "record_commit", "root", {
+      candidate_id: publishedCandidate.candidate_id,
+      commit_revision: "1".repeat(40),
+      parent_revision: "a".repeat(40),
+      branch_ref: "refs/heads/master",
+      publication_ref: `refs/codex-orchestration/deliveries/${record.assignment_id}/${record.attempt}`,
+    });
+    assert.equal(record.state, "push_pending");
+    record = await transition(fixture, record, "record_push", "root", {
+      candidate_id: publishedCandidate.candidate_id,
+      commit_revision: "1".repeat(40),
+      remote: "origin",
+      branch: "master",
+      remote_ref: "refs/heads/master",
+      remote_revision_before: "a".repeat(40),
+      remote_revision_after: "1".repeat(40),
+    });
+    assert.equal(record.state, "published");
+    record = await transition(fixture, record, "acknowledge_assignment", "root");
+    assert.equal(record.state, "acknowledged");
+    assert.equal(record.delivery.commit.commit_revision, "1".repeat(40));
+    assert.equal(record.delivery.push.remote_revision_after, "1".repeat(40));
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("delivery failures stop automatic retries until an operator explicitly resumes them", async () => {
+  const fixture = await createFixture();
+  try {
+    let record = await createAssignment({
+      cwd: fixture.repository,
+      request: request({
+        delivery: {
+          mode: "commit",
+          commit_message: "feat: publish validated candidate",
+          remote: null,
+          branch: null,
+        },
+      }),
+      briefing: "Implement and commit the bounded change.",
+      ...fixture.options,
+    });
+    record = { ...record, state: "commit_pending", resource_lease_active: true };
+    record = reduceAssignment(
+      record,
+      createAction({
+        op: "block_delivery",
+        authority: "root",
+        record,
+        payload: { phase: "commit", error_code: "git-command-failed", summary: "Automatic commit failed." },
+      }),
+    );
+    assert.equal(record.state, "delivery_blocked");
+    assert.equal(planResidualActions([record]).mechanical.length, 0);
+    assert.equal(planResidualActions([record]).attention[0].kind, "delivery-blocked");
+    record = reduceAssignment(
+      record,
+      createAction({ op: "retry_delivery", authority: "operator", record }),
+    );
+    assert.equal(record.state, "commit_pending");
+    assert.equal(planResidualActions([record]).mechanical[0].op, "commit_candidate");
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

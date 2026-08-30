@@ -41,8 +41,23 @@ function createGenerator(seed) {
   };
 }
 
-function makeRecord(index, { reviewPolicy, operatorApprovalRequired, writer = true }) {
+function makeRecord(index, { reviewPolicy, operatorApprovalRequired, writer = true, deliveryMode = "manual" }) {
   const profile = writer ? "implement" : "explore";
+  const delivery = deliveryMode === "push"
+    ? {
+        mode: "push",
+        commit_message: "feat: publish simulated candidate",
+        remote: "origin",
+        branch: "master",
+      }
+    : deliveryMode === "commit"
+      ? {
+          mode: "commit",
+          commit_message: "feat: commit simulated candidate",
+          remote: null,
+          branch: null,
+        }
+      : { mode: "manual" };
   const contract = validateAssignmentRequest({
     profile,
     base_revision: "a".repeat(40),
@@ -53,6 +68,7 @@ function makeRecord(index, { reviewPolicy, operatorApprovalRequired, writer = tr
     artifacts: [],
     review_policy: reviewPolicy,
     operator_approval_required: operatorApprovalRequired,
+    delivery,
   });
   const timestamp = "2026-01-01T00:00:00.000Z";
   return {
@@ -79,6 +95,12 @@ function makeRecord(index, { reviewPolicy, operatorApprovalRequired, writer = tr
     operator_approval_required: contract.operator_approval_required,
     allow_symlinks: contract.allow_symlinks,
     allow_submodules: contract.allow_submodules,
+    delivery: {
+      ...contract.delivery,
+      commit: null,
+      push: null,
+      last_error: null,
+    },
     parent_assignment_id: null,
     review_target_candidate_id: null,
     lock_id: null,
@@ -142,6 +164,14 @@ function validateRecordInvariants(before, after) {
   if (after.integration !== null) {
     requireInvariant(after.candidate !== null, "An integration exists without a candidate.");
     requireInvariant(after.integration.candidate_id === after.candidate.candidate_id, "Integration is bound to another candidate.");
+  }
+  if (after.delivery.commit !== null) {
+    requireInvariant(after.candidate !== null, "A delivery commit exists without a candidate.");
+    requireInvariant(after.delivery.commit.candidate_id === after.candidate.candidate_id, "Delivery commit is bound to another candidate.");
+  }
+  if (after.delivery.push !== null) {
+    requireInvariant(after.delivery.commit !== null, "A push exists without a delivery commit.");
+    requireInvariant(after.delivery.push.commit_revision === after.delivery.commit.commit_revision, "Push revision differs from the delivery commit.");
   }
   if (["acknowledged", "abandoned"].includes(after.state)) {
     requireInvariant(after.resource_lease_active === false, "A terminal assignment retained its resource lease.");
@@ -213,6 +243,27 @@ function completeAssignment(engine, { withCandidate = true } = {}) {
     target_revision_before: engine.record.base_revision,
     applied_diff_sha256: candidate.diff_sha256,
   });
+  if (engine.record.delivery.mode !== "manual") {
+    const commitRevision = sha256(`commit:${candidate.candidate_id}`).slice(0, 40);
+    engine.apply("record_commit", "root", {
+      candidate_id: candidate.candidate_id,
+      commit_revision: commitRevision,
+      parent_revision: engine.record.base_revision,
+      branch_ref: "refs/heads/master",
+      publication_ref: `refs/codex-orchestration/deliveries/${engine.record.assignment_id}/${engine.record.attempt}`,
+    });
+    if (engine.record.delivery.mode === "push") {
+      engine.apply("record_push", "root", {
+        candidate_id: candidate.candidate_id,
+        commit_revision: commitRevision,
+        remote: "origin",
+        branch: "master",
+        remote_ref: "refs/heads/master",
+        remote_revision_before: engine.record.base_revision,
+        remote_revision_after: commitRevision,
+      });
+    }
+  }
   engine.apply("acknowledge_assignment", "root");
 }
 
@@ -314,10 +365,12 @@ export function simulateControlPlane({ iterations = DEFAULT_ITERATIONS, seed = D
     operator_approval: 0,
     blocked_retry: 0,
     recovery: 0,
+    commit_delivery: 0,
+    push_delivery: 0,
   };
   let transitions = 0;
   for (let index = 0; index < iterations; index += 1) {
-    const choice = Math.floor(random() * 6);
+    const choice = Math.floor(random() * 8);
     let engine;
     if (choice === 0) {
       engine = createEngine(index, { reviewPolicy: "root", operatorApprovalRequired: false, writer: true });
@@ -339,9 +392,27 @@ export function simulateControlPlane({ iterations = DEFAULT_ITERATIONS, seed = D
     } else if (choice === 4) {
       engine = simulateBlockedRetry(index);
       scenarioCounts.blocked_retry += 1;
-    } else {
+    } else if (choice === 5) {
       engine = simulateRecovery(index);
       scenarioCounts.recovery += 1;
+    } else if (choice === 6) {
+      engine = createEngine(index, {
+        reviewPolicy: "root",
+        operatorApprovalRequired: false,
+        writer: true,
+        deliveryMode: "commit",
+      });
+      completeAssignment(engine);
+      scenarioCounts.commit_delivery += 1;
+    } else {
+      engine = createEngine(index, {
+        reviewPolicy: "root",
+        operatorApprovalRequired: false,
+        writer: true,
+        deliveryMode: "push",
+      });
+      completeAssignment(engine);
+      scenarioCounts.push_delivery += 1;
     }
     requireInvariant(engine.record.state === "acknowledged", "A successful scenario did not terminate in acknowledged.");
     transitions += engine.record.state_revision;

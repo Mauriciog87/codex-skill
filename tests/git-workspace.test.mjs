@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,11 +9,13 @@ import {
   GitWorkspaceError,
   assertMainCheckoutCompatible,
   cleanupAssignmentWorktree,
+  commitIntegratedCandidate,
   createAssignmentWorktree,
   createCandidate,
   inspectGitRepository,
   integrateCandidate,
   parsePorcelainV2,
+  pushCommittedCandidate,
   readWorkspaceStatus,
   runGit,
   runRequiredChecks,
@@ -34,6 +36,9 @@ async function createRepositoryFixture() {
     ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "initial"],
     { cwd: repository },
   );
+  await runGit(["branch", "-M", "master"], { cwd: repository });
+  await runGit(["config", "user.name", "Test"], { cwd: repository });
+  await runGit(["config", "user.email", "test@localhost"], { cwd: repository });
   const options = {
     environment: { ...process.env, HOME: home, CODEX_HOME: join(home, ".codex") },
     homeDirectory: home,
@@ -61,6 +66,29 @@ async function createWriterAssignment(fixture, overrides = {}) {
       ...overrides,
     },
   });
+}
+
+async function prepareIntegratedCandidate(fixture, delivery) {
+  let record = await createWriterAssignment(fixture, { delivery });
+  const workspace = await createAssignmentWorktree(record, fixture.options);
+  record = { ...record, workspace };
+  await writeFile(join(workspace.path, "src", "value.txt"), "candidate\n", "utf8");
+  const created = await createCandidate(record, workspace.path, {
+    ...fixture.options,
+    reportedChangedFiles: ["src/value.txt"],
+    checkResults: [],
+  });
+  record = { ...record, candidate: created.candidate };
+  const integration = await integrateCandidate(record, fixture.repository, fixture.options);
+  return {
+    ...record,
+    state: "commit_pending",
+    integration: {
+      candidate_id: created.candidate.candidate_id,
+      target_revision_before: integration.target_revision_before,
+      applied_diff_sha256: integration.applied_diff_sha256,
+    },
+  };
 }
 
 test("porcelain v2 parser retains both sides of renames", () => {
@@ -263,6 +291,192 @@ test("short Windows-safe worktree roots retain the full repository identity", as
       (error) => error instanceof GitWorkspaceError && error.code === "worktree-root-collision",
     );
   } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("automatic delivery commits only the candidate paths and preserves unrelated staged work", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    const remote = join(fixture.root, "remote.git");
+    await runGit(["init", "--bare", remote], { cwd: fixture.root });
+    await runGit(["remote", "add", "origin", remote], { cwd: fixture.repository });
+    await runGit(["push", "origin", "HEAD:refs/heads/master"], { cwd: fixture.repository });
+    let record = await prepareIntegratedCandidate(fixture, {
+      mode: "push",
+      commit_message: "feat: publish validated candidate",
+      remote: "origin",
+      branch: "master",
+    });
+    await writeFile(join(fixture.repository, "outside.txt"), "staged outside\n", "utf8");
+    await runGit(["add", "outside.txt"], { cwd: fixture.repository });
+    const committed = await commitIntegratedCandidate(record, fixture.repository, fixture.options);
+    assert.equal(committed.parent_revision, fixture.repositoryInfo.head);
+    assert.equal(committed.branch_ref, "refs/heads/master");
+    assert.equal(
+      (await runGit(["show", `${committed.commit_revision}:outside.txt`], { cwd: fixture.repository })).stdoutText,
+      "outside\n",
+    );
+    assert.equal(
+      (await runGit(["diff-tree", "--no-commit-id", "--name-only", "-r", committed.commit_revision], {
+        cwd: fixture.repository,
+      })).stdoutText.trim(),
+      "src/value.txt",
+    );
+    assert.equal(
+      (await runGit(["diff", "--cached", "--quiet", "--", "outside.txt"], {
+        cwd: fixture.repository,
+        allowFailure: true,
+      })).exitCode,
+      1,
+    );
+    assert.equal(
+      (await runGit(["diff", "--quiet", "--", "src/value.txt"], {
+        cwd: fixture.repository,
+        allowFailure: true,
+      })).exitCode,
+      0,
+    );
+    const repeatedCommit = await commitIntegratedCandidate(record, fixture.repository, fixture.options);
+    assert.equal(repeatedCommit.commit_revision, committed.commit_revision);
+    assert.equal(repeatedCommit.idempotent, true);
+    record = { ...record, state: "push_pending", delivery: { ...record.delivery, commit: committed } };
+    const pushed = await pushCommittedCandidate(record, fixture.repository, fixture.options);
+    assert.equal(pushed.remote_revision_after, committed.commit_revision);
+    const repeatedPush = await pushCommittedCandidate(record, fixture.repository, fixture.options);
+    assert.equal(repeatedPush.idempotent, true);
+    assert.equal(
+      (await runGit(["ls-remote", "origin", "refs/heads/master"], { cwd: fixture.repository })).stdoutText.split(/\s/)[0],
+      committed.commit_revision,
+    );
+  } finally {
+    await runGit(["worktree", "prune"], { cwd: fixture.repository, allowFailure: true });
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("automatic commit delivers validated additions and deletions", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    let record = await createWriterAssignment(fixture, {
+      delivery: {
+        mode: "commit",
+        commit_message: "feat: replace validated file",
+      },
+    });
+    const workspace = await createAssignmentWorktree(record, fixture.options);
+    record = { ...record, workspace };
+    await unlink(join(workspace.path, "src", "value.txt"));
+    await writeFile(join(workspace.path, "src", "replacement.txt"), "replacement\n", "utf8");
+    const created = await createCandidate(record, workspace.path, {
+      ...fixture.options,
+      reportedChangedFiles: ["src/replacement.txt", "src/value.txt"],
+      checkResults: [],
+    });
+    record = { ...record, candidate: created.candidate };
+    const integration = await integrateCandidate(record, fixture.repository, fixture.options);
+    record = {
+      ...record,
+      state: "commit_pending",
+      integration: {
+        candidate_id: created.candidate.candidate_id,
+        target_revision_before: integration.target_revision_before,
+        applied_diff_sha256: integration.applied_diff_sha256,
+      },
+    };
+    await writeFile(join(fixture.repository, "src", "replacement.txt"), "tampered\n", "utf8");
+    await assert.rejects(
+      commitIntegratedCandidate(record, fixture.repository, fixture.options),
+      (error) => error instanceof GitWorkspaceError && error.code === "delivery-path-dirty",
+    );
+    await writeFile(join(fixture.repository, "src", "replacement.txt"), "replacement\n", "utf8");
+    await writeFile(join(fixture.repository, "src", "value.txt"), "reappeared\n", "utf8");
+    await assert.rejects(
+      commitIntegratedCandidate(record, fixture.repository, fixture.options),
+      (error) => error instanceof GitWorkspaceError && error.code === "delivery-path-dirty",
+    );
+    await unlink(join(fixture.repository, "src", "value.txt"));
+    const committed = await commitIntegratedCandidate(record, fixture.repository, fixture.options);
+    assert.equal(
+      (await runGit(["show", `${committed.commit_revision}:src/replacement.txt`], {
+        cwd: fixture.repository,
+      })).stdoutText,
+      "replacement\n",
+    );
+    assert.notEqual(
+      (await runGit(["cat-file", "-e", `${committed.commit_revision}:src/value.txt`], {
+        cwd: fixture.repository,
+        allowFailure: true,
+      })).exitCode,
+      0,
+    );
+    assert.equal(
+      (await runGit(["status", "--porcelain=v1", "--", "src"], { cwd: fixture.repository })).stdoutText,
+      "",
+    );
+  } finally {
+    await runGit(["worktree", "prune"], { cwd: fixture.repository, allowFailure: true });
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("automatic push refuses to publish unrelated local parent commits", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    const remote = join(fixture.root, "remote.git");
+    await runGit(["init", "--bare", remote], { cwd: fixture.root });
+    await runGit(["remote", "add", "origin", remote], { cwd: fixture.repository });
+    await runGit(["push", "origin", "HEAD:refs/heads/master"], { cwd: fixture.repository });
+    let record = await prepareIntegratedCandidate(fixture, {
+      mode: "push",
+      commit_message: "feat: publish validated candidate",
+      remote: "origin",
+      branch: "master",
+    });
+    await writeFile(join(fixture.repository, "outside.txt"), "unpublished parent\n", "utf8");
+    await runGit(["add", "outside.txt"], { cwd: fixture.repository });
+    await runGit(["commit", "-m", "unpublished parent"], { cwd: fixture.repository });
+    const committed = await commitIntegratedCandidate(record, fixture.repository, fixture.options);
+    record = { ...record, state: "push_pending", delivery: { ...record.delivery, commit: committed } };
+    await assert.rejects(
+      pushCommittedCandidate(record, fixture.repository, fixture.options),
+      (error) => error instanceof GitWorkspaceError && error.code === "push-parent-not-published",
+    );
+  } finally {
+    await runGit(["worktree", "prune"], { cwd: fixture.repository, allowFailure: true });
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("automatic push fails closed when the remote branch diverged", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    const remote = join(fixture.root, "remote.git");
+    const other = join(fixture.root, "other");
+    await runGit(["init", "--bare", remote], { cwd: fixture.root });
+    await runGit(["remote", "add", "origin", remote], { cwd: fixture.repository });
+    await runGit(["push", "origin", "HEAD:refs/heads/master"], { cwd: fixture.repository });
+    await runGit(["clone", remote, other], { cwd: fixture.root });
+    await runGit(["config", "user.name", "Other"], { cwd: other });
+    await runGit(["config", "user.email", "other@localhost"], { cwd: other });
+    let record = await prepareIntegratedCandidate(fixture, {
+      mode: "push",
+      commit_message: "feat: publish validated candidate",
+      remote: "origin",
+      branch: "master",
+    });
+    const committed = await commitIntegratedCandidate(record, fixture.repository, fixture.options);
+    await writeFile(join(other, "outside.txt"), "remote divergence\n", "utf8");
+    await runGit(["add", "outside.txt"], { cwd: other });
+    await runGit(["commit", "-m", "remote divergence"], { cwd: other });
+    await runGit(["push", "origin", "HEAD:refs/heads/master"], { cwd: other });
+    record = { ...record, state: "push_pending", delivery: { ...record.delivery, commit: committed } };
+    await assert.rejects(
+      pushCommittedCandidate(record, fixture.repository, fixture.options),
+      (error) => error instanceof GitWorkspaceError && error.code === "push-non-fast-forward",
+    );
+  } finally {
+    await runGit(["worktree", "prune"], { cwd: fixture.repository, allowFailure: true });
     await rm(fixture.root, { recursive: true, force: true });
   }
 });

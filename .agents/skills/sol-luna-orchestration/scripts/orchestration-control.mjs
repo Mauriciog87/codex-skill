@@ -12,8 +12,11 @@ import { getExecutorProfile } from "./executor-profiles.mjs";
 import {
   archiveAssignmentWorktree,
   cleanupAssignmentWorktree,
+  commitIntegratedCandidate,
+  GitWorkspaceError,
   inspectGitRepository,
   integrateCandidate,
+  pushCommittedCandidate,
   runProcess,
 } from "./git-workspace.mjs";
 
@@ -26,6 +29,9 @@ const COMMANDS = new Set([
   "request-review",
   "approve",
   "integrate",
+  "commit-delivery",
+  "push-delivery",
+  "retry-delivery",
   "ack",
   "answer",
   "ack-answer",
@@ -148,6 +154,9 @@ export function parseControlArguments(argv, baseDirectory = process.cwd()) {
     "request-review",
     "approve",
     "integrate",
+    "commit-delivery",
+    "push-delivery",
+    "retry-delivery",
     "ack",
     "answer",
     "ack-answer",
@@ -194,6 +203,68 @@ async function applySimpleAction(options, op, payload = {}, authority = options.
       createAction({ op, authority, record, payload }),
     )
   ).record;
+}
+
+async function commitDeliveryRecord(record, authority) {
+  return (
+    await dispatchAssignmentAction(
+      record.repository,
+      createAction({
+        op: "record_commit",
+        authority,
+        record,
+        payload: { candidate_id: record.candidate?.candidate_id },
+      }),
+      { beforeTransition: async (current) => commitIntegratedCandidate(current, current.repository) },
+    )
+  ).record;
+}
+
+async function pushDeliveryRecord(record, authority) {
+  return (
+    await dispatchAssignmentAction(
+      record.repository,
+      createAction({
+        op: "record_push",
+        authority,
+        record,
+        payload: {
+          candidate_id: record.candidate?.candidate_id,
+          commit_revision: record.delivery.commit?.commit_revision,
+        },
+      }),
+      { beforeTransition: async (current) => pushCommittedCandidate(current, current.repository) },
+    )
+  ).record;
+}
+
+async function blockDeliveryRecord(record, phase, error, authority) {
+  const errorCode = error instanceof GitWorkspaceError ? error.code : "delivery-operation-failed";
+  const summary = `Automatic ${phase} failed (${errorCode}).`;
+  return (
+    await dispatchAssignmentAction(
+      record.repository,
+      createAction({
+        op: "block_delivery",
+        authority,
+        record,
+        payload: { phase, error_code: errorCode, summary },
+      }),
+    )
+  ).record;
+}
+
+function deliveryAuthority(record) {
+  if (record.lock_id === null) {
+    return "root";
+  }
+  if (
+    process.env.CODEX_ORCHESTRATION_LOCK_ID !== record.lock_id ||
+    Number(process.env.CODEX_ORCHESTRATION_GENERATION) !== record.generation
+  ) {
+    throw new ControlCliError("Ultra delivery requires the matching lock id and generation environment.");
+  }
+  return "ultra";
 }
 
 async function archiveRecord(record, authority) {
@@ -340,6 +411,40 @@ async function reconcileOnce(cwd) {
       results.push({ op: action.op, assignment_id: record.assignment_id, error: error.message });
     }
   }
+  const deliveryActions = status.planner.mechanical.filter(
+    (action) => ["commit_candidate", "push_candidate", "acknowledge_assignment"].includes(action.op),
+  );
+  for (const action of deliveryActions) {
+    let record = await readAssignment(cwd, action.assignment_id);
+    try {
+      const authority = deliveryAuthority(record);
+      if (action.op === "commit_candidate") {
+        record = await commitDeliveryRecord(record, authority);
+      } else if (action.op === "push_candidate") {
+        record = await pushDeliveryRecord(record, authority);
+      } else {
+        record = (
+          await dispatchAssignmentAction(
+            record.repository,
+            createAction({ op: "acknowledge_assignment", authority, record }),
+          )
+        ).record;
+      }
+      results.push({ op: action.op, record });
+    } catch (error) {
+      if (error instanceof GitWorkspaceError && action.op !== "acknowledge_assignment") {
+        const phase = action.op === "commit_candidate" ? "commit" : "push";
+        record = await blockDeliveryRecord(record, phase, error, deliveryAuthority(record));
+        results.push({ op: action.op, record, error: record.delivery.last_error.summary });
+      } else {
+        results.push({
+          op: action.op,
+          assignment_id: record.assignment_id,
+          error: "Automatic delivery state transition failed.",
+        });
+      }
+    }
+  }
   const cleanupActions = status.planner.mechanical.filter((action) => action.op === "cleanup_workspace");
   for (const action of cleanupActions) {
     const record = await readAssignment(cwd, action.assignment_id);
@@ -360,6 +465,28 @@ async function reconcileOnce(cwd) {
 
 async function wait(milliseconds) {
   await new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
+}
+
+function statusRevisionFingerprint(status) {
+  return status.assignments
+    .map((record) => `${record.assignment_id}:${record.state_revision}`)
+    .sort()
+    .join("|");
+}
+
+async function reconcileUntilSettled(cwd, maximumPasses = 32) {
+  const results = [];
+  let status = await getControlPlaneStatus(cwd);
+  for (let pass = 0; pass < maximumPasses && status.planner.mechanical.length > 0; pass += 1) {
+    const before = statusRevisionFingerprint(status);
+    const reconciled = await reconcileOnce(cwd);
+    results.push(...reconciled.results);
+    status = reconciled.status;
+    if (statusRevisionFingerprint(status) === before) {
+      break;
+    }
+  }
+  return { status, results };
 }
 
 export async function executeControlCommand(options) {
@@ -413,6 +540,33 @@ export async function executeControlCommand(options) {
         },
       )
     ).record;
+  }
+  if (options.command === "commit-delivery") {
+    const record = await readAssignment(options.cwd, options.assignmentId);
+    assertExpectedRevision(record, options.revision);
+    try {
+      return await commitDeliveryRecord(record, options.authority);
+    } catch (error) {
+      if (error instanceof GitWorkspaceError) {
+        return blockDeliveryRecord(record, "commit", error, options.authority);
+      }
+      throw error;
+    }
+  }
+  if (options.command === "push-delivery") {
+    const record = await readAssignment(options.cwd, options.assignmentId);
+    assertExpectedRevision(record, options.revision);
+    try {
+      return await pushDeliveryRecord(record, options.authority);
+    } catch (error) {
+      if (error instanceof GitWorkspaceError) {
+        return blockDeliveryRecord(record, "push", error, options.authority);
+      }
+      throw error;
+    }
+  }
+  if (options.command === "retry-delivery") {
+    return applySimpleAction(options, "retry_delivery");
   }
   if (options.command === "ack") {
     return applySimpleAction(options, "acknowledge_assignment");
@@ -472,13 +626,13 @@ export async function executeControlCommand(options) {
     return cleanupRecord(record, options.authority);
   }
   if (options.command === "reconcile") {
-    let result = await reconcileOnce(options.cwd);
+    let result = await reconcileUntilSettled(options.cwd);
     if (!options.watch) {
       return result;
     }
     while (true) {
       await wait(options.intervalMs);
-      result = await reconcileOnce(options.cwd);
+      result = await reconcileUntilSettled(options.cwd);
       process.stdout.write(`${JSON.stringify(result)}\n`);
     }
   }

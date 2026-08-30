@@ -419,7 +419,7 @@ function managedBlockLines() {
     "",
     "For every new substantive root task, explicitly invoke `$sol-luna-orchestration` before planning, delegating, or editing. The root uses Sol/xhigh/Standard. Verified executors use the profile registry; Luna has capacity 10, Sol has capacity 4, and Playwright has a global sublimit of 2. Capacity is not a fan-out target.",
     "",
-    "Writer profiles keep `workspace-write` sandboxing and run only in controller-created isolated worktrees with explicit write roots. Results become immutable candidates; root or Ultra owns review, approval, unstaged integration, acknowledgement, and cleanup. Never fall back to a writable shared checkout.",
+    "Writer profiles keep `workspace-write` sandboxing and run only in controller-created isolated worktrees with explicit write roots. Results become immutable candidates; root or Ultra owns review, approval, integration, explicit `manual|commit|push` delivery, acknowledgement, and cleanup. Automatic delivery commits only the validated candidate, pushes only to its declared existing remote branch without force, and stops in `delivery_blocked` until an explicit retry. Never fall back to a writable shared checkout.",
     "",
     "A human-confirmed Sol Ultra takeover owns its repository exclusively while its lock is active. Other root sessions must pause, and only executors carrying the matching `CODEX_ORCHESTRATION_LOCK_ID` and `CODEX_ORCHESTRATION_GENERATION` may run. Recovery fails closed while a registered process is live or unknown. Never remove lock state manually; inspect history or recover it through the orchestration gate.",
     MANAGED_BLOCK_END,

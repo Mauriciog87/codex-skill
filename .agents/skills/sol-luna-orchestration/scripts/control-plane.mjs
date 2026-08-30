@@ -16,6 +16,7 @@ import {
 export const CONTROL_PLANE_VERSION = 1;
 export const CONTROL_PLANE_RESULT_VERSION = 2;
 export const ASSIGNMENT_PRIORITIES = Object.freeze(["high", "normal", "low"]);
+export const DELIVERY_MODES = Object.freeze(["manual", "commit", "push"]);
 export const ASSIGNMENT_STATES = Object.freeze([
   "queued",
   "running",
@@ -25,6 +26,11 @@ export const ASSIGNMENT_STATES = Object.freeze([
   "approval_pending",
   "integration_pending",
   "integrated",
+  "commit_pending",
+  "committed",
+  "push_pending",
+  "published",
+  "delivery_blocked",
   "acknowledged",
   "blocked",
   "failed",
@@ -45,6 +51,11 @@ const ACTIVE_RESOURCE_STATES = new Set([
   "approval_pending",
   "integration_pending",
   "integrated",
+  "commit_pending",
+  "committed",
+  "push_pending",
+  "published",
+  "delivery_blocked",
   "blocked",
   "failed",
   "recovery_required",
@@ -57,6 +68,10 @@ const ACTION_AUTHORITIES = Object.freeze({
   publish_review: ["reviewer"],
   approve_candidate: ["root", "ultra", "operator"],
   integrate_candidate: ["root", "ultra"],
+  record_commit: ["root", "ultra"],
+  record_push: ["root", "ultra"],
+  block_delivery: ["root", "ultra"],
+  retry_delivery: ["root", "ultra", "operator"],
   acknowledge_assignment: ["root", "ultra"],
   answer_request: ["operator"],
   acknowledge_answer: ["root", "ultra", "executor", "daemon"],
@@ -213,6 +228,69 @@ function validateArtifact(value, index) {
   };
 }
 
+function validateDelivery(value, writer) {
+  const input = value ?? { mode: "manual" };
+  if (input === null || typeof input !== "object" || Array.isArray(input)) {
+    throw new ControlPlaneError("delivery must be an object.", "invalid-contract");
+  }
+  rejectUnexpectedProperties(
+    input,
+    new Set(["mode", "commit_message", "remote", "branch"]),
+    "delivery",
+  );
+  const mode = input.mode ?? "manual";
+  if (!DELIVERY_MODES.includes(mode)) {
+    throw new ControlPlaneError(`delivery.mode must be one of: ${DELIVERY_MODES.join(", ")}.`, "invalid-contract");
+  }
+  const commitMessage = input.commit_message ?? null;
+  const remote = input.remote ?? null;
+  const branch = input.branch ?? null;
+  if (mode !== "manual" && !writer) {
+    throw new ControlPlaneError("Only workspace-write assignments may publish commits.", "invalid-contract");
+  }
+  if (mode === "manual") {
+    if (commitMessage !== null || remote !== null || branch !== null) {
+      throw new ControlPlaneError("Manual delivery cannot declare commit or push settings.", "invalid-contract");
+    }
+  } else {
+    const message = requireString(commitMessage, "delivery.commit_message");
+    if (message.length > 200 || /[\u0000-\u001f\u007f]/.test(message)) {
+      throw new ControlPlaneError("delivery.commit_message must be one line with at most 200 characters.", "invalid-contract");
+    }
+  }
+  if (mode === "push") {
+    const remoteName = requireString(remote, "delivery.remote");
+    const branchName = requireString(branch, "delivery.branch");
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(remoteName)) {
+      throw new ControlPlaneError("delivery.remote must be a configured Git remote name.", "invalid-contract");
+    }
+    if (
+      branchName.length > 240 ||
+      branchName.startsWith("-") ||
+      branchName.startsWith("/") ||
+      branchName.endsWith("/") ||
+      branchName.endsWith(".") ||
+      branchName.endsWith(".lock") ||
+      branchName === "@" ||
+      branchName.includes("//") ||
+      branchName.includes("..") ||
+      branchName.includes("@{") ||
+      branchName.split("/").some((component) => component.startsWith(".") || component.endsWith(".lock")) ||
+      /[\u0000-\u0020~^:?*\\[\]\\]/.test(branchName)
+    ) {
+      throw new ControlPlaneError("delivery.branch is not a safe Git branch name.", "invalid-contract");
+    }
+  } else if (remote !== null || branch !== null) {
+    throw new ControlPlaneError("Only push delivery may declare a remote and branch.", "invalid-contract");
+  }
+  return {
+    mode,
+    commit_message: mode === "manual" ? null : commitMessage.trim(),
+    remote: mode === "push" ? remote.trim() : null,
+    branch: mode === "push" ? branch.trim() : null,
+  };
+}
+
 export function validateAssignmentRequest(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new ControlPlaneError("Assignment request must be an object.", "invalid-contract");
@@ -231,6 +309,7 @@ export function validateAssignmentRequest(value) {
       "operator_approval_required",
       "allow_symlinks",
       "allow_submodules",
+      "delivery",
       "parent_assignment_id",
       "review_target_candidate_id",
       "lock_id",
@@ -270,6 +349,7 @@ export function validateAssignmentRequest(value) {
   if (!writer && artifacts.length > 0) {
     throw new ControlPlaneError(`${profile.name} cannot declare artifacts.`, "invalid-contract");
   }
+  const delivery = validateDelivery(value.delivery, writer);
   for (const artifact of artifacts) {
     if (!pathWithinRoots(artifact.path, allowedWriteRoots, forbiddenWriteRoots)) {
       throw new ControlPlaneError(`Artifact is outside the assignment write scope: ${artifact.path}`, "invalid-contract");
@@ -301,6 +381,7 @@ export function validateAssignmentRequest(value) {
     ),
     allow_symlinks: requireBoolean(value.allow_symlinks ?? false, "allow_symlinks"),
     allow_submodules: requireBoolean(value.allow_submodules ?? false, "allow_submodules"),
+    delivery,
     parent_assignment_id: parentAssignmentId,
     review_target_candidate_id: reviewTargetCandidateId?.toLowerCase() ?? null,
   };
@@ -328,6 +409,33 @@ function validateAssignmentId(value) {
   return id.toLowerCase();
 }
 
+function normalizePersistedDelivery(record) {
+  const source = record.delivery ?? {};
+  if (source === null || typeof source !== "object" || Array.isArray(source)) {
+    throw new ControlPlaneError(`Assignment ${record.assignment_id} delivery state is malformed.`, "invalid-state");
+  }
+  const config = validateDelivery(
+    {
+      mode: source.mode ?? "manual",
+      commit_message: source.commit_message ?? null,
+      remote: source.remote ?? null,
+      branch: source.branch ?? null,
+    },
+    record.writer,
+  );
+  for (const property of ["commit", "push", "last_error"]) {
+    if (source[property] !== undefined && source[property] !== null && typeof source[property] !== "object") {
+      throw new ControlPlaneError(`Assignment ${record.assignment_id} delivery ${property} is malformed.`, "invalid-state");
+    }
+  }
+  return {
+    ...config,
+    commit: source.commit ?? null,
+    push: source.push ?? null,
+    last_error: source.last_error ?? null,
+  };
+}
+
 function validateRecord(record, assignmentId) {
   if (record?.schema_version !== CONTROL_PLANE_VERSION || record.assignment_id !== assignmentId) {
     throw new ControlPlaneError(`Assignment ${assignmentId} has an unsupported state format.`, "invalid-state");
@@ -335,7 +443,7 @@ function validateRecord(record, assignmentId) {
   if (!ASSIGNMENT_STATES.includes(record.state) || !Number.isInteger(record.state_revision)) {
     throw new ControlPlaneError(`Assignment ${assignmentId} state is malformed.`, "invalid-state");
   }
-  return record;
+  return { ...record, delivery: normalizePersistedDelivery(record) };
 }
 
 export async function readAssignment(cwd, assignmentId, options = {}) {
@@ -457,6 +565,12 @@ export async function createAssignment({
     operator_approval_required: contract.operator_approval_required,
     allow_symlinks: contract.allow_symlinks,
     allow_submodules: contract.allow_submodules,
+    delivery: {
+      ...contract.delivery,
+      commit: null,
+      push: null,
+      last_error: null,
+    },
     parent_assignment_id: contract.parent_assignment_id,
     review_target_candidate_id: contract.review_target_candidate_id,
     lock_id: lockId,
@@ -734,11 +848,91 @@ export function reduceAssignment(record, inputAction, timestamp = new Date().toI
       applied_diff_sha256: requireString(payload.applied_diff_sha256, "applied_diff_sha256"),
       integrated_at: timestamp,
     };
-    next.state = "integrated";
+    next.state = record.delivery.mode === "manual" ? "integrated" : "commit_pending";
+  } else if (action.op === "record_commit") {
+    requireState(record, ["commit_pending"], action.op);
+    requireCandidate(record, payload.candidate_id);
+    const publicationRef = requireString(payload.publication_ref, "publication_ref");
+    const expectedPublicationRef = `refs/codex-orchestration/deliveries/${record.assignment_id}/${record.attempt}`;
+    if (publicationRef !== expectedPublicationRef) {
+      throw new ControlPlaneError("Commit publication ref does not match the assignment.", "invalid-action");
+    }
+    const branchRef = requireString(payload.branch_ref, "branch_ref");
+    if (!branchRef.startsWith("refs/heads/")) {
+      throw new ControlPlaneError("Commit branch_ref must identify a local branch.", "invalid-action");
+    }
+    next.delivery.commit = {
+      candidate_id: record.candidate.candidate_id,
+      commit_revision: requireGitRevision(payload.commit_revision, "commit_revision"),
+      parent_revision: requireGitRevision(payload.parent_revision, "parent_revision"),
+      branch_ref: branchRef,
+      publication_ref: publicationRef,
+      committed_at: timestamp,
+    };
+    next.delivery.last_error = null;
+    next.state = record.delivery.mode === "push" ? "push_pending" : "committed";
+  } else if (action.op === "record_push") {
+    requireState(record, ["push_pending"], action.op);
+    requireCandidate(record, payload.candidate_id);
+    if (record.delivery.mode !== "push" || record.delivery.commit === null) {
+      throw new ControlPlaneError("Assignment does not have a committed push delivery.", "invalid-transition");
+    }
+    const commitRevision = requireGitRevision(payload.commit_revision, "commit_revision");
+    if (commitRevision !== record.delivery.commit.commit_revision) {
+      throw new ControlPlaneError("Push commit does not match the recorded delivery commit.", "stale-candidate");
+    }
+    const remote = requireString(payload.remote, "remote");
+    const branch = requireString(payload.branch, "branch");
+    const remoteRef = requireString(payload.remote_ref, "remote_ref");
+    if (
+      remote !== record.delivery.remote ||
+      branch !== record.delivery.branch ||
+      remoteRef !== `refs/heads/${record.delivery.branch}`
+    ) {
+      throw new ControlPlaneError("Push destination does not match the assignment delivery contract.", "invalid-action");
+    }
+    next.delivery.push = {
+      candidate_id: record.candidate.candidate_id,
+      commit_revision: commitRevision,
+      remote,
+      branch,
+      remote_ref: remoteRef,
+      remote_revision_before: requireGitRevision(payload.remote_revision_before, "remote_revision_before"),
+      remote_revision_after: requireGitRevision(payload.remote_revision_after, "remote_revision_after"),
+      pushed_at: timestamp,
+    };
+    next.delivery.last_error = null;
+    next.state = "published";
+  } else if (action.op === "block_delivery") {
+    requireState(record, ["commit_pending", "push_pending"], action.op);
+    const phase = payload.phase;
+    const expectedPhase = record.state === "commit_pending" ? "commit" : "push";
+    if (phase !== expectedPhase) {
+      throw new ControlPlaneError("Delivery failure phase does not match the current state.", "invalid-action");
+    }
+    next.delivery.last_error = {
+      phase,
+      error_code: requireString(payload.error_code, "error_code"),
+      summary: requireString(payload.summary, "summary"),
+      failed_at: timestamp,
+    };
+    next.state = "delivery_blocked";
+  } else if (action.op === "retry_delivery") {
+    requireState(record, ["delivery_blocked"], action.op);
+    if (!new Set(["commit", "push"]).has(record.delivery.last_error?.phase)) {
+      throw new ControlPlaneError("Assignment does not contain a retryable delivery failure.", "invalid-transition");
+    }
+    next.state = record.delivery.last_error.phase === "commit" ? "commit_pending" : "push_pending";
+    next.delivery.last_error = null;
   } else if (action.op === "acknowledge_assignment") {
     const zeroChangeClaim = record.state === "claimed" && record.candidate === null;
     if (!zeroChangeClaim) {
-      requireState(record, ["integrated"], action.op);
+      const completedState = {
+        manual: "integrated",
+        commit: "committed",
+        push: "published",
+      }[record.delivery.mode];
+      requireState(record, [completedState], action.op);
     }
     next.state = "acknowledged";
     next.resource_lease_active = false;
@@ -794,6 +988,12 @@ export function reduceAssignment(record, inputAction, timestamp = new Date().toI
     next.review = null;
     next.approval = null;
     next.integration = null;
+    next.delivery = {
+      ...record.delivery,
+      commit: null,
+      push: null,
+      last_error: null,
+    };
     next.operator_requests = [];
     next.workspace = null;
     next.resource_lease_active = record.writer;
@@ -982,6 +1182,9 @@ function attentionFor(record) {
   if (record.state === "integrated") {
     return "acknowledge-integration";
   }
+  if (record.state === "delivery_blocked") {
+    return "delivery-blocked";
+  }
   if (new Set(["blocked", "failed", "recovery_required"]).has(record.state)) {
     return record.operator_requests.some((request) => request.state === "open")
       ? "answer-request"
@@ -1084,6 +1287,15 @@ export function planResidualActions(records, platform = process.platform) {
         }
       }
     }
+    if (record.state === "commit_pending") {
+      mechanical.push({ op: "commit_candidate", assignment_id: record.assignment_id, state_revision: record.state_revision });
+    }
+    if (record.state === "push_pending") {
+      mechanical.push({ op: "push_candidate", assignment_id: record.assignment_id, state_revision: record.state_revision });
+    }
+    if (record.state === "committed" || record.state === "published") {
+      mechanical.push({ op: "acknowledge_assignment", assignment_id: record.assignment_id, state_revision: record.state_revision });
+    }
     if (TERMINAL_STATES.has(record.state) && record.workspace !== null && record.workspace.cleaned !== true) {
       mechanical.push({ op: "cleanup_workspace", assignment_id: record.assignment_id, state_revision: record.state_revision });
     }
@@ -1117,6 +1329,14 @@ function publicAssignment(record) {
     review_verdict: record.review?.verdict ?? null,
     root_approved: record.approval?.root_approved ?? false,
     operator_approved: record.approval?.operator_approved ?? false,
+    delivery: {
+      mode: record.delivery.mode,
+      remote: record.delivery.remote,
+      branch: record.delivery.branch,
+      commit_revision: record.delivery.commit?.commit_revision ?? null,
+      remote_revision: record.delivery.push?.remote_revision_after ?? null,
+      last_error: record.delivery.last_error,
+    },
     operator_requests: record.operator_requests.map((request) => ({
       request_id: request.request_id,
       question: request.question,

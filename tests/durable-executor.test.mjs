@@ -59,6 +59,10 @@ function options(repository, profile = "implement") {
     allowSymlinks: false,
     allowSubmodules: false,
     candidateId: null,
+    deliveryMode: "manual",
+    commitMessage: null,
+    pushRemote: null,
+    pushBranch: null,
   };
 }
 
@@ -122,6 +126,7 @@ test("durable writer executes inside sandbox worktree and publishes an immutable
       response.result.assignment_id,
       fixture.coordinationOptions,
     );
+    assert.equal(record.delivery.mode, "manual");
     assert.equal(record.state, "result_ready");
     assert.equal(record.workspace.path, invokedCwd);
     await cleanupAssignmentWorktree(record, fixture.coordinationOptions);
@@ -184,6 +189,41 @@ test("enqueue-only persists work without starting an executor", async () => {
       fixture.coordinationOptions,
     );
     assert.equal(record.state, "queued");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("enqueue-only persists the explicit controller push contract", async () => {
+  const fixture = await createFixture();
+  try {
+    const invocationOptions = options(fixture.repository);
+    invocationOptions.enqueueOnly = true;
+    invocationOptions.deliveryMode = "push";
+    invocationOptions.commitMessage = "feat: publish validated candidate";
+    invocationOptions.pushRemote = "origin";
+    invocationOptions.pushBranch = "master";
+    const response = await invokeDurableExecutor({
+      briefing: "Queue validated delivery.",
+      options: invocationOptions,
+      environment: fixture.environment,
+      coordinationOptions: fixture.coordinationOptions,
+      invokeLegacy: async () => execution("implement", []),
+    });
+    const record = await readAssignment(
+      fixture.repository,
+      response.result.assignment_id,
+      fixture.coordinationOptions,
+    );
+    assert.deepEqual(record.delivery, {
+      mode: "push",
+      commit_message: "feat: publish validated candidate",
+      remote: "origin",
+      branch: "master",
+      commit: null,
+      push: null,
+      last_error: null,
+    });
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

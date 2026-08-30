@@ -71,6 +71,7 @@ function contractBriefing(record, briefing) {
     `Assignment attempt: ${record.attempt}`,
     `Base revision: ${record.base_revision}`,
     `Allowed write roots: ${roots}`,
+    `Controller delivery policy: ${record.delivery.mode}`,
     record.writer
       ? "Your cwd is an isolated worktree. Modify only the allowed roots. Do not stage, commit, change HEAD, create branches, or touch another checkout."
       : "Keep repository files unchanged.",
@@ -155,6 +156,7 @@ async function createNewRecord({ briefing, options, environment, coordinationOpt
           artifacts: [],
           review_policy: "root",
           operator_approval_required: false,
+          delivery: { mode: "manual" },
           parent_assignment_id: target.assignment_id,
           review_target_candidate_id: target.candidate.candidate_id,
           lock_id: environment[ORCHESTRATION_LOCK_ENV] ?? null,
@@ -183,6 +185,12 @@ async function createNewRecord({ briefing, options, environment, coordinationOpt
         operator_approval_required: options.operatorApprovalRequired,
         allow_symlinks: options.allowSymlinks,
         allow_submodules: options.allowSubmodules,
+        delivery: {
+          mode: options.deliveryMode ?? "manual",
+          commit_message: options.commitMessage ?? null,
+          remote: options.pushRemote ?? null,
+          branch: options.pushBranch ?? null,
+        },
         lock_id: environment[ORCHESTRATION_LOCK_ENV] ?? null,
         generation: inheritedGeneration(environment),
       },

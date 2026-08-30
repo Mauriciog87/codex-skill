@@ -166,6 +166,9 @@ test("profile registry and operational guidance stay aligned", async () => {
   assert.match(controlPlane, /action-id-reuse/);
   assert.match(controlPlane, /resource-capacity/);
   assert.match(controlPlane, /operator_requests require a blocked result/);
+  assert.match(controlPlane, /delivery_blocked/);
+  assert.match(controlPlane, /record_commit/);
+  assert.match(controlPlane, /record_push/);
 
   const gitWorkspace = await readFile(
     ".agents/skills/sol-luna-orchestration/scripts/git-workspace.mjs",
@@ -174,6 +177,10 @@ test("profile registry and operational guidance stay aligned", async () => {
   assert.match(gitWorkspace, /worktree.*add/);
   assert.match(gitWorkspace, /candidate-ref-exists/);
   assert.match(gitWorkspace, /integration unexpectedly staged/);
+  assert.match(gitWorkspace, /commitIntegratedCandidate/);
+  assert.match(gitWorkspace, /pushCommittedCandidate/);
+  assert.match(gitWorkspace, /push.*--porcelain/s);
+  assert.doesNotMatch(gitWorkspace, /push[^\n]*--force/);
   assert.doesNotMatch(gitWorkspace, /shell\s*:\s*true/);
 
   const dashboard = await readFile(
@@ -184,6 +191,7 @@ test("profile registry and operational guidance stay aligned", async () => {
   assert.match(dashboard, /X-CSRF-Token/);
   assert.match(dashboard, /Content-Security-Policy/);
   assert.match(dashboard, /Dashboard action is not allowed/);
+  assert.match(dashboard, /retry_delivery/);
 
   const simulator = await readFile(
     ".agents/skills/sol-luna-orchestration/scripts/orchestration-simulator.mjs",
@@ -200,6 +208,11 @@ test("profile registry and operational guidance stay aligned", async () => {
     const schema = JSON.parse(await readFile(path, "utf8"));
     assert.equal(schema.$schema, "https://json-schema.org/draft/2020-12/schema");
   }
+  const assignmentSchema = JSON.parse(await readFile(
+    ".agents/skills/sol-luna-orchestration/references/assignment-request.schema.json",
+    "utf8",
+  ));
+  assert.deepEqual(assignmentSchema.properties.delivery.properties.mode.enum, ["manual", "commit", "push"]);
 
   for (const path of [
     "AGENTS.md",
@@ -230,6 +243,8 @@ test("profile registry and operational guidance stay aligned", async () => {
     assert.match(content, /worktree/i);
     assert.match(content, /candidate/i);
     assert.match(content, /durable/i);
+    assert.match(content, /delivery/i);
+    assert.match(content, /force-push|force/i);
   }
 });
 

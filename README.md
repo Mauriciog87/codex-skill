@@ -1,6 +1,6 @@
 # Verified Sol-Luna orchestration for Codex
 
-This repository provides a dependency-free orchestration layer for Codex. It keeps planning and integration on GPT-5.6 Sol, moves bounded work to verified Sol or Luna profiles, persists assignments through interruption, isolates writers in Git worktrees, and checks the effective model, reasoning effort, and service tier before accepting a candidate.
+This repository provides a dependency-free orchestration layer for Codex. It keeps planning and integration on GPT-5.6 Sol, moves bounded work to verified Sol or Luna profiles, persists assignments through interruption, isolates writers in Git worktrees, checks the effective model, reasoning effort, and service tier before accepting a candidate, and can explicitly commit or push only after that candidate clears every configured gate.
 
 The launchers use the [experimental Codex App Server](https://developers.openai.com/codex/app-server) over local stdio JSON-RPC instead of native subagent routing. App Server applies and reports each route explicitly while native multi-agent execution remains disabled. There is deliberately no fallback to the legacy execution path: an incompatible protocol fails closed with exit code `2`.
 
@@ -92,18 +92,19 @@ Machine-readable JSON remains the only stdout output. `NO_COLOR`, `TERM=dumb`, a
 
 ## Durable assignments
 
-An assignment stores its briefing separately from its public status and binds all execution to a full Git base revision. Its contract includes priority, allowed and forbidden write roots, required checks, declared artifacts, review policy, operator approval, and explicit symlink or submodule capabilities. State lives outside the repository under Codex home.
+An assignment stores its briefing separately from its public status and binds all execution to a full Git base revision. Its contract includes priority, allowed and forbidden write roots, required checks, declared artifacts, review policy, operator approval, explicit symlink or submodule capabilities, and a `manual`, `commit`, or `push` delivery policy. State lives outside the repository under Codex home.
 
 Persist work without starting it, inspect the residual plan, and run every currently safe assignment:
 
 ```text
 briefing | npm run executor -- --profile implement --cwd . --sandbox workspace-write --write-root src/feature --enqueue-only
+briefing | npm run executor -- --profile implement --cwd . --sandbox workspace-write --write-root src/feature --delivery push --commit-message "feat: finish feature" --push-remote origin --push-branch master --enqueue-only
 npm run control -- status --cwd .
 npm run control -- next --cwd .
 npm run control -- reconcile --cwd .
 ```
 
-The lifecycle is revision fenced: `queued`, `running`, `result_ready`, `claimed`, optional review and approval, `integration_pending`, `integrated`, then `acknowledged`. Blocked, failed, and recovery-required attempts can be archived and retried. Every mutation carries a unique action id, expected state revision, and authority; exact replays are idempotent, while altered replays and stale revisions fail closed.
+The lifecycle is revision fenced: `queued`, `running`, `result_ready`, `claimed`, optional review and approval, `integration_pending`, then delivery. Manual delivery uses `integrated`; automatic delivery advances through `commit_pending` and `committed`, plus `push_pending` and `published` for push, before `acknowledged`. A Git failure enters `delivery_blocked` and requires an explicit retry instead of looping. Blocked, failed, and recovery-required execution attempts can be archived and retried separately. Every mutation carries a unique action id, expected state revision, and authority; exact replays are idempotent, while altered replays and stale revisions fail closed.
 
 The residual planner starts disjoint write scopes in parallel and retains active leases across blocked or failed attempts. It never uses capacity as a fan-out target and never falls back to a shared writable checkout.
 
@@ -111,7 +112,11 @@ The residual planner starts disjoint write scopes in parallel and retains active
 
 Worktrees and sandboxing solve different problems and are both enforced. `workspace-write` limits the executor process; the detached worktree keeps its Git changes away from the main checkout. Before publication, the controller verifies the actual changed paths, rejects executor commits or HEAD changes, checks symlink and submodule policy, runs the declared commands without a shell, and copies only declared in-scope artifacts.
 
-The controller then creates an immutable hidden candidate ref through Git plumbing. The executor never stages or commits. Candidate identity binds the base revision, tree diff, contract, checks, and artifact manifest. Reusing an attempt with different content is rejected.
+The controller then creates an immutable hidden candidate ref through Git plumbing. The executor never stages or commits. Candidate identity binds the base revision, tree diff, contract, checks, and artifact manifest. Reusing an attempt with different content is rejected. Delivery still defaults to manual, unstaged integration.
+
+When commit delivery is explicitly selected, the controller builds a temporary index from the current branch, applies only the validated candidate, creates a candidate-bound commit, updates the checked-out branch with compare-and-swap semantics, and synchronizes only those candidate paths in the real index. Unrelated staged and unstaged work is preserved. Push delivery additionally requires a configured remote name and an existing branch named in the assignment. It requires the delivery commit's parent to be present remotely, verifies ancestry, pushes the exact delivery commit noninteractively without `--force`, and verifies the remote result. It therefore neither chooses a destination implicitly nor publishes unrelated local parent commits.
+
+The deterministic plumbing commit does not execute repository commit hooks or create a signed commit. Put mandatory validation in `required_checks`; repositories that require interactive hooks or signed commits should keep delivery `manual`.
 
 Root-driven review and integration use explicit state revisions:
 
@@ -121,10 +126,13 @@ npm run control -- request-review --cwd . --assignment-id <id> --revision <n>
 review briefing | npm run executor -- --profile review --cwd . --sandbox read-only --candidate-id <candidate-id>
 npm run control -- approve --cwd . --assignment-id <id> --revision <n> --kind root
 npm run control -- integrate --cwd . --assignment-id <id> --revision <n>
+npm run control -- commit-delivery --cwd . --assignment-id <id> --revision <n>
+npm run control -- push-delivery --cwd . --assignment-id <id> --revision <n>
+npm run control -- retry-delivery --cwd . --assignment-id <id> --revision <n>
 npm run control -- ack --cwd . --assignment-id <id> --revision <n>
 ```
 
-An independent verdict is bound to the exact candidate id and revision. Optional operator approval is a separate authority. Integration rechecks candidate integrity and path drift, refuses conflicts with local work, and applies the patch unstaged. Retry archives the prior worktree first; acknowledged and abandoned workspaces can then be cleaned safely.
+An independent verdict is bound to the exact candidate id and revision. Optional operator approval is a separate authority. Integration rechecks candidate integrity and path drift and refuses conflicts with local work. `reconcile` can perform the declared commit, push, acknowledgement, and cleanup steps after integration. A blocked delivery records a sanitized reason and waits for `retry-delivery`; assignment retry remains a separate operation that archives the prior worktree first. Acknowledged and abandoned workspaces can then be cleaned safely.
 
 ## Local control dashboard and simulator
 
@@ -133,9 +141,9 @@ npm run dashboard -- --cwd .
 npm run simulate -- --iterations 1000 --seed 73
 ```
 
-The dashboard binds only to `127.0.0.1`, `localhost`, or `::1`. It uses a single-use URL token, an HttpOnly SameSite cookie, Host and Origin validation, CSRF protection, and a restrictive content security policy. It exposes the redacted projection, not briefings, raw events, or artifact contents, and permits only operator answers and approvals.
+The dashboard binds only to `127.0.0.1`, `localhost`, or `::1`. It uses a single-use URL token, an HttpOnly SameSite cookie, Host and Origin validation, CSRF protection, and a restrictive content security policy. It exposes the redacted projection, not briefings, raw events, or artifact contents, and permits only operator answers, approvals, and explicit delivery retries.
 
-The deterministic simulator is pure: it changes neither Git nor durable state. It exercises successful candidates, zero-change readers, independent review, operator approval, blocked retry, recovery, stale action replay, stale candidate use, premature integration, and unauthorized actions.
+The deterministic simulator is pure: it changes neither Git nor durable state. It exercises successful candidates, commit and push delivery, delivery blocking and retry, zero-change readers, independent review, operator approval, blocked execution retry, recovery, stale action replay, stale candidate use, premature integration, and unauthorized actions.
 
 ## Result contract
 
@@ -237,4 +245,4 @@ npm run verify:platform
 npm run verify:live
 ```
 
-The unit suite covers JSON-RPC ordering and failures, profile routing, durable state transitions, action idempotency, resource leases, worktree isolation, immutable candidates, unstaged integration, required checks and artifacts, independent review, operator gates, dashboard security, deterministic fault simulation, tiers, terminal colors, capacity races, Ultra fencing generations, portable process identity, fail-closed recovery, immutable redacted history and retention, safe version 1 migration, Playwright preflight and tool evidence, installer rollback, and platform-specific path rules. `verify:platform` is the authentication-free compatibility gate and includes a live fingerprint check for the current process. Live verification generates the installed App Server schemas, checks the root and every profile against protocol and rollout evidence, uses temporary repositories for write tests, and confirms that read-only checks do not alter this repository. Add `--output <path-outside-the-repository>` to either verification command when an evidence artifact is required.
+The unit suite covers JSON-RPC ordering and failures, profile routing, durable state transitions, action idempotency, resource leases, worktree isolation, immutable candidates, manual integration, exact candidate-only commits, fast-forward push delivery, delivery blocking and retry, required checks and artifacts, independent review, operator gates, dashboard security, deterministic fault simulation, tiers, terminal colors, capacity races, Ultra fencing generations, portable process identity, fail-closed recovery, immutable redacted history and retention, safe version 1 migration, Playwright preflight and tool evidence, installer rollback, and platform-specific path rules. `verify:platform` is the authentication-free compatibility gate and includes a live fingerprint check for the current process. Live verification generates the installed App Server schemas, checks the root and every profile against protocol and rollout evidence, uses temporary repositories for write tests, and confirms that read-only checks do not alter this repository. Add `--output <path-outside-the-repository>` to either verification command when an evidence artifact is required.

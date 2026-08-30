@@ -31,6 +31,7 @@ test("dashboard requires one-time authentication, CSRF, and loopback origin", as
     assert.equal(page.status, 200);
     assert.match(page.headers.get("content-security-policy"), /frame-ancestors 'none'/);
     const html = await page.text();
+    assert.match(html, /Retry delivery/);
     const csrf = /name="csrf-token" content="([^"]+)"/.exec(html)?.[1];
     assert.ok(csrf);
     const status = await fetch(`${origin}/api/status`, { headers: { Cookie: cookie } });
@@ -64,6 +65,22 @@ test("dashboard requires one-time authentication, CSRF, and loopback origin", as
     });
     assert.equal(accepted.status, 200);
     assert.equal(actionPayload.answer, "answer");
+    const deliveryRetry = await fetch(`${origin}/api/action`, {
+      method: "POST",
+      headers: {
+        Cookie: cookie,
+        Origin: origin,
+        "Content-Type": "application/json",
+        "X-CSRF-Token": csrf,
+      },
+      body: JSON.stringify({
+        op: "retry_delivery",
+        assignment_id: "assignment",
+        expected_state_revision: 2,
+      }),
+    });
+    assert.equal(deliveryRetry.status, 200);
+    assert.equal(actionPayload.op, "retry_delivery");
     const replay = await fetch(dashboard.url, { redirect: "manual" });
     assert.equal(replay.status, 401);
   } finally {

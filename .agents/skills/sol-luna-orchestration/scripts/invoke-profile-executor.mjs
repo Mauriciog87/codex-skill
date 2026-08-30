@@ -107,6 +107,10 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
     allowSymlinks: false,
     allowSubmodules: false,
     candidateId: null,
+    deliveryMode: "manual",
+    commitMessage: null,
+    pushRemote: null,
+    pushBranch: null,
   };
   const seen = new Set();
   const repeatable = new Set(["--write-root", "--forbid-root", "--check-json", "--artifact-json"]);
@@ -131,6 +135,10 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
     "--artifact-json",
     "--review-policy",
     "--candidate-id",
+    "--delivery",
+    "--commit-message",
+    "--push-remote",
+    "--push-branch",
   ]);
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -222,8 +230,19 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
         throw new ExecutorInvocationError("--review-policy must be root or independent.");
       }
       parsed.reviewPolicy = value;
-    } else {
+    } else if (option === "--candidate-id") {
       parsed.candidateId = value;
+    } else if (option === "--delivery") {
+      if (!["manual", "commit", "push"].includes(value)) {
+        throw new ExecutorInvocationError("--delivery must be manual, commit, or push.");
+      }
+      parsed.deliveryMode = value;
+    } else if (option === "--commit-message") {
+      parsed.commitMessage = value;
+    } else if (option === "--push-remote") {
+      parsed.pushRemote = value;
+    } else {
+      parsed.pushBranch = value;
     }
   }
 
@@ -250,6 +269,10 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
       "--allow-symlinks",
       "--allow-submodules",
       "--candidate-id",
+      "--delivery",
+      "--commit-message",
+      "--push-remote",
+      "--push-branch",
     ];
     if (durableOptions.some((option) => seen.has(option))) {
       throw new ExecutorInvocationError("Durable assignment options require --control-plane v2.");
@@ -268,6 +291,10 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
       "--allow-symlinks",
       "--allow-submodules",
       "--candidate-id",
+      "--delivery",
+      "--commit-message",
+      "--push-remote",
+      "--push-branch",
     ];
     if (contractOptions.some((option) => seen.has(option))) {
       throw new ExecutorInvocationError("A resumed assignment uses its stored contract.");
@@ -284,6 +311,24 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
   }
   if (parsed.enqueueOnly && parsed.assignmentId !== null) {
     throw new ExecutorInvocationError("--enqueue-only cannot resume an existing assignment.");
+  }
+  if (parsed.deliveryMode === "manual") {
+    if (parsed.commitMessage !== null || parsed.pushRemote !== null || parsed.pushBranch !== null) {
+      throw new ExecutorInvocationError("Manual delivery cannot declare commit or push options.");
+    }
+  } else {
+    if (profile.workspaceStrategy !== "isolated-worktree") {
+      throw new ExecutorInvocationError("Only workspace-write profiles support automatic delivery.");
+    }
+    if (parsed.commitMessage === null) {
+      throw new ExecutorInvocationError("Automatic delivery requires --commit-message.");
+    }
+    if (parsed.deliveryMode === "push" && (parsed.pushRemote === null || parsed.pushBranch === null)) {
+      throw new ExecutorInvocationError("Push delivery requires --push-remote and --push-branch.");
+    }
+    if (parsed.deliveryMode === "commit" && (parsed.pushRemote !== null || parsed.pushBranch !== null)) {
+      throw new ExecutorInvocationError("Commit delivery cannot declare push options.");
+    }
   }
 
   return parsed;

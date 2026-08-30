@@ -131,6 +131,123 @@
     "allow_submodules": {
       "type": "boolean"
     },
+    "delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "commit",
+            "push"
+          ]
+        },
+        "commit_message": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 200,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+        },
+        "remote": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 240
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "manual"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "commit_message": {
+                "type": "null"
+              },
+              "remote": {
+                "type": "null"
+              },
+              "branch": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "commit"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "commit_message"
+            ],
+            "properties": {
+              "commit_message": {
+                "type": "string"
+              },
+              "remote": {
+                "type": "null"
+              },
+              "branch": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "push"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "commit_message",
+              "remote",
+              "branch"
+            ],
+            "properties": {
+              "commit_message": {
+                "type": "string"
+              },
+              "remote": {
+                "type": "string"
+              },
+              "branch": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    },
     "parent_assignment_id": {
       "type": [
         "string",
