@@ -9,6 +9,8 @@ const PROFILE_DEFINITIONS = {
     fastMode: true,
     sandboxMode: "read-only",
     concurrencyPool: "luna",
+    workspaceStrategy: "shared-read-only",
+    capabilities: ["workspace-read", "operator-request"],
     colorCode: 36,
     instructions: [
       "Explore the assigned question without modifying files or running state-changing commands.",
@@ -27,6 +29,8 @@ const PROFILE_DEFINITIONS = {
     fastMode: true,
     sandboxMode: "workspace-write",
     concurrencyPool: "luna",
+    workspaceStrategy: "isolated-worktree",
+    capabilities: ["workspace-read", "workspace-write", "operator-request"],
     colorCode: 92,
     instructions: [
       "Implement only the small, explicit, low-risk change assigned in the briefing and preserve unrelated changes.",
@@ -45,6 +49,8 @@ const PROFILE_DEFINITIONS = {
     fastMode: false,
     sandboxMode: "read-only",
     concurrencyPool: "luna",
+    workspaceStrategy: "shared-read-only",
+    capabilities: ["workspace-read", "browser", "operator-request"],
     concurrencyLimit: 2,
     colorCode: 94,
     instructions: [
@@ -65,6 +71,8 @@ const PROFILE_DEFINITIONS = {
     fastMode: false,
     sandboxMode: "workspace-write",
     concurrencyPool: "sol",
+    workspaceStrategy: "isolated-worktree",
+    capabilities: ["workspace-read", "workspace-write", "operator-request"],
     colorCode: 33,
     instructions: [
       "Implement only the explicitly assigned files or subsystem and preserve unrelated changes.",
@@ -82,6 +90,8 @@ const PROFILE_DEFINITIONS = {
     fastMode: false,
     sandboxMode: "read-only",
     concurrencyPool: "sol",
+    workspaceStrategy: "candidate-worktree",
+    capabilities: ["workspace-read", "review"],
     colorCode: 35,
     instructions: [
       "Review only the plan or Git changes explicitly named in the briefing and never modify files.",
@@ -109,6 +119,8 @@ export const EXECUTOR_PROFILES = Object.freeze(
         sandboxMode: profile.sandboxMode,
         concurrencyPool: profile.concurrencyPool,
         concurrencyLimit: profile.concurrencyLimit ?? null,
+        workspaceStrategy: profile.workspaceStrategy,
+        capabilities: Object.freeze([...profile.capabilities]),
         colorCode: profile.colorCode,
         instructions: Object.freeze([...profile.instructions]),
       }),

@@ -76,7 +76,7 @@ function wait(milliseconds) {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
 }
 
-async function getEntry(path) {
+export async function getEntry(path) {
   try {
     return await lstat(path);
   } catch (error) {
@@ -87,7 +87,7 @@ async function getEntry(path) {
   }
 }
 
-async function readJson(path, label) {
+export async function readJson(path, label) {
   let content;
   try {
     content = await readFile(path, "utf8");
@@ -111,7 +111,7 @@ async function writeTemporary(path, value) {
   return temporaryPath;
 }
 
-async function atomicWrite(path, value) {
+export async function atomicWrite(path, value) {
   const temporaryPath = await writeTemporary(path, value);
   try {
     try {
@@ -127,7 +127,7 @@ async function atomicWrite(path, value) {
   }
 }
 
-async function atomicCreate(path, value) {
+export async function atomicCreate(path, value) {
   const temporaryPath = await writeTemporary(path, value);
   try {
     if ((await getEntry(path)) !== null) {
@@ -195,6 +195,12 @@ export async function getRepositoryState(
     "state",
     key,
   );
+  const worktreesDirectory = join(
+    getCodexHome(environment, homeDirectory),
+    "sol-sol-orchestration",
+    "worktrees",
+    key.slice(0, 16),
+  );
   const globalState = getGlobalCapacityState({ environment, homeDirectory });
   return {
     repository,
@@ -206,6 +212,10 @@ export async function getRepositoryState(
     lockPath: join(stateDirectory, "ultra.lock", "lock.json"),
     runsDirectory: join(stateDirectory, "runs"),
     historyDirectory: join(stateDirectory, "history"),
+    assignmentsDirectory: join(stateDirectory, "assignments"),
+    controlEventsDirectory: join(stateDirectory, "control-events"),
+    artifactsDirectory: join(stateDirectory, "artifacts"),
+    worktreesDirectory,
     globalStateDirectory: globalState.stateDirectory,
     globalMutexDirectory: globalState.mutexDirectory,
     globalRunsDirectory: globalState.runsDirectory,
@@ -245,7 +255,7 @@ async function removeStaleMutex(state) {
   return true;
 }
 
-async function withStateMutex(state, action) {
+export async function withStateMutex(state, action) {
   await mkdir(state.stateDirectory, { recursive: true });
   const startedAt = Date.now();
   while (true) {

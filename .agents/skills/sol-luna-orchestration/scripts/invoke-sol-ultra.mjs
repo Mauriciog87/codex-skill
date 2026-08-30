@@ -2,6 +2,7 @@ import { access, readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getExecutorProfile } from "./executor-profiles.mjs";
+import { assertEpochAssignmentsComplete } from "./control-plane.mjs";
 import {
   RESULT_SCHEMA_PATH,
   RoutingVerificationError,
@@ -43,6 +44,26 @@ export const DEFAULT_ULTRA_TIMEOUT_SECONDS = 1_800;
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const EXECUTOR_LAUNCHER_PATH = join(SCRIPT_DIRECTORY, "invoke-profile-executor.mjs");
 const MAX_REASON_CHARACTERS = 4_096;
+
+async function releaseCompletedUltraLock({
+  cwd,
+  lockId,
+  generation,
+  environment,
+  coordinationOptions,
+}) {
+  await assertEpochAssignmentsComplete(cwd, lockId, generation, {
+    ...coordinationOptions,
+    environment,
+  });
+  await releaseUltraLock({
+    cwd,
+    lockId,
+    generation,
+    ...coordinationOptions,
+    environment,
+  });
+}
 
 export class UltraInvocationError extends Error {
   constructor(message) {
@@ -140,8 +161,10 @@ export function createUltraDeveloperInstructions(lockId, generation) {
     "Own planning, bounded delegation, integration, verification, and the terminal result while the repository lock is active.",
     "Do not use native spawn_agent or any native multi-agent tool and do not start another Ultra takeover.",
     `Delegate only through node ${JSON.stringify(EXECUTOR_LAUNCHER_PATH)} --profile explore|implement-lite|playwright|implement|review with a bounded briefing on stdin.`,
-    "Use only useful independent executor scopes, respect the verified Luna and Sol capacity pools, and serialize overlapping writes.",
-    "Use read-only executors by default and workspace-write only for explicitly assigned implement-lite or implement scopes.",
+    "Use only useful independent executor scopes, respect the verified Luna and Sol capacity pools, and never overlap write roots.",
+    "Use read-only executors by default. Every implement-lite or implement assignment requires workspace-write plus at least one explicit --write-root and runs in a controller-created isolated worktree.",
+    `Use node ${JSON.stringify(resolve(SCRIPT_DIRECTORY, "orchestration-control.mjs"))} to claim, review, approve, integrate, acknowledge, archive, retry, abandon, and clean durable assignments with exact state revisions.`,
+    "Do not return while an assignment from this lock id and generation remains unfinished. Accepted candidates require every configured gate and unstaged integration; work that cannot finish must be explicitly archived and abandoned.",
     "Do not alter approval policy, sandbox policy, orchestration configuration, or use bypasses.",
     "Preserve unrelated changes and do not exceed the authority granted in the original briefing.",
     "Return only the result required by the supplied JSON schema.",
@@ -254,8 +277,8 @@ async function markRecoveryRequired(
       generation,
       state: "recovery-required",
       threadId,
-      environment,
       ...coordinationOptions,
+      environment,
     });
     return null;
   } catch (error) {
@@ -286,8 +309,8 @@ export async function invokeUltra({
     cwd: options.cwd,
     reason: options.reason,
     sandboxMode: options.sandboxMode,
-    environment,
     ...coordinationOptions,
+    environment,
   });
   let threadId = null;
   let actualModel = null;
@@ -322,8 +345,8 @@ export async function invokeUltra({
           generation: lock.generation,
           kind: "app-server",
           pid,
-          environment,
           ...coordinationOptions,
+          environment,
         });
       },
     });
@@ -338,8 +361,8 @@ export async function invokeUltra({
         lockId: lock.lock_id,
         generation: lock.generation,
         threadId,
-        environment,
         ...coordinationOptions,
+        environment,
       });
     }
     if (threadId === null) {
@@ -367,8 +390,8 @@ export async function invokeUltra({
         cwd: options.cwd,
         lockId: lock.lock_id,
         generation: lock.generation,
-        environment,
         ...coordinationOptions,
+        environment,
       }),
     );
     if (appServerResult.blockedReason !== null) {
@@ -387,12 +410,12 @@ export async function invokeUltra({
         blockers: [appServerResult.blockedReason],
         warnings,
       });
-      await releaseUltraLock({
+      await releaseCompletedUltraLock({
         cwd: options.cwd,
         lockId: lock.lock_id,
         generation: lock.generation,
         environment,
-        ...coordinationOptions,
+        coordinationOptions,
       });
       return { result, exitCode: 1 };
     }
@@ -413,12 +436,12 @@ export async function invokeUltra({
         blockers: [message],
         warnings,
       });
-      await releaseUltraLock({
+      await releaseCompletedUltraLock({
         cwd: options.cwd,
         lockId: lock.lock_id,
         generation: lock.generation,
         environment,
-        ...coordinationOptions,
+        coordinationOptions,
       });
       return { result, exitCode: 1 };
     }
@@ -443,12 +466,12 @@ export async function invokeUltra({
       blockers: payload.blockers,
       warnings: [...payload.warnings, ...warnings],
     });
-    await releaseUltraLock({
+    await releaseCompletedUltraLock({
       cwd: options.cwd,
       lockId: lock.lock_id,
       generation: lock.generation,
       environment,
-      ...coordinationOptions,
+      coordinationOptions,
     });
     return { result, exitCode: result.status === "completed" ? 0 : 1 };
   } catch (error) {

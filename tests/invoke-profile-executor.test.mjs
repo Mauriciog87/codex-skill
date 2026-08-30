@@ -10,6 +10,8 @@ import {
   getExecutorProfile,
 } from "../.agents/skills/sol-luna-orchestration/scripts/executor-profiles.mjs";
 import {
+  DEFAULT_CONTROL_PLANE,
+  DEFAULT_RESULT_FORMAT,
   DEFAULT_SANDBOX_MODE,
   DEFAULT_TIMEOUT_SECONDS,
   ExecutorConfigurationError,
@@ -110,6 +112,20 @@ test("parseArguments requires a profile and applies safe defaults", () => {
     cwd: baseDirectory,
     sandboxMode: DEFAULT_SANDBOX_MODE,
     timeoutSeconds: DEFAULT_TIMEOUT_SECONDS,
+    controlPlane: DEFAULT_CONTROL_PLANE,
+    resultFormat: DEFAULT_RESULT_FORMAT,
+    assignmentId: null,
+    enqueueOnly: false,
+    priority: "normal",
+    writeRoots: [],
+    forbiddenRoots: [],
+    requiredChecks: [],
+    artifacts: [],
+    reviewPolicy: "root",
+    operatorApprovalRequired: false,
+    allowSymlinks: false,
+    allowSubmodules: false,
+    candidateId: null,
   });
   assert.throws(() => parseArguments([], baseDirectory), ExecutorInvocationError);
 });
@@ -127,6 +143,8 @@ test("parseArguments accepts supported profile-specific options", () => {
         "workspace-write",
         "--timeout-seconds",
         "42",
+        "--write-root",
+        "src",
       ],
       baseDirectory,
     ),
@@ -135,6 +153,20 @@ test("parseArguments accepts supported profile-specific options", () => {
       cwd: resolve(baseDirectory, "repository"),
       sandboxMode: "workspace-write",
       timeoutSeconds: 42,
+      controlPlane: DEFAULT_CONTROL_PLANE,
+      resultFormat: DEFAULT_RESULT_FORMAT,
+      assignmentId: null,
+      enqueueOnly: false,
+      priority: "normal",
+      writeRoots: ["src"],
+      forbiddenRoots: [],
+      requiredChecks: [],
+      artifacts: [],
+      reviewPolicy: "root",
+      operatorApprovalRequired: false,
+      allowSymlinks: false,
+      allowSubmodules: false,
+      candidateId: null,
     },
   );
 });
@@ -217,6 +249,23 @@ test("validateExecutorPayload enforces the untrusted structured payload", () => 
   assert.throws(
     () => validateExecutorPayload({ ...payload, warnings: "none" }),
     ExecutorConfigurationError,
+  );
+});
+
+test("operator requests require a blocked executor result", () => {
+  const payload = {
+    status: "completed",
+    summary: "Done.",
+    changed_files: [],
+    checks: [],
+    blockers: [],
+    warnings: [],
+    operator_requests: [{ question: "Continue?", choices: ["yes", "no"] }],
+  };
+  assert.throws(() => validateExecutorPayload(payload), /require status blocked/);
+  assert.deepEqual(
+    validateExecutorPayload({ ...payload, status: "blocked", blockers: ["operator input"] }).operator_requests,
+    payload.operator_requests,
   );
 });
 

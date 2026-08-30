@@ -6,6 +6,9 @@
   "scripts": {
     "install:global": "node scripts/install-global-orchestration.mjs",
     "executor": "node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs",
+    "control": "node .agents/skills/sol-luna-orchestration/scripts/orchestration-control.mjs",
+    "dashboard": "node .agents/skills/sol-luna-orchestration/scripts/orchestration-control.mjs dashboard",
+    "simulate": "node .agents/skills/sol-luna-orchestration/scripts/orchestration-simulator.mjs",
     "ultra": "node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs",
     "ultra:gate": "node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs",
     "test": "node --test",

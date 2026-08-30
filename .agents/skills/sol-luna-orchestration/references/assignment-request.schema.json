@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "dependentRequired": {
+    "lock_id": [
+      "generation"
+    ],
+    "generation": [
+      "lock_id"
+    ]
+  },
+  "required": [
+    "profile",
+    "base_revision",
+    "allowed_write_roots",
+    "forbidden_write_roots",
+    "required_checks",
+    "artifacts",
+    "review_policy",
+    "operator_approval_required"
+  ],
+  "properties": {
+    "profile": {
+      "type": "string",
+      "enum": [
+        "explore",
+        "implement-lite",
+        "playwright",
+        "implement",
+        "review"
+      ]
+    },
+    "base_revision": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$"
+    },
+    "priority": {
+      "type": "string",
+      "enum": [
+        "high",
+        "normal",
+        "low"
+      ]
+    },
+    "allowed_write_roots": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "forbidden_write_roots": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "required_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "argv"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "argv": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 86400
+          }
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "path",
+          "kind"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^/\\\\]+$"
+          },
+          "path": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "file",
+              "directory"
+            ]
+          }
+        }
+      }
+    },
+    "review_policy": {
+      "type": "string",
+      "enum": [
+        "root",
+        "independent"
+      ]
+    },
+    "operator_approval_required": {
+      "type": "boolean"
+    },
+    "allow_symlinks": {
+      "type": "boolean"
+    },
+    "allow_submodules": {
+      "type": "boolean"
+    },
+    "parent_assignment_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "review_target_candidate_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-fA-F]{64}$"
+    },
+    "lock_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "generation": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    }
+  }
+}

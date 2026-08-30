@@ -15,6 +15,17 @@ import {
   verifySessionRouting,
 } from "../.agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs";
 import {
+  invokeDurableExecutor,
+} from "../.agents/skills/sol-luna-orchestration/scripts/durable-executor.mjs";
+import {
+  createAction,
+  dispatchAssignmentAction,
+} from "../.agents/skills/sol-luna-orchestration/scripts/control-plane.mjs";
+import {
+  cleanupAssignmentWorktree,
+  integrateCandidate,
+} from "../.agents/skills/sol-luna-orchestration/scripts/git-workspace.mjs";
+import {
   MINIMUM_CODEX_VERSION,
   runAppServerTurn,
 } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
@@ -212,6 +223,56 @@ function verifyExecutorResultSchema(result) {
     ) {
       throw new Error(`Executor result property ${property} must be an array of strings.`);
     }
+  }
+}
+
+function verifyDurableExecutorResultSchema(result) {
+  const expectedProperties = [
+    "schema_version",
+    "assignment_id",
+    "attempt",
+    "status",
+    "profile",
+    "thread_id",
+    "model",
+    "reasoning_effort",
+    "service_tier",
+    "routing_verified",
+    "sandbox_mode",
+    "base_revision",
+    "candidate",
+    "summary",
+    "changed_files",
+    "artifacts",
+    "operator_requests",
+    "checks",
+    "blockers",
+    "warnings",
+  ];
+  if (JSON.stringify(Object.keys(result)) !== JSON.stringify(expectedProperties)) {
+    throw new Error("The durable executor result does not match the version 2 output contract.");
+  }
+  if (
+    result.schema_version !== 2 ||
+    typeof result.assignment_id !== "string" ||
+    !Number.isInteger(result.attempt) ||
+    result.attempt < 1 ||
+    typeof result.routing_verified !== "boolean"
+  ) {
+    throw new Error("The durable executor result contains invalid fixed properties.");
+  }
+  for (const property of ["changed_files", "artifacts", "operator_requests", "checks", "blockers", "warnings"]) {
+    if (!Array.isArray(result[property])) {
+      throw new Error(`Durable executor result property ${property} must be an array.`);
+    }
+  }
+  for (const property of ["changed_files", "blockers", "warnings"]) {
+    if (result[property].some((entry) => typeof entry !== "string")) {
+      throw new Error(`Durable executor result property ${property} must contain strings.`);
+    }
+  }
+  if (result.checks.some((entry) => typeof entry !== "string" && (entry === null || typeof entry !== "object"))) {
+    throw new Error("Durable executor result property checks contains an invalid entry.");
   }
 }
 
@@ -469,40 +530,158 @@ async function createWriteProbeRepository() {
   return repository;
 }
 
+async function completeDurableWriteProbe(record, repository) {
+  let current = (
+    await dispatchAssignmentAction(
+      repository,
+      createAction({ op: "claim_result", authority: "root", record }),
+    )
+  ).record;
+  current = (
+    await dispatchAssignmentAction(
+      repository,
+      createAction({
+        op: "approve_candidate",
+        authority: "root",
+        record: current,
+        payload: { candidate_id: current.candidate.candidate_id, kind: "root" },
+      }),
+    )
+  ).record;
+  current = (
+    await dispatchAssignmentAction(
+      repository,
+      createAction({
+        op: "integrate_candidate",
+        authority: "root",
+        record: current,
+        payload: { candidate_id: current.candidate.candidate_id },
+      }),
+      { beforeTransition: async (pending) => integrateCandidate(pending, repository) },
+    )
+  ).record;
+  current = (
+    await dispatchAssignmentAction(
+      repository,
+      createAction({ op: "acknowledge_assignment", authority: "root", record: current }),
+    )
+  ).record;
+  const cleanup = await cleanupAssignmentWorktree(current);
+  if (!cleanup.cleaned) {
+    throw new Error("The durable write probe did not clean its isolated worktree.");
+  }
+  return (
+    await dispatchAssignmentAction(
+      repository,
+      createAction({
+        op: "cleanup_workspace",
+        authority: "root",
+        record: current,
+        payload: { cleaned_path: cleanup.path },
+      }),
+    )
+  ).record;
+}
+
+async function abandonDurableWriteProbe(record, repository) {
+  if (record?.workspace?.path === undefined || record.workspace.cleaned === true) {
+    return;
+  }
+  let current = record;
+  if (!new Set(["acknowledged", "abandoned"]).has(current.state)) {
+    current = (
+      await dispatchAssignmentAction(
+        repository,
+        createAction({
+          op: "abandon_assignment",
+          authority: "root",
+          record: current,
+          payload: { reason: "Live routing probe cleanup after failure." },
+        }),
+      )
+    ).record;
+  }
+  const cleanup = await cleanupAssignmentWorktree(current);
+  if (cleanup.cleaned) {
+    await dispatchAssignmentAction(
+      repository,
+      createAction({
+        op: "cleanup_workspace",
+        authority: "root",
+        record: current,
+        payload: { cleaned_path: cleanup.path },
+      }),
+    );
+  }
+}
+
 async function runWriteProfileProbe(repository, sessionRoots, profileName) {
   const expectedContent = `verified ${profileName} profile\n`;
-  const executor = await invokeExecutor({
-    briefing: [
-      "Own only executor-probe.txt in this temporary repository.",
-      `Replace its complete contents with exactly: verified ${profileName} profile`,
-      "Keep one trailing newline, run git diff --check, and do not modify any other file.",
-      `Return status completed, summary ${profileName} workspace probe completed, changed_files containing exactly executor-probe.txt, checks containing exactly git_diff_check:passed, and no blockers or warnings.`,
-    ].join("\n"),
-    options: {
-      profile: profileName,
-      cwd: repository,
-      sandboxMode: "workspace-write",
-      timeoutSeconds: 300,
-    },
-    sessionRoots,
-  });
-  verifyExecutorResultSchema(executor.result);
-  if (executor.exitCode !== 0) {
-    throw new Error(`The ${profileName} probe failed: ${executor.result.summary}`);
+  let record = null;
+  try {
+    const executor = await invokeDurableExecutor({
+      briefing: [
+        "Own only executor-probe.txt in this temporary repository.",
+        `Replace its complete contents with exactly: verified ${profileName} profile`,
+        "Keep one trailing newline, run git diff --check, and do not modify any other file.",
+        `Return status completed, summary ${profileName} workspace probe completed, changed_files containing exactly executor-probe.txt, checks containing exactly git_diff_check:passed, and no blockers or warnings.`,
+      ].join("\n"),
+      options: {
+        profile: profileName,
+        cwd: repository,
+        sandboxMode: "workspace-write",
+        timeoutSeconds: 300,
+        assignmentId: null,
+        enqueueOnly: false,
+        priority: "normal",
+        writeRoots: ["executor-probe.txt"],
+        forbiddenRoots: [],
+        requiredChecks: [
+          {
+            id: "controller-git-diff-check",
+            argv: ["git", "diff", "--check"],
+            cwd: ".",
+            timeout_seconds: 60,
+          },
+        ],
+        artifacts: [],
+        reviewPolicy: "root",
+        operatorApprovalRequired: false,
+        allowSymlinks: false,
+        allowSubmodules: false,
+        candidateId: null,
+        resultFormat: "v2",
+      },
+      invokeLegacy: invokeExecutor,
+      sessionRoots,
+    });
+    record = executor.record;
+    verifyDurableExecutorResultSchema(executor.result);
+    if (executor.exitCode !== 0) {
+      throw new Error(`The ${profileName} probe failed: ${executor.result.summary}`);
+    }
+    verifyProfileRouting(executor.result, profileName);
+    if (
+      executor.result.candidate === null ||
+      JSON.stringify(executor.result.changed_files) !== JSON.stringify(["executor-probe.txt"]) ||
+      executor.result.checks[0] !== "git_diff_check:passed" ||
+      executor.result.checks[1]?.id !== "controller-git-diff-check" ||
+      executor.result.checks[1]?.exit_code !== 0
+    ) {
+      throw new Error(`The ${profileName} probe did not publish a verified candidate.`);
+    }
+    record = await completeDurableWriteProbe(record, repository);
+    const probeContent = (await readFile(join(repository, "executor-probe.txt"), "utf8")).replace(
+      /\r\n/g,
+      "\n",
+    );
+    if (probeContent !== expectedContent || record.workspace.cleaned !== true) {
+      throw new Error(`The ${profileName} probe did not prove durable worktree integration.`);
+    }
+    return executor.result;
+  } finally {
+    await abandonDurableWriteProbe(record, repository).catch(() => {});
   }
-  verifyProfileRouting(executor.result, profileName);
-  const probeContent = (await readFile(join(repository, "executor-probe.txt"), "utf8")).replace(
-    /\r\n/g,
-    "\n",
-  );
-  if (
-    probeContent !== expectedContent ||
-    JSON.stringify(executor.result.changed_files) !== JSON.stringify(["executor-probe.txt"]) ||
-    JSON.stringify(executor.result.checks) !== JSON.stringify(["git_diff_check:passed"])
-  ) {
-    throw new Error(`The ${profileName} probe did not prove bounded workspace-write access.`);
-  }
-  return executor.result;
 }
 
 async function runImplementLiteProbe(repository, sessionRoots) {
@@ -681,10 +860,28 @@ async function runUltraWriteProbe(sessionRoots) {
   const repository = await mkdtemp(join(tmpdir(), "sol-ultra-write-probe-"));
   try {
     await execFileAsync("git", ["init", "--quiet"], { cwd: repository, windowsHide: true });
+    await writeFile(join(repository, "baseline.txt"), "baseline\n", "utf8");
+    await execFileAsync("git", ["add", "baseline.txt"], { cwd: repository, windowsHide: true });
+    await execFileAsync(
+      "git",
+      [
+        "-c",
+        "user.name=Sol-Ultra Probe",
+        "-c",
+        "user.email=sol-ultra-probe@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "chore: initialize Ultra probe",
+      ],
+      { cwd: repository, windowsHide: true },
+    );
     const execution = await invokeUltra({
       briefing: [
         "Delegate exactly one task through the verified implement profile and do not edit files yourself.",
+        "Launch it through the durable version 2 control plane with workspace-write and --write-root ultra-probe.txt.",
         "Assign only ultra-probe.txt in this temporary repository. The implement executor must create it with exactly verified Ultra implement profile followed by one newline and run git diff --check.",
+        "After it publishes a candidate, refresh the exact assignment revision before each control action, then claim, approve as root, integrate, acknowledge, and clean its isolated worktree.",
         "After the verified executor succeeds, return status completed, summary Sol Ultra implement delegation probe completed, changed_files containing exactly ultra-probe.txt, checks containing exactly ultra_implement_delegation:passed, and no blockers or warnings.",
       ].join("\n"),
       options: {

@@ -1,20 +1,20 @@
 # Verified Sol-Luna orchestration for Codex
 
-This repository provides a small, dependency-free orchestration layer for Codex. It keeps planning and integration on GPT-5.6 Sol, moves bounded work to verified Sol or Luna profiles, and checks the effective model, reasoning effort, and service tier before accepting a result.
+This repository provides a dependency-free orchestration layer for Codex. It keeps planning and integration on GPT-5.6 Sol, moves bounded work to verified Sol or Luna profiles, persists assignments through interruption, isolates writers in Git worktrees, and checks the effective model, reasoning effort, and service tier before accepting a candidate.
 
 The launchers use the [experimental Codex App Server](https://developers.openai.com/codex/app-server) over local stdio JSON-RPC instead of native subagent routing. App Server applies and reports each route explicitly while native multi-agent execution remains disabled. There is deliberately no fallback to the legacy execution path: an incompatible protocol fails closed with exit code `2`.
 
 ## Roles
 
-| Role | Model | Effort | Tier | Access | Best use |
-|---|---|---|---|---|---|
-| Root | Sol | xhigh | Standard | Current session | Planning, delegation, integration, final validation |
-| `explore` | Luna | max | Fast | Read-only | Repository discovery, documentation, contract tracing |
-| `implement-lite` | Luna | max | Fast | Explicit workspace write | Small, low-risk, tightly bounded edits |
-| `playwright` | Luna | max | Standard | Read-only repository | Browser inspection and authorized test interaction |
-| `implement` | Sol | high | Standard | Explicit workspace write | Changes that need stronger engineering judgment |
-| `review` | Sol | high | Standard | Read-only | Independent plan and code review |
-| Ultra | Sol | ultra | Standard | Explicit takeover sandbox | Exceptional architecture, security, or concurrency decisions |
+| Role | Model | Effort | Tier | Sandbox | Workspace | Best use |
+|---|---|---|---|---|---|---|
+| Root | Sol | xhigh | Standard | Current session | Main checkout | Planning, delegation, integration, final validation |
+| `explore` | Luna | max | Fast | Read-only | Shared checkout | Repository discovery, documentation, contract tracing |
+| `implement-lite` | Luna | max | Fast | Workspace write | Isolated worktree | Small, low-risk, tightly bounded edits |
+| `playwright` | Luna | max | Standard | Read-only repository | Shared checkout | Browser inspection and authorized test interaction |
+| `implement` | Sol | high | Standard | Workspace write | Isolated worktree | Changes that need stronger engineering judgment |
+| `review` | Sol | high | Standard | Read-only | Exact candidate worktree when requested | Independent plan and code review |
+| Ultra | Sol | ultra | Standard | Explicit takeover sandbox | Main checkout | Exceptional architecture, security, or concurrency decisions |
 
 Every role uses `model_verbosity = "low"`. Fast profiles force `features.fast_mode = true`, while Standard roles force it to `false`. Reasoning effort and output verbosity are independent settings.
 
@@ -71,14 +71,14 @@ The direct Node command is the canonical interface:
 briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile explore --cwd . --sandbox read-only --timeout-seconds 900
 ```
 
-Use `workspace-write` explicitly for either implementation profile:
+Use `workspace-write` explicitly and declare at least one permitted path for either implementation profile:
 
 ```text
-briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile implement-lite --cwd . --sandbox workspace-write
-briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile implement --cwd . --sandbox workspace-write
+briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile implement-lite --cwd . --sandbox workspace-write --write-root src/feature
+briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile implement --cwd . --sandbox workspace-write --write-root src --forbid-root src/generated
 ```
 
-Read-only profiles reject `workspace-write`. Write profiles do not enable it automatically. Every profile rejects `danger-full-access`, approval overrides, and bypass flags.
+Read-only profiles reject `workspace-write`. Write profiles do not enable it automatically. Every profile rejects `danger-full-access`, approval overrides, and bypass flags. Control plane v2 and result format v2 are the defaults; use `--control-plane v1` only for the legacy read-only interface.
 
 `npm run executor -- --profile ...` is available for convenience, but the direct command provides the clearest option forwarding and exit-code behavior.
 
@@ -90,10 +90,60 @@ The launcher prints a colored route banner to stderr when the terminal supports 
 
 Machine-readable JSON remains the only stdout output. `NO_COLOR`, `TERM=dumb`, and `FORCE_COLOR` are honored.
 
+## Durable assignments
+
+An assignment stores its briefing separately from its public status and binds all execution to a full Git base revision. Its contract includes priority, allowed and forbidden write roots, required checks, declared artifacts, review policy, operator approval, and explicit symlink or submodule capabilities. State lives outside the repository under Codex home.
+
+Persist work without starting it, inspect the residual plan, and run every currently safe assignment:
+
+```text
+briefing | npm run executor -- --profile implement --cwd . --sandbox workspace-write --write-root src/feature --enqueue-only
+npm run control -- status --cwd .
+npm run control -- next --cwd .
+npm run control -- reconcile --cwd .
+```
+
+The lifecycle is revision fenced: `queued`, `running`, `result_ready`, `claimed`, optional review and approval, `integration_pending`, `integrated`, then `acknowledged`. Blocked, failed, and recovery-required attempts can be archived and retried. Every mutation carries a unique action id, expected state revision, and authority; exact replays are idempotent, while altered replays and stale revisions fail closed.
+
+The residual planner starts disjoint write scopes in parallel and retains active leases across blocked or failed attempts. It never uses capacity as a fan-out target and never falls back to a shared writable checkout.
+
+## Worktrees, candidates, and review
+
+Worktrees and sandboxing solve different problems and are both enforced. `workspace-write` limits the executor process; the detached worktree keeps its Git changes away from the main checkout. Before publication, the controller verifies the actual changed paths, rejects executor commits or HEAD changes, checks symlink and submodule policy, runs the declared commands without a shell, and copies only declared in-scope artifacts.
+
+The controller then creates an immutable hidden candidate ref through Git plumbing. The executor never stages or commits. Candidate identity binds the base revision, tree diff, contract, checks, and artifact manifest. Reusing an attempt with different content is rejected.
+
+Root-driven review and integration use explicit state revisions:
+
+```text
+npm run control -- claim --cwd . --assignment-id <id> --revision <n>
+npm run control -- request-review --cwd . --assignment-id <id> --revision <n>
+review briefing | npm run executor -- --profile review --cwd . --sandbox read-only --candidate-id <candidate-id>
+npm run control -- approve --cwd . --assignment-id <id> --revision <n> --kind root
+npm run control -- integrate --cwd . --assignment-id <id> --revision <n>
+npm run control -- ack --cwd . --assignment-id <id> --revision <n>
+```
+
+An independent verdict is bound to the exact candidate id and revision. Optional operator approval is a separate authority. Integration rechecks candidate integrity and path drift, refuses conflicts with local work, and applies the patch unstaged. Retry archives the prior worktree first; acknowledged and abandoned workspaces can then be cleaned safely.
+
+## Local control dashboard and simulator
+
+```text
+npm run dashboard -- --cwd .
+npm run simulate -- --iterations 1000 --seed 73
+```
+
+The dashboard binds only to `127.0.0.1`, `localhost`, or `::1`. It uses a single-use URL token, an HttpOnly SameSite cookie, Host and Origin validation, CSRF protection, and a restrictive content security policy. It exposes the redacted projection, not briefings, raw events, or artifact contents, and permits only operator answers and approvals.
+
+The deterministic simulator is pure: it changes neither Git nor durable state. It exercises successful candidates, zero-change readers, independent review, operator approval, blocked retry, recovery, stale action replay, stale candidate use, premature integration, and unauthorized actions.
+
 ## Result contract
 
 ```json
 {
+  "schema_version": 2,
+  "assignment_id": "uuid",
+  "attempt": 1,
   "status": "completed | blocked | failed",
   "profile": "explore | implement-lite | playwright | implement | review | null",
   "thread_id": "string | null",
@@ -102,17 +152,21 @@ Machine-readable JSON remains the only stdout output. `NO_COLOR`, `TERM=dumb`, a
   "service_tier": "fast | standard | null",
   "routing_verified": false,
   "sandbox_mode": "read-only | workspace-write",
+  "base_revision": "full Git object id",
+  "candidate": "object | null",
   "summary": "string",
   "changed_files": [],
+  "artifacts": [],
+  "operator_requests": [],
   "checks": [],
   "blockers": [],
   "warnings": []
 }
 ```
 
-The executor supplies only task fields. The launcher adds the profile and observed routing metadata. `routing_verified` becomes true only when App Server settings confirm model, effort, and tier and rollout `turn_context` independently confirms model and effort.
+The executor still supplies only task fields. The launcher adds observed routing metadata and the durable controller adds assignment, attempt, base revision, candidate, artifact, operator-request, and required-check evidence. `routing_verified` becomes true only when App Server settings confirm model, effort, and tier and rollout `turn_context` independently confirms model and effort.
 
-The executor result contract remains unchanged. Ultra uses the same shared fields and adds `mode: "ultra"`, `lock_id`, integer `generation`, and `executors`. The generation is allocated once per Ultra epoch and is included even in terminal failures after acquisition.
+The legacy v1 task payload remains available to compatible read-only callers. Ultra uses the shared routing fields and adds `mode: "ultra"`, `lock_id`, integer `generation`, and `executors`. The generation is allocated once per Ultra epoch and is included even in terminal failures after acquisition.
 
 Exit codes are stable:
 
@@ -129,7 +183,7 @@ Capacity is enforced with atomic leases at repository and machine scope:
 - total machine capacity: 14 executors;
 - Playwright: 2 across the PC, counted inside the Luna pool.
 
-The root and Ultra process do not consume executor slots. Executors started by Ultra do. Reaching a limit fails immediately; the launcher does not create a hidden queue.
+The root and Ultra process do not consume executor slots. Executors started by Ultra do. Reaching an executor pool limit fails immediately. Durable assignments may remain explicitly queued until `reconcile` can start them; the launcher does not create a second hidden queue.
 
 These numbers are upper bounds, not a target. Parallel work should have independent evidence or ownership. Overlapping writes must remain sequential, and creating redundant executors usually costs more integration time than it saves.
 
@@ -173,7 +227,7 @@ Version 1 state is never silently upgraded while active. The gate reports it as 
 
 History is append-only and stores sanitized coordination metadata rather than briefings, model responses, or raw errors. Retention targets 1,000 events and prunes only terminal generations; the active generation is protected and can temporarily keep the count above that target. History corruption is reported as a warning and is never used as lock authority.
 
-There is no TTL, heartbeat, automatic recovery, worktree isolation, dependency fallback, or `shell: true` execution. Descendants not launched through the registered launcher/App Server paths cannot be identified portably. Fencing prevents stale orchestration transitions and result publication, but it cannot atomically cancel an arbitrary unregistered descendant that is already mutating the workspace.
+There is no TTL, heartbeat, automatic recovery, shared-checkout write fallback, dependency fallback, or `shell: true` execution. Ultra cannot release while one of its durable assignments remains unfinished. Descendants not launched through the registered launcher/App Server paths cannot be identified portably. Fencing prevents stale orchestration transitions and result publication, but it cannot atomically cancel an arbitrary unregistered descendant that is already mutating a worktree.
 
 ## Verification
 
@@ -183,4 +237,4 @@ npm run verify:platform
 npm run verify:live
 ```
 
-The unit suite covers JSON-RPC ordering and failures, profile routing, structured results, tiers, terminal colors, capacity races, Ultra fencing generations, portable process identity, fail-closed recovery, immutable redacted history and retention, safe version 1 migration, Playwright preflight and tool evidence, installer rollback, and platform-specific path rules. `verify:platform` is the authentication-free compatibility gate and includes a live fingerprint check for the current process. Live verification generates the installed App Server schemas, checks the root and every profile against protocol and rollout evidence, uses temporary repositories for write tests, and confirms that read-only checks do not alter this repository. Add `--output <path-outside-the-repository>` to either verification command when an evidence artifact is required.
+The unit suite covers JSON-RPC ordering and failures, profile routing, durable state transitions, action idempotency, resource leases, worktree isolation, immutable candidates, unstaged integration, required checks and artifacts, independent review, operator gates, dashboard security, deterministic fault simulation, tiers, terminal colors, capacity races, Ultra fencing generations, portable process identity, fail-closed recovery, immutable redacted history and retention, safe version 1 migration, Playwright preflight and tool evidence, installer rollback, and platform-specific path rules. `verify:platform` is the authentication-free compatibility gate and includes a live fingerprint check for the current process. Live verification generates the installed App Server schemas, checks the root and every profile against protocol and rollout evidence, uses temporary repositories for write tests, and confirms that read-only checks do not alter this repository. Add `--output <path-outside-the-repository>` to either verification command when an evidence artifact is required.

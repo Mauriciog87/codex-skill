@@ -4,15 +4,15 @@ The root Codex session is the orchestrator. At the beginning of every new substa
 
 ## Model roles
 
-| Role | Model | Effort | Tier | Sandbox |
-|---|---|---|---|---|
-| Root and planner | `gpt-5.6-sol` | `xhigh` | Standard | Current session |
-| `explore` | `gpt-5.6-luna` | `max` | Fast | `read-only` |
-| `implement-lite` | `gpt-5.6-luna` | `max` | Fast | Explicit `workspace-write` |
-| `playwright` | `gpt-5.6-luna` | `max` | Standard | `read-only` for repository files |
-| `implement` | `gpt-5.6-sol` | `high` | Standard | Explicit `workspace-write` |
-| `review` | `gpt-5.6-sol` | `high` | Standard | `read-only` |
-| Exceptional takeover | `gpt-5.6-sol` | `ultra` | Standard | Human-confirmed repository lock |
+| Role | Model | Effort | Tier | Sandbox | Workspace |
+|---|---|---|---|---|---|
+| Root and planner | `gpt-5.6-sol` | `xhigh` | Standard | Current session | Main checkout |
+| `explore` | `gpt-5.6-luna` | `max` | Fast | `read-only` | Shared checkout |
+| `implement-lite` | `gpt-5.6-luna` | `max` | Fast | Explicit `workspace-write` | Isolated worktree |
+| `playwright` | `gpt-5.6-luna` | `max` | Standard | `read-only` for repository files | Shared checkout |
+| `implement` | `gpt-5.6-sol` | `high` | Standard | Explicit `workspace-write` | Isolated worktree |
+| `review` | `gpt-5.6-sol` | `high` | Standard | `read-only` | Exact candidate worktree when reviewing a candidate |
+| Exceptional takeover | `gpt-5.6-sol` | `ultra` | Standard | Human-confirmed repository lock | Main checkout |
 
 Every role uses `model_verbosity = "low"`. Fast profiles force `features.fast_mode = true`; Standard roles force it to `false`. Verbosity controls response length independently from reasoning effort.
 
@@ -24,7 +24,15 @@ All executor work must use:
 node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile explore|implement-lite|playwright|implement|review [options]
 ```
 
-The briefing is read from stdin. The profile fixes model, reasoning effort, tier, and sandbox. Do not use native `spawn_agent` or custom agent TOML for executor routing. Reconsider native spawning only after it exposes role-specific routing and live tests prove every required model, effort, and tier.
+The briefing is read from stdin. The profile fixes model, reasoning effort, tier, sandbox, workspace strategy, and capabilities. Writer profiles require at least one `--write-root`; the worktree is additional isolation and never replaces `workspace-write`. Do not use native `spawn_agent` or custom agent TOML for executor routing. Reconsider native spawning only after it exposes role-specific routing and live tests prove every required model, effort, and tier.
+
+## Durable control plane
+
+Control plane v2 and result format v2 are the defaults. Every assignment binds the base revision, allowed and forbidden write roots, required checks, artifacts, review policy, and operator approval policy. State transitions require an action id, exact state revision, and authorized actor. Replays are idempotent; stale revisions, changed action replays, overlapping writer leases, and stale Ultra generations fail closed.
+
+Writer profiles run in controller-created detached worktrees outside the repository. Executors never stage, commit, change HEAD, create branches, or push. The controller validates actual Git changes and declared artifacts, runs required checks without a shell, creates an immutable candidate ref, and leaves final integration unstaged in the main checkout. Only root or Ultra may claim, approve, integrate, acknowledge, archive, or retry a writer assignment. Independent `review` runs against the exact candidate revision. Operator questions and approvals are never inferred.
+
+Use `orchestration-control.mjs status|next|reconcile` for residual work and its revision-fenced mutation commands for claim, review, approval, integration, acknowledgement, answers, retry, abandonment, archival, and cleanup. The local dashboard is projection-only, loopback-bound, one-time authenticated, CSRF protected, and limited to operator answers and approvals. The deterministic simulator mutates neither Git nor durable state.
 
 ## Concurrency
 
@@ -34,7 +42,7 @@ The briefing is read from stdin. The profile fixes model, reasoning effort, tier
 - Playwright consumes Luna capacity and has a separate machine-wide limit of 2.
 - Root and Ultra are excluded; executors started by Ultra are included.
 - These are maximum capacities, not fan-out targets. Delegate only useful independent scopes.
-- Run overlapping writes sequentially.
+- Never run overlapping write roots concurrently. Disjoint writer worktrees may run in parallel when the residual planner selects them.
 
 The launchers acquire atomic repository and machine leases and fail immediately with code `2` when a pool is full. Inspect utilization through `orchestration-gate.mjs status`. Never manually edit state.
 
@@ -48,7 +56,7 @@ node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs
 
 The repository lock has no time-based expiry. Every Ultra epoch receives a repository-persistent monotonic generation. Normal executors and unrelated sessions stop while it exists. Ultra may run only verified profiles carrying the matching `CODEX_ORCHESTRATION_LOCK_ID` and `CODEX_ORCHESTRATION_GENERATION`; those executors consume the normal capacity pools and still serialize overlapping writes. State and result transitions revalidate both values. A verified terminal result releases the lock. Timeout, interruption, process, contract, or routing failure leaves `recovery-required`.
 
-State v2 registers launcher and App Server process identities for Ultra and its executors. Recovery succeeds only when every registered identity is confirmed dead or reused; live and unknown identities fail closed, and recovery never kills a process. Version 1 state remains `legacy-unfenced` until explicitly recovered with `--confirm-legacy-recovery`. History is immutable, sanitized, retention-bounded evidence and is not lock authority. There is no TTL, heartbeat, automatic recovery, worktree isolation, dependency fallback, or `shell: true`. Descendants outside registered launcher/App Server paths cannot be identified portably or atomically stopped.
+State v2 registers launcher and App Server process identities for Ultra and its executors. Recovery succeeds only when every registered identity is confirmed dead or reused; live and unknown identities fail closed, and recovery never kills a process. Version 1 state remains `legacy-unfenced` until explicitly recovered with `--confirm-legacy-recovery`. History is immutable, sanitized, retention-bounded evidence and is not lock authority. There is no TTL, heartbeat, automatic recovery, shared-checkout write fallback, dependency fallback, or `shell: true`. Descendants outside registered launcher/App Server paths cannot be identified portably or atomically stopped. Ultra cannot release while an assignment from its lock id and generation remains unfinished.
 
 Inspect or recover only through:
 
@@ -67,14 +75,15 @@ node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs recove
 5. Use `playwright` for isolated browser evidence and authorized test interactions.
 6. Use `implement` for bounded changes needing stronger engineering judgment.
 7. Use `review` for independent critique of a named plan or high-risk Git change.
-8. Inspect executor evidence instead of repeating discovery unless verification requires it.
-9. Request Ultra only for an explicit exceptional reason and pause while it owns the repository.
+8. Claim the durable result, bind review and approval to its candidate id, integrate only after every gate passes, then acknowledge and clean the worktree.
+9. Inspect executor evidence instead of repeating discovery unless verification requires it.
+10. Request Ultra only for an explicit exceptional reason and pause while it owns the repository.
 
 ## Executor responsibilities
 
 1. Complete only the briefing and preserve unrelated changes.
-2. Follow the selected profile, applicable project instructions, and assigned sandbox.
-3. Do not re-delegate, launch another Codex session, alter orchestration or approval policy, use bypasses, commit, or push.
+2. Follow the selected profile, applicable project instructions, assigned sandbox, worktree, and path contract.
+3. Do not re-delegate, launch another Codex session, alter orchestration or approval policy, use bypasses, stage, commit, change HEAD, create branches, or push.
 4. Return the required structured result with changed files, checks, blockers, and warnings.
 
 `explore` returns no changed files and escalates architectural, security, concurrency, distributed-invariant, or contradictory-contract decisions. `implement-lite` escalates expanded or cross-cutting work to `implement`. Neither implementation profile self-approves. `review` returns `APPROVE` or `COMMENT` with completed status, or `REQUEST_CHANGES` with blocked status and at least one blocker.

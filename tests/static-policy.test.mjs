@@ -45,6 +45,12 @@ test("package scripts and skill policy expose the supported interfaces", async (
     "install:global": "node scripts/install-global-orchestration.mjs",
     executor:
       "node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs",
+    control:
+      "node .agents/skills/sol-luna-orchestration/scripts/orchestration-control.mjs",
+    dashboard:
+      "node .agents/skills/sol-luna-orchestration/scripts/orchestration-control.mjs dashboard",
+    simulate:
+      "node .agents/skills/sol-luna-orchestration/scripts/orchestration-simulator.mjs",
     ultra: "node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs",
     "ultra:gate":
       "node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs",
@@ -72,15 +78,22 @@ test("profile registry and operational guidance stay aligned", async () => {
     Object.fromEntries(
       Object.entries(EXECUTOR_PROFILES).map(([name, profile]) => [
         name,
-        [profile.model, profile.reasoningEffort, profile.serviceTier, profile.sandboxMode],
+        [
+          profile.model,
+          profile.reasoningEffort,
+          profile.serviceTier,
+          profile.sandboxMode,
+          profile.workspaceStrategy,
+          profile.capabilities,
+        ],
       ]),
     ),
     {
-      explore: ["gpt-5.6-luna", "max", "fast", "read-only"],
-      "implement-lite": ["gpt-5.6-luna", "max", "fast", "workspace-write"],
-      playwright: ["gpt-5.6-luna", "max", "standard", "read-only"],
-      implement: ["gpt-5.6-sol", "high", "standard", "workspace-write"],
-      review: ["gpt-5.6-sol", "high", "standard", "read-only"],
+      explore: ["gpt-5.6-luna", "max", "fast", "read-only", "shared-read-only", ["workspace-read", "operator-request"]],
+      "implement-lite": ["gpt-5.6-luna", "max", "fast", "workspace-write", "isolated-worktree", ["workspace-read", "workspace-write", "operator-request"]],
+      playwright: ["gpt-5.6-luna", "max", "standard", "read-only", "shared-read-only", ["workspace-read", "browser", "operator-request"]],
+      implement: ["gpt-5.6-sol", "high", "standard", "workspace-write", "isolated-worktree", ["workspace-read", "workspace-write", "operator-request"]],
+      review: ["gpt-5.6-sol", "high", "standard", "read-only", "candidate-worktree", ["workspace-read", "review"]],
     },
   );
 
@@ -145,6 +158,49 @@ test("profile registry and operational guidance stay aligned", async () => {
   assert.match(gate, /history/);
   assert.match(gate, /--confirm-legacy-recovery/);
 
+  const controlPlane = await readFile(
+    ".agents/skills/sol-luna-orchestration/scripts/control-plane.mjs",
+    "utf8",
+  );
+  assert.match(controlPlane, /expected_state_revision/);
+  assert.match(controlPlane, /action-id-reuse/);
+  assert.match(controlPlane, /resource-capacity/);
+  assert.match(controlPlane, /operator_requests require a blocked result/);
+
+  const gitWorkspace = await readFile(
+    ".agents/skills/sol-luna-orchestration/scripts/git-workspace.mjs",
+    "utf8",
+  );
+  assert.match(gitWorkspace, /worktree.*add/);
+  assert.match(gitWorkspace, /candidate-ref-exists/);
+  assert.match(gitWorkspace, /integration unexpectedly staged/);
+  assert.doesNotMatch(gitWorkspace, /shell\s*:\s*true/);
+
+  const dashboard = await readFile(
+    ".agents/skills/sol-luna-orchestration/scripts/orchestration-dashboard.mjs",
+    "utf8",
+  );
+  assert.match(dashboard, /timingSafeEqual/);
+  assert.match(dashboard, /X-CSRF-Token/);
+  assert.match(dashboard, /Content-Security-Policy/);
+  assert.match(dashboard, /Dashboard action is not allowed/);
+
+  const simulator = await readFile(
+    ".agents/skills/sol-luna-orchestration/scripts/orchestration-simulator.mjs",
+    "utf8",
+  );
+  assert.match(simulator, /stale-state-revision/);
+  assert.match(simulator, /stale-candidate/);
+
+  for (const path of [
+    ".agents/skills/sol-luna-orchestration/references/assignment-request.schema.json",
+    ".agents/skills/sol-luna-orchestration/references/executor-result.schema.json",
+    ".agents/skills/sol-luna-orchestration/references/executor-result-v2.schema.json",
+  ]) {
+    const schema = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(schema.$schema, "https://json-schema.org/draft/2020-12/schema");
+  }
+
   for (const path of [
     "AGENTS.md",
     "README.md",
@@ -171,6 +227,9 @@ test("profile registry and operational guidance stay aligned", async () => {
     assert.match(content, /thread\/settings\/updated/);
     assert.match(content, /priority/);
     assert.match(content, /default/);
+    assert.match(content, /worktree/i);
+    assert.match(content, /candidate/i);
+    assert.match(content, /durable/i);
   }
 });
 
@@ -240,6 +299,9 @@ test("platform smoke and documentation expose the same portability contract", as
   assert.match(liveRunner, /codex_version/);
   assert.match(liveRunner, /"generation"/);
   assert.match(liveRunner, /writeJsonOutput/);
+  assert.match(liveRunner, /invokeDurableExecutor/);
+  assert.match(liveRunner, /integrateCandidate/);
+  assert.match(liveRunner, /cleanupAssignmentWorktree/);
 
   for (const path of [
     "README.md",

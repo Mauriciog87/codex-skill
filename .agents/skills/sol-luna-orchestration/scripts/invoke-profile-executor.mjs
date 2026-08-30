@@ -30,6 +30,8 @@ import {
 
 export const DEFAULT_SANDBOX_MODE = "read-only";
 export const DEFAULT_TIMEOUT_SECONDS = 900;
+export const DEFAULT_CONTROL_PLANE = "v2";
+export const DEFAULT_RESULT_FORMAT = "v2";
 
 const MAX_BRIEFING_BYTES = 1_048_576;
 const MAX_DIAGNOSTIC_CHARACTERS = 131_072;
@@ -91,18 +93,67 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
     cwd: resolve(baseDirectory),
     sandboxMode: DEFAULT_SANDBOX_MODE,
     timeoutSeconds: DEFAULT_TIMEOUT_SECONDS,
+    controlPlane: DEFAULT_CONTROL_PLANE,
+    resultFormat: DEFAULT_RESULT_FORMAT,
+    assignmentId: null,
+    enqueueOnly: false,
+    priority: "normal",
+    writeRoots: [],
+    forbiddenRoots: [],
+    requiredChecks: [],
+    artifacts: [],
+    reviewPolicy: "root",
+    operatorApprovalRequired: false,
+    allowSymlinks: false,
+    allowSubmodules: false,
+    candidateId: null,
   };
   const seen = new Set();
+  const repeatable = new Set(["--write-root", "--forbid-root", "--check-json", "--artifact-json"]);
+  const booleanOptions = new Set([
+    "--enqueue-only",
+    "--require-operator-approval",
+    "--allow-symlinks",
+    "--allow-submodules",
+  ]);
+  const valueOptions = new Set([
+    "--profile",
+    "--cwd",
+    "--sandbox",
+    "--timeout-seconds",
+    "--control-plane",
+    "--result-format",
+    "--assignment-id",
+    "--priority",
+    "--write-root",
+    "--forbid-root",
+    "--check-json",
+    "--artifact-json",
+    "--review-policy",
+    "--candidate-id",
+  ]);
 
   for (let index = 0; index < argv.length; index += 1) {
     const option = argv[index];
-    if (!["--profile", "--cwd", "--sandbox", "--timeout-seconds"].includes(option)) {
+    if (!valueOptions.has(option) && !booleanOptions.has(option)) {
       throw new ExecutorInvocationError(`Unknown option: ${option}`);
     }
-    if (seen.has(option)) {
+    if (seen.has(option) && !repeatable.has(option)) {
       throw new ExecutorInvocationError(`Duplicate option: ${option}`);
     }
     seen.add(option);
+    if (booleanOptions.has(option)) {
+      if (option === "--enqueue-only") {
+        parsed.enqueueOnly = true;
+      } else if (option === "--require-operator-approval") {
+        parsed.operatorApprovalRequired = true;
+      } else if (option === "--allow-symlinks") {
+        parsed.allowSymlinks = true;
+      } else {
+        parsed.allowSubmodules = true;
+      }
+      continue;
+    }
     const value = requireOptionValue(argv, index, option);
     index += 1;
 
@@ -125,7 +176,7 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
         );
       }
       parsed.sandboxMode = value;
-    } else {
+    } else if (option === "--timeout-seconds") {
       const timeoutSeconds = Number(value);
       if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 86_400) {
         throw new ExecutorInvocationError(
@@ -133,6 +184,46 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
         );
       }
       parsed.timeoutSeconds = timeoutSeconds;
+    } else if (option === "--control-plane") {
+      if (!["v1", "v2"].includes(value)) {
+        throw new ExecutorInvocationError("--control-plane must be v1 or v2.");
+      }
+      parsed.controlPlane = value;
+    } else if (option === "--result-format") {
+      if (!["v1", "v2"].includes(value)) {
+        throw new ExecutorInvocationError("--result-format must be v1 or v2.");
+      }
+      parsed.resultFormat = value;
+    } else if (option === "--assignment-id") {
+      parsed.assignmentId = value;
+    } else if (option === "--priority") {
+      if (!["high", "normal", "low"].includes(value)) {
+        throw new ExecutorInvocationError("--priority must be high, normal, or low.");
+      }
+      parsed.priority = value;
+    } else if (option === "--write-root") {
+      parsed.writeRoots.push(value);
+    } else if (option === "--forbid-root") {
+      parsed.forbiddenRoots.push(value);
+    } else if (option === "--check-json") {
+      try {
+        parsed.requiredChecks.push(JSON.parse(value));
+      } catch (error) {
+        throw new ExecutorInvocationError(`--check-json is invalid JSON: ${error.message}`);
+      }
+    } else if (option === "--artifact-json") {
+      try {
+        parsed.artifacts.push(JSON.parse(value));
+      } catch (error) {
+        throw new ExecutorInvocationError(`--artifact-json is invalid JSON: ${error.message}`);
+      }
+    } else if (option === "--review-policy") {
+      if (!["root", "independent"].includes(value)) {
+        throw new ExecutorInvocationError("--review-policy must be root or independent.");
+      }
+      parsed.reviewPolicy = value;
+    } else {
+      parsed.candidateId = value;
     }
   }
 
@@ -144,6 +235,55 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
     throw new ExecutorInvocationError(
       `Profile ${profile.name} requires --sandbox ${profile.sandboxMode}.`,
     );
+  }
+  if (parsed.controlPlane === "v1") {
+    const durableOptions = [
+      "--assignment-id",
+      "--enqueue-only",
+      "--priority",
+      "--write-root",
+      "--forbid-root",
+      "--check-json",
+      "--artifact-json",
+      "--review-policy",
+      "--require-operator-approval",
+      "--allow-symlinks",
+      "--allow-submodules",
+      "--candidate-id",
+    ];
+    if (durableOptions.some((option) => seen.has(option))) {
+      throw new ExecutorInvocationError("Durable assignment options require --control-plane v2.");
+    }
+    parsed.resultFormat = "v1";
+  }
+  if (parsed.assignmentId !== null) {
+    const contractOptions = [
+      "--priority",
+      "--write-root",
+      "--forbid-root",
+      "--check-json",
+      "--artifact-json",
+      "--review-policy",
+      "--require-operator-approval",
+      "--allow-symlinks",
+      "--allow-submodules",
+      "--candidate-id",
+    ];
+    if (contractOptions.some((option) => seen.has(option))) {
+      throw new ExecutorInvocationError("A resumed assignment uses its stored contract.");
+    }
+  }
+  if (profile.workspaceStrategy === "isolated-worktree" && parsed.assignmentId === null && parsed.writeRoots.length === 0) {
+    throw new ExecutorInvocationError("Workspace-write profiles require at least one --write-root.");
+  }
+  if (profile.workspaceStrategy === "isolated-worktree" && parsed.resultFormat === "v1") {
+    throw new ExecutorInvocationError("Workspace-write profiles require --result-format v2.");
+  }
+  if (parsed.candidateId !== null && parsed.profile !== "review") {
+    throw new ExecutorInvocationError("--candidate-id requires --profile review.");
+  }
+  if (parsed.enqueueOnly && parsed.assignmentId !== null) {
+    throw new ExecutorInvocationError("--enqueue-only cannot resume an existing assignment.");
   }
 
   return parsed;
@@ -522,6 +662,7 @@ export function validateExecutorPayload(value) {
     "checks",
     "blockers",
     "warnings",
+    "operator_requests",
   ];
   const unexpectedProperties = Object.keys(value).filter(
     (property) => !allowedProperties.includes(property),
@@ -543,8 +684,30 @@ export function validateExecutorPayload(value) {
   assertStringArray(value.checks, "checks");
   assertStringArray(value.blockers, "blockers");
   assertStringArray(value.warnings, "warnings");
+  const operatorRequests = value.operator_requests ?? [];
+  if (!Array.isArray(operatorRequests)) {
+    throw new ExecutorConfigurationError("operator_requests must be an array.");
+  }
+  if (operatorRequests.length > 0 && value.status !== "blocked") {
+    throw new ExecutorConfigurationError("operator_requests require status blocked.");
+  }
+  for (const [index, request] of operatorRequests.entries()) {
+    if (request === null || typeof request !== "object" || Array.isArray(request)) {
+      throw new ExecutorConfigurationError(`operator_requests[${index}] must be an object.`);
+    }
+    const unexpected = Object.keys(request).filter((property) => !["question", "choices"].includes(property));
+    if (unexpected.length > 0) {
+      throw new ExecutorConfigurationError(
+        `Unexpected operator request properties: ${unexpected.join(", ")}.`,
+      );
+    }
+    if (typeof request.question !== "string" || request.question.trim().length === 0) {
+      throw new ExecutorConfigurationError(`operator_requests[${index}].question must be non-empty.`);
+    }
+    assertStringArray(request.choices, `operator_requests[${index}].choices`);
+  }
 
-  return {
+  const validated = {
     status: value.status,
     summary: value.summary,
     changed_files: [...value.changed_files],
@@ -552,6 +715,13 @@ export function validateExecutorPayload(value) {
     blockers: [...value.blockers],
     warnings: [...value.warnings],
   };
+  if (value.operator_requests !== undefined) {
+    validated.operator_requests = operatorRequests.map((request) => ({
+      question: request.question.trim(),
+      choices: [...request.choices],
+    }));
+  }
+  return validated;
 }
 
 function validateProfilePayload(profileName, payload) {
@@ -886,6 +1056,7 @@ async function runExecutor({
     });
     return {
       result,
+      operatorRequests: payload.operator_requests ?? [],
       exitCode: determineExitCode({
         status: result.status,
         routingVerified: result.routing_verified,
@@ -952,7 +1123,7 @@ export async function main(argv = process.argv.slice(2)) {
 
   try {
     options = parseArguments(argv);
-    const briefing = await readBriefing();
+    const briefing = options.assignmentId === null ? await readBriefing() : "";
     const profile = requireExecutorProfile(options.profile, options.sandboxMode);
     writeStatusMessage(
       executorLaunchMessage({
@@ -965,11 +1136,20 @@ export async function main(argv = process.argv.slice(2)) {
       process.stderr,
       { colorCode: profile.colorCode },
     );
-    const execution = await invokeExecutor({
-      briefing,
-      options,
-      signal: abortController.signal,
-    });
+    const execution = options.controlPlane === "v2"
+      ? await (
+          await import("./durable-executor.mjs")
+        ).invokeDurableExecutor({
+          briefing,
+          options,
+          invokeLegacy: invokeExecutor,
+          signal: abortController.signal,
+        })
+      : await invokeExecutor({
+          briefing,
+          options,
+          signal: abortController.signal,
+        });
     writeStatusMessage(executorResultMessage(execution.result), process.stderr, {
       colorCode: profile.colorCode,
     });
