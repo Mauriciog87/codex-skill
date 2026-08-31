@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
+import { access, mkdtemp, mkdir, readFile, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { createAssignment } from "../.agents/skills/sol-luna-orchestration/scripts/control-plane.mjs";
 import { getRepositoryState } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
 import {
   GitWorkspaceError,
+  archiveAssignmentWorktree,
   assertMainCheckoutCompatible,
   cleanupAssignmentWorktree,
   commitIntegratedCandidate,
@@ -14,6 +16,7 @@ import {
   createCandidate,
   inspectGitRepository,
   integrateCandidate,
+  gitArgumentsForPlatform,
   parsePorcelainV2,
   pushCommittedCandidate,
   readWorkspaceStatus,
@@ -102,6 +105,38 @@ test("porcelain v2 parser retains both sides of renames", () => {
     { kind: "rename", xy: "R.", path: "src/new.txt", original_path: "src/old.txt" },
     { kind: "untracked", xy: "??", path: "src/untracked.txt", original_path: null },
   ]);
+});
+
+test("Git enables long paths per Windows command without changing other platforms", () => {
+  const args = ["worktree", "list", "--porcelain", "-z"];
+  assert.deepEqual(
+    gitArgumentsForPlatform(args, "win32"),
+    ["-c", "core.longpaths=true", ...args],
+  );
+  assert.deepEqual(gitArgumentsForPlatform(args, "linux"), args);
+  assert.deepEqual(gitArgumentsForPlatform(args, "darwin"), args);
+});
+
+test("runGit derives its long-path override from the host instead of caller options", async () => {
+  let invokedArgs = null;
+  await runGit(["status", "--short"], {
+    platform: process.platform === "win32" ? "linux" : "win32",
+    spawnImplementation: (executable, args) => {
+      assert.equal(executable, "git");
+      invokedArgs = args;
+      const child = new EventEmitter();
+      child.stdin = { end: () => {} };
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => {};
+      queueMicrotask(() => child.emit("close", 0, null));
+      return child;
+    },
+  });
+  assert.deepEqual(
+    invokedArgs,
+    gitArgumentsForPlatform(["status", "--short"], process.platform),
+  );
 });
 
 test("writer worktree isolates changes and candidate integration stays unstaged", async () => {
@@ -294,6 +329,126 @@ test("worktree cleanup accepts canonical paths beneath an aliased state root", a
     const cleanup = await cleanupAssignmentWorktree({ ...record, workspace }, aliasedOptions);
     assert.equal(cleanup.cleaned, true);
   } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("worktree archive and cleanup are idempotent with paths longer than 260 characters", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    await runGit(["config", "--local", "core.longpaths", "false"], {
+      ...fixture.options,
+      cwd: fixture.repository,
+    });
+    const record = await createWriterAssignment(fixture);
+    const workspace = await createAssignmentWorktree(record, fixture.options);
+    const activeRecord = { ...record, workspace };
+    let deepDirectory = workspace.path;
+    for (let index = 0; index < 6; index += 1) {
+      deepDirectory = join(deepDirectory, `${String(index)}-${"nested".repeat(8)}`);
+    }
+    await mkdir(deepDirectory, { recursive: true });
+    const deepFile = join(deepDirectory, "value.txt");
+    await writeFile(deepFile, "long path\n", "utf8");
+    assert.ok(deepFile.length > 260, `Expected a path longer than 260 characters, received ${deepFile.length}.`);
+
+    const archivedPath = await archiveAssignmentWorktree(activeRecord, fixture.options);
+    assert.ok(archivedPath.length <= workspace.path.length);
+    assert.match(archivedPath, /[\\/]a-[^\\/]+$/);
+    assert.equal(
+      await archiveAssignmentWorktree(activeRecord, fixture.options),
+      archivedPath,
+    );
+
+    const archivedRecord = {
+      ...activeRecord,
+      workspace: { ...workspace, archive_path: archivedPath, archived: true },
+    };
+    assert.equal((await cleanupAssignmentWorktree(archivedRecord, fixture.options)).cleaned, true);
+    assert.equal((await cleanupAssignmentWorktree(archivedRecord, fixture.options)).cleaned, true);
+    await assert.rejects(access(archivedPath), { code: "ENOENT" });
+    const configured = await runGit(["config", "--local", "--get", "core.longpaths"], {
+      ...fixture.options,
+      cwd: fixture.repository,
+    });
+    assert.equal(configured.stdoutText.trim(), "false");
+  } finally {
+    await runGit(["worktree", "prune", "--expire", "now"], {
+      cwd: fixture.repository,
+      allowFailure: true,
+    });
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("archive recovery supports legacy destinations and rejects conflicting paths", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    const legacyRecord = await createWriterAssignment(fixture);
+    const legacyWorkspace = await createAssignmentWorktree(legacyRecord, fixture.options);
+    const state = await getRepositoryState(fixture.repository, fixture.options);
+    const legacyPath = join(
+      state.worktreesDirectory,
+      "archive",
+      `archive-${legacyRecord.assignment_id.replaceAll("-", "").slice(0, 16)}-${legacyRecord.attempt}`,
+    );
+    await mkdir(dirname(legacyPath), { recursive: true });
+    await runGit(["worktree", "move", legacyWorkspace.path, legacyPath], {
+      ...fixture.options,
+      cwd: fixture.repository,
+    });
+    const recognizedLegacyPath = await archiveAssignmentWorktree(
+      { ...legacyRecord, workspace: legacyWorkspace },
+      fixture.options,
+    );
+    assert.equal(recognizedLegacyPath, await realpath(legacyPath));
+    const archivedLegacyRecord = {
+      ...legacyRecord,
+      workspace: {
+        ...legacyWorkspace,
+        archive_path: recognizedLegacyPath,
+        archived: true,
+      },
+    };
+    assert.equal((await cleanupAssignmentWorktree(archivedLegacyRecord, fixture.options)).cleaned, true);
+    assert.equal((await cleanupAssignmentWorktree(archivedLegacyRecord, fixture.options)).cleaned, true);
+
+    const conflictRecord = await createWriterAssignment(fixture);
+    const conflictWorkspace = await createAssignmentWorktree(conflictRecord, fixture.options);
+    const shortPath = join(
+      state.worktreesDirectory,
+      `a-${conflictRecord.assignment_id.replaceAll("-", "").slice(0, 16)}-${conflictRecord.attempt}`,
+    );
+    await mkdir(shortPath, { recursive: true });
+    await assert.rejects(
+      archiveAssignmentWorktree(
+        { ...conflictRecord, workspace: conflictWorkspace },
+        fixture.options,
+      ),
+      (error) => error instanceof GitWorkspaceError && error.code === "worktree-archive-conflict",
+    );
+    await cleanupAssignmentWorktree(
+      { ...conflictRecord, workspace: conflictWorkspace },
+      fixture.options,
+    );
+    const legacyConflictPath = join(
+      state.worktreesDirectory,
+      "archive",
+      `archive-${conflictRecord.assignment_id.replaceAll("-", "").slice(0, 16)}-${conflictRecord.attempt}`,
+    );
+    await mkdir(legacyConflictPath, { recursive: true });
+    await assert.rejects(
+      archiveAssignmentWorktree(
+        { ...conflictRecord, workspace: conflictWorkspace },
+        fixture.options,
+      ),
+      (error) => error instanceof GitWorkspaceError && error.code === "worktree-archive-conflict",
+    );
+  } finally {
+    await runGit(["worktree", "prune", "--expire", "now"], {
+      cwd: fixture.repository,
+      allowFailure: true,
+    });
     await rm(fixture.root, { recursive: true, force: true });
   }
 });

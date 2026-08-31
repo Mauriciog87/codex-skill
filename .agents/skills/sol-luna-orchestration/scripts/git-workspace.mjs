@@ -9,7 +9,7 @@ import {
   realpath,
   rm,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   canonicalJson,
   normalizeRepositoryPath,
@@ -138,8 +138,15 @@ export function runProcess(executable, args, {
   });
 }
 
+export function gitArgumentsForPlatform(args, platform = process.platform) {
+  return platform === "win32"
+    ? ["-c", "core.longpaths=true", ...args]
+    : [...args];
+}
+
 export async function runGit(args, options = {}) {
-  const result = await runProcess("git", args, options);
+  const effectiveArgs = gitArgumentsForPlatform(args);
+  const result = await runProcess("git", effectiveArgs, options);
   if (result.exitCode !== 0 && options.allowFailure !== true) {
     const detail = result.stderr.toString("utf8").trim() || result.stdout.toString("utf8").trim();
     throw new GitWorkspaceError(
@@ -1211,17 +1218,61 @@ export async function pushCommittedCandidate(record, targetCwd, options = {}) {
 
 async function assertControlledWorktreePath(state, path) {
   const root = await realpath(state.worktreesDirectory);
-  const target = await realpath(path);
+  const requested = resolve(path);
+  const entry = await getEntry(requested);
+  let target;
+  if (entry !== null) {
+    target = await realpath(requested);
+  } else {
+    let ancestor = dirname(requested);
+    while ((await getEntry(ancestor)) === null) {
+      const parent = dirname(ancestor);
+      if (parent === ancestor) {
+        throw new GitWorkspaceError(`Refusing unmanaged worktree path: ${path}`, "unmanaged-worktree");
+      }
+      ancestor = parent;
+    }
+    const canonicalAncestor = await realpath(ancestor);
+    target = resolve(canonicalAncestor, relative(ancestor, requested));
+  }
   const relativePath = relative(root, target);
   if (
     relativePath.length === 0 ||
     isAbsolute(relativePath) ||
     relativePath === ".." ||
-    relativePath.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)
+    relativePath.startsWith(`..${sep}`)
   ) {
     throw new GitWorkspaceError(`Refusing unmanaged worktree path: ${path}`, "unmanaged-worktree");
   }
-  return target;
+  return { entry, path: target };
+}
+
+function assertConcreteWorktree(entry, path) {
+  if (entry === null || !entry.isDirectory() || entry.isSymbolicLink()) {
+    throw new GitWorkspaceError(`Worktree path is not a concrete directory: ${path}`, "invalid-worktree-path");
+  }
+}
+
+function comparablePath(path, platform = process.platform) {
+  const normalized = resolve(path).replace(/^\\\\\?\\/, "");
+  return platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+async function listRegisteredWorktrees(repository, options) {
+  const result = await runGit(["worktree", "list", "--porcelain", "-z"], {
+    ...options,
+    cwd: repository,
+  });
+  return result.stdoutText
+    .split("\0")
+    .filter((entry) => entry.startsWith("worktree "))
+    .map((entry) => entry.slice("worktree ".length));
+}
+
+async function isWorktreeRegistered(repository, path, options) {
+  const expected = comparablePath(path);
+  const registered = await listRegisteredWorktrees(repository, options);
+  return registered.some((candidate) => comparablePath(candidate) === expected);
 }
 
 export async function archiveAssignmentWorktree(record, options = {}) {
@@ -1231,14 +1282,55 @@ export async function archiveAssignmentWorktree(record, options = {}) {
   const state = await getRepositoryState(record.repository, options);
   await ensureWorktreesDirectory(state);
   const source = await assertControlledWorktreePath(state, record.workspace.path);
-  const destination = join(
+  const shortDestination = await assertControlledWorktreePath(state, join(
+    state.worktreesDirectory,
+    worktreeName(record, "a"),
+  ));
+  const legacyDestination = await assertControlledWorktreePath(state, join(
     state.worktreesDirectory,
     "archive",
     worktreeName(record, "archive"),
-  );
-  await mkdir(dirname(destination), { recursive: true });
-  await runGit(["worktree", "move", source, destination], { ...options, cwd: record.repository });
-  return await realpath(destination);
+  ));
+  const destinations = [shortDestination, legacyDestination].filter(({ entry }) => entry !== null);
+  if (source.entry !== null) {
+    assertConcreteWorktree(source.entry, source.path);
+    if (destinations.length !== 0) {
+      throw new GitWorkspaceError(
+        "The active worktree and an archive destination both exist.",
+        "worktree-archive-conflict",
+      );
+    }
+    if (shortDestination.path.length > source.path.length) {
+      throw new GitWorkspaceError(
+        "The archive destination is longer than the active worktree path.",
+        "worktree-archive-path-too-long",
+      );
+    }
+    await runGit(["worktree", "move", source.path, shortDestination.path], {
+      ...options,
+      cwd: record.repository,
+    });
+    const archived = await assertControlledWorktreePath(state, shortDestination.path);
+    assertConcreteWorktree(archived.entry, archived.path);
+    if (!(await isWorktreeRegistered(record.repository, archived.path, options))) {
+      throw new GitWorkspaceError("The archived worktree is not registered.", "worktree-archive-incomplete");
+    }
+    return archived.path;
+  }
+  if (destinations.length !== 1) {
+    const message = destinations.length === 0
+      ? "The active worktree and archive destinations are missing."
+      : "Multiple archive destinations exist for the assignment.";
+    throw new GitWorkspaceError(message, destinations.length === 0
+      ? "worktree-not-found"
+      : "worktree-archive-conflict");
+  }
+  const [archived] = destinations;
+  assertConcreteWorktree(archived.entry, archived.path);
+  if (!(await isWorktreeRegistered(record.repository, archived.path, options))) {
+    throw new GitWorkspaceError("The archived worktree is not registered.", "worktree-archive-conflict");
+  }
+  return archived.path;
 }
 
 export async function cleanupAssignmentWorktree(record, options = {}) {
@@ -1247,12 +1339,27 @@ export async function cleanupAssignmentWorktree(record, options = {}) {
   }
   const state = await getRepositoryState(record.repository, options);
   await ensureWorktreesDirectory(state);
-  const path = await assertControlledWorktreePath(state, record.workspace.archive_path ?? record.workspace.path);
-  await runGit(["worktree", "remove", "--force", path], {
+  const controlled = await assertControlledWorktreePath(
+    state,
+    record.workspace.archive_path ?? record.workspace.path,
+  );
+  if (controlled.entry !== null) {
+    assertConcreteWorktree(controlled.entry, controlled.path);
+    await runGit(["worktree", "remove", "--force", controlled.path], {
+      ...options,
+      cwd: record.repository,
+      allowFailure: false,
+    });
+  }
+  await runGit(["worktree", "prune", "--expire", "now"], {
     ...options,
     cwd: record.repository,
-    allowFailure: false,
   });
-  await runGit(["worktree", "prune"], { ...options, cwd: record.repository });
-  return { cleaned: true, path };
+  if (
+    (await getEntry(controlled.path)) !== null
+    || await isWorktreeRegistered(record.repository, controlled.path, options)
+  ) {
+    throw new GitWorkspaceError("Worktree cleanup did not complete.", "worktree-cleanup-incomplete");
+  }
+  return { cleaned: true, path: controlled.path };
 }
