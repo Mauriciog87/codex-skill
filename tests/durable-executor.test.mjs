@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -34,6 +34,7 @@ async function createFixture() {
   return {
     root,
     repository,
+    home,
     environment,
     coordinationOptions: { environment, homeDirectory: home, platform: process.platform },
   };
@@ -97,6 +98,36 @@ async function dispatch(record, op, authority, payload, fixture) {
     )
   ).record;
 }
+
+test("durable execution rejects an invalid output contract before creating state or a worktree", async () => {
+  const fixture = await createFixture();
+  let invoked = false;
+  try {
+    await assert.rejects(
+      invokeDurableExecutor({
+        briefing: "Change the scoped value.",
+        options: options(fixture.repository),
+        environment: fixture.environment,
+        coordinationOptions: fixture.coordinationOptions,
+        outputContractLoader: async () => {
+          throw new Error("invalid output contract");
+        },
+        invokeLegacy: async () => {
+          invoked = true;
+          return execution("implement", []);
+        },
+      }),
+      /invalid output contract/,
+    );
+    assert.equal(invoked, false);
+    assert.deepEqual(await readdir(fixture.home), []);
+    assert.equal((await runGit(["worktree", "list", "--porcelain"], {
+      cwd: fixture.repository,
+    })).stdoutText.match(/^worktree /gm)?.length, 1);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
 
 test("durable writer executes inside sandbox worktree and publishes an immutable candidate", async () => {
   const fixture = await createFixture();

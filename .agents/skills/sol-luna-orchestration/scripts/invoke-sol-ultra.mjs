@@ -1,16 +1,19 @@
-import { access, readFile, stat } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getExecutorProfile } from "./executor-profiles.mjs";
 import { assertEpochAssignmentsComplete } from "./control-plane.mjs";
 import {
-  RESULT_SCHEMA_PATH,
   RoutingVerificationError,
   getSessionRoots,
   readBriefing,
   validateExecutorPayload,
   verifySessionRouting,
 } from "./invoke-profile-executor.mjs";
+import {
+  loadExecutorResultContract,
+  validateExecutorResultContract,
+} from "./executor-result-contract.mjs";
 import {
   AppServerError,
   buildAppServerArguments,
@@ -168,6 +171,7 @@ export function createUltraDeveloperInstructions(lockId, generation) {
     "Do not return while an assignment from this lock id and generation remains unfinished. Accepted candidates require every configured gate and completed delivery; work that cannot finish must be explicitly archived and abandoned.",
     "Do not alter approval policy, sandbox policy, orchestration configuration, or use bypasses.",
     "Preserve unrelated changes and do not exceed the authority granted in the original briefing.",
+    "Always include operator_requests in the result. Use an empty array unless status is blocked and operator input is required.",
     "Return only the result required by the supplied JSON schema.",
   ].join("\n");
 }
@@ -295,6 +299,7 @@ export async function invokeUltra({
   sessionRoots = getSessionRoots(environment),
   signal,
   appServerRunner = runAppServerTurn,
+  outputContractLoader = loadExecutorResultContract,
   coordinationOptions = {},
 }) {
   if (typeof briefing !== "string" || briefing.trim().length === 0) {
@@ -304,8 +309,7 @@ export async function invokeUltra({
   if (!workingDirectory.isDirectory()) {
     throw new UltraInvocationError(`Ultra cwd is not a directory: ${options.cwd}`);
   }
-  await access(RESULT_SCHEMA_PATH);
-  const outputSchema = JSON.parse(await readFile(RESULT_SCHEMA_PATH, "utf8"));
+  const outputContract = validateExecutorResultContract(await outputContractLoader());
   const lock = await acquireUltraLock({
     cwd: options.cwd,
     reason: options.reason,
@@ -336,7 +340,7 @@ export async function invokeUltra({
       sandboxMode: options.sandboxMode,
       developerInstructions: createUltraDeveloperInstructions(lock.lock_id, lock.generation),
       briefing: briefing.trim(),
-      outputSchema,
+      outputSchema: outputContract.schema,
       timeoutMs: options.timeoutSeconds * 1000,
       signal,
       onProcessStarted: async ({ pid }) => {

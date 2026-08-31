@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { MINIMUM_CODEX_VERSION } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
+import { loadExecutorResultContract } from "../.agents/skills/sol-luna-orchestration/scripts/executor-result-contract.mjs";
 import { getSkillLinkType } from "../scripts/install-global-orchestration.mjs";
 import {
   createPlatformVerificationResult,
@@ -75,6 +76,8 @@ test("platform result property order remains stable", () => {
     "strict_config_verified",
     "app_server_schema_verified",
     "schema_file_count",
+    "executor_output_schema_verified",
+    "executor_output_schema_sha256",
     "process_identity_verified",
     "installation_idempotent",
     "git_unchanged",
@@ -97,6 +100,8 @@ test("platform smoke installs twice and verifies the native link", async () => {
   assert.equal(result.strict_config_verified, true);
   assert.equal(result.app_server_schema_verified, true);
   assert.equal(result.schema_file_count, 7);
+  assert.equal(result.executor_output_schema_verified, true);
+  assert.match(result.executor_output_schema_sha256, /^[0-9a-f]{64}$/);
   assert.equal(result.process_identity_verified, true);
   assert.equal(result.installation_idempotent, true);
   assert.equal(result.git_unchanged, true);
@@ -155,6 +160,37 @@ test("platform smoke fails closed on version, strict config, and schema errors",
   );
   assert.equal(schema.status, "failed");
   assert.match(schema.warnings[0], /schema incompatible/);
+
+  const outputContract = await verifyPlatform(
+    {},
+    {
+      commandRunner: createCommandRunner(),
+      schemaVerifier: schemaVerifier(),
+      outputContractLoader: async () => {
+        throw new Error("executor output schema incompatible");
+      },
+    },
+  );
+  assert.equal(outputContract.status, "failed");
+  assert.equal(outputContract.app_server_schema_verified, false);
+  assert.equal(outputContract.executor_output_schema_verified, false);
+  assert.match(outputContract.warnings[0], /executor output schema incompatible/);
+
+  const productionContract = await loadExecutorResultContract();
+  const invalidHash = await verifyPlatform(
+    {},
+    {
+      commandRunner: createCommandRunner(),
+      schemaVerifier: schemaVerifier(),
+      outputContractLoader: async () => ({
+        ...productionContract,
+        sha256: "a".repeat(64),
+      }),
+    },
+  );
+  assert.equal(invalidHash.status, "failed");
+  assert.equal(invalidHash.executor_output_schema_verified, false);
+  assert.match(invalidHash.warnings[0], /SHA-256 is invalid/);
 });
 
 test("platform smoke removes its isolated home after a failed installation", async (context) => {

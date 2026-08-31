@@ -50,6 +50,7 @@ function completedPayload(overrides = {}) {
     checks: ["verified"],
     blockers: [],
     warnings: [],
+    operator_requests: [],
     ...overrides,
   };
 }
@@ -147,6 +148,7 @@ test("Ultra command and instructions pin the exclusive Sol runtime", () => {
   assert.match(instructions, /Do not use native spawn_agent/);
   assert.match(instructions, /invoke-profile-executor\.mjs/);
   assert.match(instructions, /implement-lite\|playwright/);
+  assert.match(instructions, /Always include operator_requests/);
   const args = buildUltraAppServerArguments();
   assert.ok(args.includes(`model_verbosity=${JSON.stringify(SOL_MODEL_VERBOSITY)}`));
   assert.ok(args.includes('service_tier="default"'));
@@ -181,6 +183,30 @@ test("Ultra result preserves the public key order", () => {
     "blockers",
     "warnings",
   ]);
+});
+
+test("Ultra rejects an invalid output contract before acquiring its lock", async (context) => {
+  const fixture = await createFixture(context);
+  let appServerStarted = false;
+  await assert.rejects(
+    invokeUltra({
+      briefing: "Do not start with an invalid contract.",
+      options: ultraOptions(fixture.repository),
+      outputContractLoader: async () => {
+        throw new Error("invalid executor output schema");
+      },
+      appServerRunner: async () => {
+        appServerStarted = true;
+      },
+      coordinationOptions: { homeDirectory: fixture.homeDirectory },
+    }),
+    /invalid executor output schema/,
+  );
+  assert.equal(appServerStarted, false);
+  assert.equal(
+    await readUltraLock(fixture.repository, { homeDirectory: fixture.homeDirectory }),
+    null,
+  );
 });
 
 test("verified Ultra completion releases its repository lock", async (context) => {

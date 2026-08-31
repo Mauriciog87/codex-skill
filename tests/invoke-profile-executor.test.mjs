@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -30,6 +31,9 @@ import {
 } from "../.agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs";
 import { acquireUltraLock, releaseUltraLock } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
 import { AppServerProtocolError } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
+import { loadExecutorResultContract } from "../.agents/skills/sol-luna-orchestration/scripts/executor-result-contract.mjs";
+
+const OUTPUT_CONTRACT = await loadExecutorResultContract();
 
 async function writeRoutingMetadata(
   sessionsRoot,
@@ -46,13 +50,18 @@ async function writeRoutingMetadata(
 
 function createAppServerRunner(threadId, payload, overrides = {}) {
   return async (options) => {
+    assert.deepEqual(options.outputSchema, OUTPUT_CONTRACT.schema);
+    assert.equal(
+      createHash("sha256").update(JSON.stringify(options.outputSchema)).digest("hex"),
+      OUTPUT_CONTRACT.sha256,
+    );
     return {
       threadId,
       model: options.model,
       reasoningEffort: options.reasoningEffort,
       serviceTier: options.serviceTier,
       turnStatus: "completed",
-      finalResponse: JSON.stringify(payload),
+      finalResponse: JSON.stringify({ operator_requests: [], ...payload }),
       blockedReason: null,
       warnings: [],
       stderr: "",
@@ -273,6 +282,7 @@ test("validateExecutorPayload enforces the untrusted structured payload", () => 
     checks: ["node --test passed"],
     blockers: [],
     warnings: [],
+    operator_requests: [],
   };
   assert.deepEqual(validateExecutorPayload(payload), payload);
   assert.throws(
@@ -282,6 +292,12 @@ test("validateExecutorPayload enforces the untrusted structured payload", () => 
   assert.throws(
     () => validateExecutorPayload({ ...payload, warnings: "none" }),
     ExecutorConfigurationError,
+  );
+  const missingOperatorRequests = { ...payload };
+  delete missingOperatorRequests.operator_requests;
+  assert.throws(
+    () => validateExecutorPayload(missingOperatorRequests),
+    /operator_requests is required/,
   );
 });
 
@@ -402,6 +418,32 @@ test("verifySessionRouting accepts profile efforts and reports mismatches", asyn
     }),
     RoutingVerificationError,
   );
+});
+
+test("invokeExecutor rejects an invalid output contract before acquiring a lease", async (context) => {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-luna-contract-preflight-test-"));
+  context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const repository = join(temporaryRoot, "repository");
+  const homeDirectory = join(temporaryRoot, "home");
+  await mkdir(repository, { recursive: true });
+  let appServerStarted = false;
+  const execution = await invokeExecutor({
+    briefing: "Do not start with an invalid contract.",
+    options: profileOptions(repository, "explore"),
+    outputContract: {
+      ...OUTPUT_CONTRACT,
+      sha256: "a".repeat(64),
+    },
+    coordinationOptions: { homeDirectory },
+    appServerRunner: async () => {
+      appServerStarted = true;
+    },
+  });
+  assert.equal(execution.exitCode, 2);
+  assert.equal(execution.result.routing_verified, false);
+  assert.match(execution.result.summary, /schema preflight failed/);
+  assert.equal(appServerStarted, false);
+  await assert.rejects(access(homeDirectory), { code: "ENOENT" });
 });
 
 test("invokeExecutor returns verified profile metadata and status exit codes", async (context) => {

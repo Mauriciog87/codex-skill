@@ -1,8 +1,8 @@
 import { spawn as spawnChildProcess } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { access, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import {
@@ -28,6 +28,13 @@ import {
   executorResultMessage,
   writeStatusMessage,
 } from "./orchestration-messages.mjs";
+import {
+  RESULT_SCHEMA_PATH,
+  loadExecutorResultContract,
+  validateExecutorResultContract,
+} from "./executor-result-contract.mjs";
+
+export { RESULT_SCHEMA_PATH };
 
 export const DEFAULT_SANDBOX_MODE = "read-only";
 export const DEFAULT_TIMEOUT_SECONDS = 900;
@@ -36,14 +43,6 @@ export const DEFAULT_RESULT_FORMAT = "v2";
 
 const MAX_BRIEFING_BYTES = 1_048_576;
 const MAX_DIAGNOSTIC_CHARACTERS = 131_072;
-const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
-export const RESULT_SCHEMA_PATH = resolve(
-  SCRIPT_DIRECTORY,
-  "..",
-  "references",
-  "executor-result.schema.json",
-);
-
 export class ExecutorInvocationError extends Error {
   constructor(message) {
     super(message);
@@ -369,6 +368,7 @@ export function createExecutorDeveloperInstructions(profileName) {
     "Complete only the supplied briefing and preserve unrelated changes.",
     "Do not alter orchestration policy, approval policy, or sandbox configuration, and do not use bypasses.",
     "Return only the result required by the supplied JSON schema.",
+    "Always include operator_requests; use an empty array unless status is blocked and operator input is required.",
     "Use completed only when the assigned work and requested checks succeeded; otherwise use blocked or failed.",
     ...profile.instructions,
   ].join("\n");
@@ -839,7 +839,10 @@ export function validateExecutorPayload(value) {
   assertStringArray(value.checks, "checks");
   assertStringArray(value.blockers, "blockers");
   assertStringArray(value.warnings, "warnings");
-  const operatorRequests = value.operator_requests ?? [];
+  if (!Object.hasOwn(value, "operator_requests")) {
+    throw new ExecutorConfigurationError("operator_requests is required.");
+  }
+  const operatorRequests = value.operator_requests;
   if (!Array.isArray(operatorRequests)) {
     throw new ExecutorConfigurationError("operator_requests must be an array.");
   }
@@ -869,13 +872,11 @@ export function validateExecutorPayload(value) {
     checks: [...value.checks],
     blockers: [...value.blockers],
     warnings: [...value.warnings],
-  };
-  if (value.operator_requests !== undefined) {
-    validated.operator_requests = operatorRequests.map((request) => ({
+    operator_requests: operatorRequests.map((request) => ({
       question: request.question.trim(),
       choices: [...request.choices],
-    }));
-  }
+    })),
+  };
   return validated;
 }
 
@@ -987,6 +988,7 @@ async function runExecutor({
   appServerRunner = runAppServerTurn,
   playwrightMcpVerifier = verifyPlaywrightMcp,
   onAppServerStarted,
+  outputContract,
 }) {
   if (typeof briefing !== "string" || briefing.trim().length === 0) {
     throw new ExecutorInvocationError("An executor briefing is required.");
@@ -994,11 +996,8 @@ async function runExecutor({
   const profile = requireExecutorProfile(options.profile, options.sandboxMode);
 
   let workingDirectory;
-  let outputSchema;
   try {
     workingDirectory = await stat(options.cwd);
-    await access(RESULT_SCHEMA_PATH);
-    outputSchema = JSON.parse(await readFile(RESULT_SCHEMA_PATH, "utf8"));
   } catch (error) {
     throw new ExecutorConfigurationError(error.message);
   }
@@ -1043,7 +1042,7 @@ async function runExecutor({
         sandboxMode: options.sandboxMode,
         developerInstructions: createExecutorDeveloperInstructions(profile.name),
         briefing: briefing.trim(),
-        outputSchema,
+        outputSchema: outputContract.schema,
         timeoutMs: options.timeoutSeconds * 1000,
         signal,
         onProcessStarted: onAppServerStarted,
@@ -1211,7 +1210,7 @@ async function runExecutor({
     });
     return {
       result,
-      operatorRequests: payload.operator_requests ?? [],
+      operatorRequests: payload.operator_requests,
       exitCode: determineExitCode({
         status: result.status,
         routingVerified: result.routing_verified,
@@ -1230,6 +1229,15 @@ export async function invokeExecutor(input) {
     input.options.profile,
     input.options.sandboxMode,
   );
+  let outputContract;
+  try {
+    outputContract = validateExecutorResultContract(
+      input.outputContract ?? await loadExecutorResultContract(),
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return configurationFailure(`Executor output schema preflight failed: ${message}`, input.options);
+  }
   let lease;
   try {
     lease = await beginExecutorRun({
@@ -1248,6 +1256,7 @@ export async function invokeExecutor(input) {
     execution = await runExecutor({
       ...input,
       environment,
+      outputContract,
       onAppServerStarted: async ({ pid }) => {
         await registerExecutorProcess(lease, {
           kind: "app-server",

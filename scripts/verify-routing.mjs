@@ -8,12 +8,16 @@ import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import {
-  RESULT_SCHEMA_PATH,
   getSessionRoots,
   invokeExecutor,
   runProcess,
+  validateExecutorPayload,
   verifySessionRouting,
 } from "../.agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs";
+import {
+  loadExecutorResultContract,
+  validateExecutorResultContract,
+} from "../.agents/skills/sol-luna-orchestration/scripts/executor-result-contract.mjs";
 import {
   invokeDurableExecutor,
 } from "../.agents/skills/sol-luna-orchestration/scripts/durable-executor.mjs";
@@ -351,7 +355,22 @@ function verifyProfileRouting(result, profileName) {
   }
 }
 
-async function runGlobalRootProbe(sessionRoots) {
+function validateRootProbePayload(value) {
+  const payload = validateExecutorPayload(value);
+  if (
+    payload.status !== "completed"
+    || payload.changed_files.length !== 0
+    || payload.checks.length !== 0
+    || payload.blockers.length !== 0
+    || payload.warnings.length !== 0
+    || payload.operator_requests.length !== 0
+  ) {
+    throw new Error("The Sol routing probe returned an unexpected structured result.");
+  }
+  return payload;
+}
+
+async function runGlobalRootProbe(sessionRoots, outputContract) {
   const temporaryRepository = await mkdtemp(join(tmpdir(), "sol-luna-global-probe-"));
   try {
     await execFileAsync("git", ["init", "--quiet"], {
@@ -374,8 +393,8 @@ async function runGlobalRootProbe(sessionRoots) {
       fastMode: false,
       sandboxMode: "read-only",
       developerInstructions,
-      briefing: "Return a completed structured result for the Sol routing probe.",
-      outputSchema: JSON.parse(await readFile(RESULT_SCHEMA_PATH, "utf8")),
+      briefing: "Return status completed, summary Sol routing probe completed, and empty changed_files, checks, blockers, warnings, and operator_requests arrays.",
+      outputSchema: outputContract.schema,
       timeoutMs: 300_000,
     });
     if (rootProcess.threadId === null) {
@@ -384,6 +403,7 @@ async function runGlobalRootProbe(sessionRoots) {
     if (rootProcess.turnStatus !== "completed" || rootProcess.blockedReason !== null) {
       throw new Error("The Sol routing probe did not complete through App Server.");
     }
+    const payload = validateRootProbePayload(JSON.parse(rootProcess.finalResponse));
     const routing = await verifySessionRouting(
       rootProcess.threadId,
       ORCHESTRATOR_MODEL,
@@ -393,6 +413,7 @@ async function runGlobalRootProbe(sessionRoots) {
     return {
       threadId: rootProcess.threadId,
       routing: { ...routing, serviceTier: rootProcess.serviceTier },
+      payload,
     };
   } finally {
     await rm(temporaryRepository, { recursive: true, force: true });
@@ -1142,7 +1163,8 @@ export async function verifyRouting(repositoryRoot = REPOSITORY_ROOT) {
   const skill = await verifySkillDiscovery(repositoryRoot);
   const appServer = await verifyAppServerSchema();
   const sessionRoots = getSessionRoots();
-  const rootProbe = await runGlobalRootProbe(sessionRoots);
+  const outputContract = validateExecutorResultContract(await loadExecutorResultContract());
+  const rootProbe = await runGlobalRootProbe(sessionRoots, outputContract);
   const executors = await runExecutorProbes(repositoryRoot, sessionRoots);
   const blockedExecutor = await runLockedExecutorProbe(sessionRoots);
   const ultraReadOnly = await runUltraReadOnlyProbe(repositoryRoot, sessionRoots);
@@ -1187,10 +1209,59 @@ export async function verifyRouting(repositoryRoot = REPOSITORY_ROOT) {
   };
 }
 
+export async function verifyOutputSchemaLive(repositoryRoot = REPOSITORY_ROOT, dependencies = {}) {
+  const platformCode = dependencies.platform ?? process.platform;
+  const platform = getPlatformName(platformCode);
+  if (platform === null) {
+    throw new Error(`Unsupported platform: ${platformCode}`);
+  }
+  const statusReader = dependencies.gitStatusReader ?? gitStatus;
+  const codexVersionReader = dependencies.codexVersionReader
+    ?? ((cwd) => readCodexVersion({ cwd }));
+  const outputContractLoader = dependencies.outputContractLoader ?? loadExecutorResultContract;
+  const rootProbeRunner = dependencies.rootProbeRunner ?? runGlobalRootProbe;
+  const beforeStatus = await statusReader(repositoryRoot);
+  const outputContract = validateExecutorResultContract(await outputContractLoader());
+  const rootProbe = await rootProbeRunner(
+    dependencies.sessionRoots ?? getSessionRoots(),
+    outputContract,
+  );
+  const rootPayload = validateRootProbePayload(rootProbe.payload);
+  const afterStatus = await statusReader(repositoryRoot);
+  if (afterStatus !== beforeStatus) {
+    throw new Error("Git status changed during schema-only live verification.");
+  }
+  return {
+    status: "completed",
+    mode: "schema-only",
+    platform,
+    architecture: process.arch,
+    node_version: process.version,
+    codex_version: await codexVersionReader(repositoryRoot),
+    executor_output_schema_sha256: outputContract.sha256,
+    root: {
+      thread_id: rootProbe.threadId,
+      model: rootProbe.routing.model,
+      reasoning_effort: rootProbe.routing.reasoningEffort,
+      service_tier: rootProbe.routing.serviceTier,
+      result: rootPayload,
+    },
+    git_unchanged: true,
+  };
+}
+
 export function parseVerifyRoutingArguments(argv) {
   let outputPath = null;
+  let schemaOnly = false;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
+    if (argument === "--schema-only") {
+      if (schemaOnly) {
+        throw new Error("--schema-only may be provided only once.");
+      }
+      schemaOnly = true;
+      continue;
+    }
     if (argument !== "--output") {
       throw new Error(`Unknown argument: ${argument}`);
     }
@@ -1204,11 +1275,12 @@ export function parseVerifyRoutingArguments(argv) {
     outputPath = resolve(value);
     index += 1;
   }
-  return { outputPath };
+  return { outputPath, schemaOnly };
 }
 
 export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const verify = dependencies.verifyRouting ?? verifyRouting;
+  const verifySchemaOnly = dependencies.verifyOutputSchemaLive ?? verifyOutputSchemaLive;
   const outputWriter = dependencies.writeJsonOutput ?? writeJsonOutput;
   const writeStdout = dependencies.writeStdout ?? ((value) => process.stdout.write(value));
   const writeStderr = dependencies.writeStderr ?? ((value) => process.stderr.write(value));
@@ -1219,7 +1291,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     if (options.outputPath !== null && isPathInside(REPOSITORY_ROOT, options.outputPath)) {
       throw new Error("--output must be outside the repository so live verification leaves Git unchanged.");
     }
-    const result = await verify();
+    const result = options.schemaOnly ? await verifySchemaOnly() : await verify();
     await outputWriter(options.outputPath, result);
     writeStdout(`${JSON.stringify(result)}\n`);
     return 0;

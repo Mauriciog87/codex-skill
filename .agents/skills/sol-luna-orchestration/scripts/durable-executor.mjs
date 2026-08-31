@@ -13,6 +13,10 @@ import {
 } from "./control-plane.mjs";
 import { getExecutorProfile } from "./executor-profiles.mjs";
 import {
+  loadExecutorResultContract,
+  validateExecutorResultContract,
+} from "./executor-result-contract.mjs";
+import {
   GitWorkspaceError,
   cleanupAssignmentWorktree,
   createAssignmentWorktree,
@@ -313,7 +317,9 @@ export async function invokeDurableExecutor({
   sessionRoots,
   appServerRunner,
   playwrightMcpVerifier,
+  outputContractLoader = loadExecutorResultContract,
 }) {
+  const outputContract = validateExecutorResultContract(await outputContractLoader());
   const loaded = await loadOrCreateRecord({
     briefing,
     options,
@@ -391,6 +397,7 @@ export async function invokeDurableExecutor({
       sessionRoots,
       appServerRunner,
       playwrightMcpVerifier,
+      outputContract,
     });
   } catch (error) {
     await dispatchAssignmentAction(

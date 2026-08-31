@@ -7,6 +7,10 @@ import {
   isCompatibleCodexVersion,
 } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
 import {
+  loadExecutorResultContract,
+  validateExecutorResultContract,
+} from "../.agents/skills/sol-luna-orchestration/scripts/executor-result-contract.mjs";
+import {
   createProcessIdentity,
   inspectProcessIdentity,
 } from "../.agents/skills/sol-luna-orchestration/scripts/process-identity.mjs";
@@ -46,6 +50,8 @@ export function createPlatformVerificationResult(overrides = {}) {
     strict_config_verified: false,
     app_server_schema_verified: false,
     schema_file_count: 0,
+    executor_output_schema_verified: false,
+    executor_output_schema_sha256: null,
     process_identity_verified: false,
     installation_idempotent: false,
     git_unchanged: false,
@@ -166,6 +172,7 @@ export async function verifyPlatform(options = {}, dependencies = {}) {
   const repositoryRoot = resolve(dependencies.repositoryRoot ?? REPOSITORY_ROOT);
   const commandRunner = dependencies.commandRunner ?? runCommand;
   const schemaVerifier = dependencies.schemaVerifier ?? verifyAppServerSchema;
+  const outputContractLoader = dependencies.outputContractLoader ?? loadExecutorResultContract;
   const processIdentityCreator = dependencies.processIdentityCreator ?? createProcessIdentity;
   const processIdentityInspector = dependencies.processIdentityInspector ?? inspectProcessIdentity;
   const installer = dependencies.installer ?? installGlobalOrchestration;
@@ -226,6 +233,11 @@ export async function verifyPlatform(options = {}, dependencies = {}) {
     });
     result.strict_config_verified = true;
     result.checks.push("strict_config:verified");
+
+    const outputContract = validateExecutorResultContract(await outputContractLoader());
+    result.executor_output_schema_verified = true;
+    result.executor_output_schema_sha256 = outputContract.sha256;
+    result.checks.push("executor_output_schema:verified");
 
     const schema = await schemaVerifier({
       environment: isolatedEnvironment,

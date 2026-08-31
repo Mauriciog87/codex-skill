@@ -2,34 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "allOf": [
-    {
-      "if": {
-        "required": [
-          "operator_requests"
-        ],
-        "properties": {
-          "operator_requests": {
-            "minItems": 1
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "status": {
-            "const": "blocked"
-          }
-        }
-      }
-    }
-  ],
   "required": [
     "status",
     "summary",
     "changed_files",
     "checks",
     "blockers",
-    "warnings"
+    "warnings",
+    "operator_requests"
   ],
   "properties": {
     "status": {

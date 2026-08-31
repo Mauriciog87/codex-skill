@@ -15,6 +15,7 @@ const payload = scenario.payload ?? {
   checks: [],
   blockers: [],
   warnings: [],
+  operator_requests: [],
 };
 
 if (scenario.ignoreSigterm === true) {

@@ -15,15 +15,11 @@ import {
   normalizeAppServerServiceTier,
   runAppServerTurn,
 } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
+import { loadExecutorResultContract } from "../.agents/skills/sol-luna-orchestration/scripts/executor-result-contract.mjs";
 
 const TEST_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const MOCK_SERVER_PATH = join(TEST_DIRECTORY, "fixtures", "mock-codex-app-server.mjs");
-const OUTPUT_SCHEMA = {
-  type: "object",
-  properties: { status: { type: "string" } },
-  required: ["status"],
-  additionalProperties: true,
-};
+const OUTPUT_SCHEMA = (await loadExecutorResultContract()).schema;
 
 function spawnMock(scenario, capturePath) {
   return (_command, _args, options) => spawn(process.execPath, [MOCK_SERVER_PATH], {
