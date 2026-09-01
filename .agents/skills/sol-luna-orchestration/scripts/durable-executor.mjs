@@ -62,14 +62,36 @@ function createOperatorRequests(record, requests) {
     request_id: randomUUID(),
     question: request.question,
     choices: [...request.choices],
+    source: request.source ?? "executor",
+    sensitive: request.sensitive === true,
     assignment_id: record.assignment_id,
     attempt: record.attempt,
     ordinal: index,
   }));
 }
 
-function contractBriefing(record, briefing) {
+function priorOperatorAnswerLines(record) {
+  const answers = new Map();
+  for (const attempt of record.previous_attempts ?? []) {
+    for (const request of attempt.operator_requests ?? []) {
+      if (
+        request.state === "acknowledged" &&
+        request.sensitive !== true &&
+        typeof request.question === "string" &&
+        typeof request.answer === "string"
+      ) {
+        answers.set(request.question, request.answer);
+      }
+    }
+  }
+  return [...answers].map(
+    ([question, answer]) => `- Question ${JSON.stringify(question)}: ${JSON.stringify(answer)}`,
+  );
+}
+
+export function createContractBriefing(record, briefing) {
   const roots = record.writer ? record.allowed_write_roots.join(", ") : "none";
+  const operatorAnswers = priorOperatorAnswerLines(record);
   return [
     `Assignment id: ${record.assignment_id}`,
     `Assignment attempt: ${record.attempt}`,
@@ -80,6 +102,9 @@ function contractBriefing(record, briefing) {
       ? "Your cwd is an isolated worktree. Modify only the allowed roots. Do not stage, commit, change HEAD, create branches, or touch another checkout."
       : "Keep repository files unchanged.",
     "If essential operator input is missing, return blocked and use operator_requests.",
+    ...(operatorAnswers.length === 0
+      ? []
+      : ["Operator answers from previous attempts:", ...operatorAnswers]),
     "",
     briefing.trim(),
   ].join("\n");
@@ -383,7 +408,7 @@ export async function invokeDurableExecutor({
   let execution;
   try {
     execution = await invokeLegacy({
-      briefing: contractBriefing(record, effectiveBriefing),
+      briefing: createContractBriefing(record, effectiveBriefing),
       options: {
         profile: record.profile,
         cwd: workspace.path,

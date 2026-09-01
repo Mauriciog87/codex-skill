@@ -566,6 +566,13 @@ test("operator requests require answer acknowledgement before retry", async () =
     assert.equal(record.state, "queued");
     assert.equal(record.attempt, 2);
     assert.equal(record.base_revision, "c".repeat(40));
+    assert.equal(record.previous_attempts.length, 1);
+    assert.equal(record.previous_attempts[0].operator_requests.length, 1);
+    assert.equal(record.previous_attempts[0].operator_requests[0].request_id, requestId);
+    assert.equal(record.previous_attempts[0].operator_requests[0].answer, "A");
+    assert.equal(record.previous_attempts[0].operator_requests[0].state, "acknowledged");
+    assert.equal(record.previous_attempts[0].operator_requests[0].source, "executor");
+    assert.equal(record.previous_attempts[0].operator_requests[0].sensitive, false);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

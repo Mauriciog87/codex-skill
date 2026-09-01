@@ -7,14 +7,25 @@ import {
   main,
   parseVerifyRoutingArguments,
   verifyOutputSchemaLive,
+  verifyPlaywrightOnly,
 } from "../scripts/verify-routing.mjs";
 import { loadExecutorResultContract } from "../.agents/skills/sol-luna-orchestration/scripts/executor-result-contract.mjs";
 
 test("verify-live accepts only one output path", () => {
-  assert.deepEqual(parseVerifyRoutingArguments([]), { outputPath: null, schemaOnly: false });
+  assert.deepEqual(parseVerifyRoutingArguments([]), {
+    outputPath: null,
+    schemaOnly: false,
+    playwrightOnly: false,
+  });
   assert.deepEqual(parseVerifyRoutingArguments(["--schema-only"]), {
     outputPath: null,
     schemaOnly: true,
+    playwrightOnly: false,
+  });
+  assert.deepEqual(parseVerifyRoutingArguments(["--playwright-only"]), {
+    outputPath: null,
+    schemaOnly: false,
+    playwrightOnly: true,
   });
   assert.throws(() => parseVerifyRoutingArguments(["--output"]), /requires a path/);
   assert.throws(
@@ -25,7 +36,47 @@ test("verify-live accepts only one output path", () => {
     () => parseVerifyRoutingArguments(["--schema-only", "--schema-only"]),
     /only once/,
   );
+  assert.throws(
+    () => parseVerifyRoutingArguments(["--playwright-only", "--playwright-only"]),
+    /only once/,
+  );
+  assert.throws(
+    () => parseVerifyRoutingArguments(["--schema-only", "--playwright-only"]),
+    /mutually exclusive/,
+  );
   assert.throws(() => parseVerifyRoutingArguments(["--unknown"]), /Unknown argument/);
+});
+
+test("verify-live playwright-only dispatches only the bounded browser verifier", async () => {
+  const result = { status: "completed", mode: "playwright-only" };
+  let fullInvoked = false;
+  let schemaInvoked = false;
+  let playwrightInvoked = false;
+  let stdout = "";
+  const code = await main(["--playwright-only"], {
+    verifyRouting: async () => {
+      fullInvoked = true;
+      throw new Error("full verification must not run");
+    },
+    verifyOutputSchemaLive: async () => {
+      schemaInvoked = true;
+      throw new Error("schema verification must not run");
+    },
+    verifyPlaywrightOnly: async () => {
+      playwrightInvoked = true;
+      return result;
+    },
+    writeJsonOutput: async () => {},
+    writeStdout: (value) => {
+      stdout += value;
+    },
+    writeStderr: () => {},
+  });
+  assert.equal(code, 0);
+  assert.equal(fullInvoked, false);
+  assert.equal(schemaInvoked, false);
+  assert.equal(playwrightInvoked, true);
+  assert.deepEqual(JSON.parse(stdout), result);
 });
 
 test("verify-live schema-only dispatches only the bounded schema verifier", async () => {
@@ -122,6 +173,30 @@ test("schema-only live verification rejects an invalid probe payload", async () 
     }),
     /operator_requests/,
   );
+});
+
+test("playwright-only live verification preserves the checkout", async () => {
+  const statuses = ["before", "before"];
+  const result = await verifyPlaywrightOnly("C:\\repository", {
+    platform: "win32",
+    gitStatusReader: async () => statuses.shift(),
+    codexVersionReader: async () => "0.151.0",
+    sessionRoots: ["C:\\sessions"],
+    playwrightProbeRunner: async (repositoryRoot, sessionRoots) => {
+      assert.equal(repositoryRoot, "C:\\repository");
+      assert.deepEqual(sessionRoots, ["C:\\sessions"]);
+      return {
+        profile: "playwright",
+        status: "completed",
+        checks: ["playwright_mcp:verified", "heading:verified", "interaction:verified"],
+      };
+    },
+  });
+  assert.equal(result.status, "completed");
+  assert.equal(result.mode, "playwright-only");
+  assert.equal(result.codex_version, "0.151.0");
+  assert.equal(result.playwright.profile, "playwright");
+  assert.equal(result.git_unchanged, true);
 });
 
 test("verify-live writes its preserved result with platform metadata", async (context) => {

@@ -751,6 +751,8 @@ export function reduceAssignment(record, inputAction, timestamp = new Date().toI
       "request_id",
       "question",
       "choices",
+      "source",
+      "sensitive",
       "assignment_id",
       "attempt",
       "ordinal",
@@ -769,6 +771,13 @@ export function reduceAssignment(record, inputAction, timestamp = new Date().toI
       ) {
         throw new ControlPlaneError("operator_requests contains an invalid request.", "invalid-action");
       }
+      const source = request.source ?? "executor";
+      if (
+        !["executor", "app_server_user_input"].includes(source) ||
+        (request.sensitive !== undefined && typeof request.sensitive !== "boolean")
+      ) {
+        throw new ControlPlaneError("operator_requests contains invalid metadata.", "invalid-action");
+      }
       const unexpected = Object.keys(request).filter(
         (key) => !operatorRequestProperties.has(key),
       );
@@ -776,7 +785,13 @@ export function reduceAssignment(record, inputAction, timestamp = new Date().toI
         throw new ControlPlaneError("operator_requests contains unexpected properties.", "invalid-action");
       }
       requestIds.add(request.request_id);
-      return { ...request, state: "open", answer: null };
+      return {
+        ...request,
+        source,
+        sensitive: request.sensitive === true,
+        state: "open",
+        answer: null,
+      };
     });
     next.result = payload.result;
     next.candidate = publishedCandidate;
@@ -975,6 +990,7 @@ export function reduceAssignment(record, inputAction, timestamp = new Date().toI
         result: record.result,
         candidate: record.candidate,
         workspace: record.workspace,
+        operator_requests: structuredClone(record.operator_requests),
         finished_at: timestamp,
       },
     ];

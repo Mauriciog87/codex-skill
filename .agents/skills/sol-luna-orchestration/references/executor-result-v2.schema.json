@@ -331,13 +331,13 @@
     "operatorRequest": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "request_id",
-        "question",
-        "choices",
-        "assignment_id",
-        "attempt",
-        "ordinal"
+    "required": [
+      "request_id",
+      "question",
+      "choices",
+      "assignment_id",
+      "attempt",
+      "ordinal"
       ],
       "properties": {
         "request_id": {
@@ -351,6 +351,16 @@
           "items": {
             "type": "string"
           }
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "executor",
+            "app_server_user_input"
+          ]
+        },
+        "sensitive": {
+          "type": "boolean"
         },
         "assignment_id": {
           "type": "string"

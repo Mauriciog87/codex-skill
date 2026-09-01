@@ -35,6 +35,37 @@ import { loadExecutorResultContract } from "../.agents/skills/sol-luna-orchestra
 
 const OUTPUT_CONTRACT = await loadExecutorResultContract();
 
+function assertPlaywrightRuntimeOverrides(overrides) {
+  assert.equal(overrides.length, 4);
+  assert.equal(
+    overrides[0],
+    'mcp_servers.playwright.default_tools_approval_mode="approve"',
+  );
+  assert.equal(
+    overrides[1],
+    'mcp_servers.playwright.disabled_tools=["browser_run_code_unsafe"]',
+  );
+  const outputDirectory = JSON.parse(
+    overrides[2].slice("mcp_servers.playwright.cwd=".length),
+  );
+  assert.equal(
+    overrides[2],
+    `mcp_servers.playwright.cwd=${JSON.stringify(outputDirectory)}`,
+  );
+  const prefix = "mcp_servers.playwright.args=";
+  assert.ok(overrides[3].startsWith(prefix));
+  const runtimeArguments = JSON.parse(overrides[3].slice(prefix.length));
+  assert.deepEqual(runtimeArguments.slice(0, 4), [
+    "--yes",
+    "@playwright/mcp@0.0.80",
+    "--isolated",
+    "--output-dir",
+  ]);
+  assert.equal(runtimeArguments[4], outputDirectory);
+  assert.ok(resolve(outputDirectory) === outputDirectory);
+  return outputDirectory;
+}
+
 async function writeRoutingMetadata(
   sessionsRoot,
   threadId,
@@ -248,11 +279,13 @@ test("developer instructions identify the selected bounded profile", () => {
 });
 
 test("buildProfileAppServerArguments pins each selected route without bypass flags", () => {
+  const playwrightOutputDirectory = resolve("test-playwright-output");
   for (const profileName of EXECUTOR_PROFILE_NAMES) {
     const profile = EXECUTOR_PROFILES[profileName];
     const args = buildProfileAppServerArguments({
       profile: profileName,
       sandboxMode: profile.sandboxMode,
+      playwrightOutputDirectory,
     });
     assert.ok(args.includes(`model_verbosity=${JSON.stringify(MODEL_VERBOSITY)}`));
     assert.ok(args.includes(`service_tier=${JSON.stringify(profile.configuredServiceTier)}`));
@@ -260,6 +293,30 @@ test("buildProfileAppServerArguments pins each selected route without bypass fla
     assert.ok(args.includes("features.multi_agent=false"));
     assert.ok(args.includes("agents.max_depth=1"));
     assert.ok(args.includes("agents.max_threads=1"));
+    assert.equal(
+      args.includes('mcp_servers.playwright.default_tools_approval_mode="approve"'),
+      profileName === "playwright",
+    );
+    assert.equal(
+      args.includes('mcp_servers.playwright.disabled_tools=["browser_run_code_unsafe"]'),
+      profileName === "playwright",
+    );
+    assert.equal(
+      args.includes(`mcp_servers.playwright.cwd=${JSON.stringify(playwrightOutputDirectory)}`),
+      profileName === "playwright",
+    );
+    assert.equal(
+      args.includes(
+        `mcp_servers.playwright.args=${JSON.stringify([
+          "--yes",
+          "@playwright/mcp@0.0.80",
+          "--isolated",
+          "--output-dir",
+          playwrightOutputDirectory,
+        ])}`,
+      ),
+      profileName === "playwright",
+    );
     assert.deepEqual(args.slice(-3), ["app-server", "--listen", "stdio://"]);
     assert.equal(args.includes("exec"), false);
     assert.equal(args.includes("--json"), false);
@@ -272,6 +329,13 @@ test("buildProfileAppServerArguments pins each selected route without bypass fla
       assert.equal(args.includes(prohibitedFlag), false);
     }
   }
+  assert.throws(
+    () => buildProfileAppServerArguments({
+      profile: "playwright",
+      sandboxMode: "read-only",
+    }),
+    /output directory must be an absolute path/,
+  );
 });
 
 test("validateExecutorPayload enforces the untrusted structured payload", () => {
@@ -464,22 +528,30 @@ test("invokeExecutor returns verified profile metadata and status exit codes", a
     const changedFiles = ["implement-lite", "implement"].includes(profileName)
       ? ["assigned.mjs"]
       : [];
+    const appServerDelegate = createAppServerRunner(threadId, {
+      status: "completed",
+      summary: profileName === "review"
+        ? "APPROVE: Review completed."
+        : `${profileName} completed.`,
+      changed_files: changedFiles,
+      checks: [],
+      blockers: [],
+      warnings: [],
+    });
     const execution = await invokeExecutor({
       briefing: "Complete the bounded test task.",
       options: profileOptions(temporaryRoot, profileName),
       coordinationOptions: { homeDirectory: temporaryRoot },
       sessionRoots: [sessionsRoot],
       playwrightMcpVerifier: async () => ({ enabled: true }),
-      appServerRunner: createAppServerRunner(threadId, {
-        status: "completed",
-        summary: profileName === "review"
-          ? "APPROVE: Review completed."
-          : `${profileName} completed.`,
-        changed_files: changedFiles,
-        checks: [],
-        blockers: [],
-        warnings: [],
-      }),
+      appServerRunner: async (appServerOptions) => {
+        if (profileName === "playwright") {
+          assertPlaywrightRuntimeOverrides(appServerOptions.configurationOverrides);
+        } else {
+          assert.deepEqual(appServerOptions.configurationOverrides, []);
+        }
+        return appServerDelegate(appServerOptions);
+      },
     });
     assert.equal(execution.exitCode, 0);
     assert.equal(execution.result.profile, profileName);
@@ -630,6 +702,14 @@ test("declined App Server interaction returns blocked with verified routing", as
       {
         finalResponse: null,
         blockedReason: "Declined App Server approval request.",
+        operatorRequests: [
+          {
+            question: "Continue with the authorized test action?",
+            choices: ["Yes"],
+            source: "app_server_user_input",
+            sensitive: false,
+          },
+        ],
       },
     ),
   });
@@ -637,6 +717,14 @@ test("declined App Server interaction returns blocked with verified routing", as
   assert.equal(execution.result.status, "blocked");
   assert.equal(execution.result.routing_verified, true);
   assert.deepEqual(execution.result.blockers, ["Declined App Server approval request."]);
+  assert.deepEqual(execution.operatorRequests, [
+    {
+      question: "Continue with the authorized test action?",
+      choices: ["Yes"],
+      source: "app_server_user_input",
+      sensitive: false,
+    },
+  ]);
 });
 
 test("invokeExecutor returns actual metadata and exit code 2 for routing mismatch", async (context) => {
@@ -676,7 +764,11 @@ test("verifyPlaywrightMcp requires an enabled stdio server", async () => {
       stdout: JSON.stringify({
         name: "playwright",
         enabled: true,
-        transport: { type: "stdio" },
+        transport: {
+          type: "stdio",
+          command: "npx",
+          args: ["--yes", "@playwright/mcp@0.0.80"],
+        },
       }),
       stderr: "",
     }),
@@ -693,6 +785,26 @@ test("verifyPlaywrightMcp requires an enabled stdio server", async () => {
       }),
     }),
     ExecutorConfigurationError,
+  );
+  await assert.rejects(
+    verifyPlaywrightMcp({
+      processRunner: async () => ({
+        exitCode: 0,
+        timedOut: false,
+        aborted: false,
+        stdout: JSON.stringify({
+          name: "playwright",
+          enabled: true,
+          transport: {
+            type: "stdio",
+            command: "npx",
+            args: ["@playwright/mcp@latest"],
+          },
+        }),
+        stderr: "",
+      }),
+    }),
+    /@playwright\/mcp@0\.0\.80/,
   );
 });
 
@@ -724,8 +836,10 @@ test("playwright profile verifies MCP use and removes its temporary output", asy
     sessionRoots: [sessionsRoot],
     playwrightMcpVerifier: async () => ({ enabled: true }),
     appServerRunner: async (options) => {
-      outputDirectory = options.environment.PLAYWRIGHT_MCP_OUTPUT_DIR;
-      assert.equal(options.environment.PLAYWRIGHT_MCP_ISOLATED, "true");
+      outputDirectory = assertPlaywrightRuntimeOverrides(options.configurationOverrides);
+      assert.equal(Object.hasOwn(options.environment, "PLAYWRIGHT_MCP_OUTPUT_DIR"), false);
+      assert.equal(Object.hasOwn(options.environment, "PLAYWRIGHT_MCP_ISOLATED"), false);
+      await writeFile(join(outputDirectory, "explicit-screenshot.png"), "artifact");
       return delegate(options);
     },
   });

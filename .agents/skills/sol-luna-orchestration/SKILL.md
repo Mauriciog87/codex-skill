@@ -141,7 +141,9 @@ node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs status
 
 `review` returns `APPROVE` or `COMMENT` with completed status, or `REQUEST_CHANGES` with blocked status and at least one blocker. It never changes files.
 
-`playwright` requires an installed and enabled stdio Playwright MCP. The launcher gives it an isolated temporary browser profile and output directory, verifies that a Playwright MCP tool was used, and removes the temporary artifacts.
+`playwright` requires the enabled stdio MCP configuration `npx --yes @playwright/mcp@0.0.80`. The global installer pins or repairs that configuration. The launcher applies `mcp_servers.playwright.default_tools_approval_mode="approve"` only to that App Server process, adds `browser_run_code_unsafe` to its MCP deny-list, sets the MCP process working directory to a unique temporary directory, and extends the MCP arguments with the official `--isolated` and `--output-dir` options for the same location. It verifies that a Playwright MCP tool was used and removes the temporary artifacts.
+
+Executor turns use App Server approval policy `never`. Command and file approvals, permission grants, and MCP elicitations fail closed with protocol-valid responses. Non-blocking user-input requests receive an empty answer. Blocking, non-sensitive questions become durable operator requests whose acknowledged answers are carried into a retry; sensitive answers are never persisted.
 
 Full interaction is allowed only on localhost and explicitly named development or test environments. External sites are observation-only unless the briefing authorizes a named state-changing action and destination. Purchases, deletion, publishing, messaging, account or security changes, production mutation, and `browser_run_code_unsafe` are prohibited.
 

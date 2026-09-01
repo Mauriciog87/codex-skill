@@ -459,6 +459,9 @@ export async function verifyAppServerSchema({
       "turn/start",
       "turn/interrupt",
       "item/commandExecution/requestApproval",
+      "item/fileChange/requestApproval",
+      "item/permissions/requestApproval",
+      "item/tool/requestUserInput",
       "mcpServer/elicitation/request",
       "experimentalApi",
       "serviceTier",
@@ -469,18 +472,31 @@ export async function verifyAppServerSchema({
         throw new Error(`Generated App Server schemas do not expose ${requiredShape}.`);
       }
     }
+    const findDefinition = (definitionName) => schemaDocuments
+      .map((document) =>
+        document.title === definitionName
+          ? document
+          : document.definitions?.[definitionName])
+      .find(Boolean);
     for (const [definitionName, properties] of Object.entries({
-      ThreadStartParams: ["model", "cwd", "sandbox", "developerInstructions", "serviceTier"],
+      ThreadStartParams: [
+        "model",
+        "cwd",
+        "sandbox",
+        "developerInstructions",
+        "serviceTier",
+        "approvalPolicy",
+      ],
       ThreadSettingsUpdateParams: ["threadId", "model", "effort", "serviceTier"],
       ThreadSettingsUpdatedNotification: ["threadId", "threadSettings"],
       TurnStartParams: ["threadId", "input", "outputSchema"],
+      CommandExecutionRequestApprovalResponse: ["decision"],
+      FileChangeRequestApprovalResponse: ["decision"],
+      PermissionsRequestApprovalResponse: ["permissions"],
+      ToolRequestUserInputResponse: ["answers"],
+      McpServerElicitationRequestResponse: ["action"],
     })) {
-      const definition = schemaDocuments
-        .map((document) =>
-          document.title === definitionName
-            ? document
-            : document.definitions?.[definitionName])
-        .find(Boolean);
+      const definition = findDefinition(definitionName);
       if (definition === undefined) {
         throw new Error(`Generated App Server schemas do not define ${definitionName}.`);
       }
@@ -491,6 +507,14 @@ export async function verifyAppServerSchema({
           );
         }
       }
+    }
+    const askForApproval = findDefinition("AskForApproval");
+    if (askForApproval === undefined || !JSON.stringify(askForApproval).includes('"never"')) {
+      throw new Error("Generated App Server AskForApproval does not expose never.");
+    }
+    const appToolApproval = findDefinition("AppToolApproval");
+    if (appToolApproval === undefined || !JSON.stringify(appToolApproval).includes('"approve"')) {
+      throw new Error("Generated App Server AppToolApproval does not expose approve.");
     }
     return { cli_minimum: MINIMUM_CODEX_VERSION, generated_files: files.length };
   } finally {
@@ -1250,9 +1274,41 @@ export async function verifyOutputSchemaLive(repositoryRoot = REPOSITORY_ROOT, d
   };
 }
 
+export async function verifyPlaywrightOnly(repositoryRoot = REPOSITORY_ROOT, dependencies = {}) {
+  const platformCode = dependencies.platform ?? process.platform;
+  const platform = getPlatformName(platformCode);
+  if (platform === null) {
+    throw new Error(`Unsupported platform: ${platformCode}`);
+  }
+  const statusReader = dependencies.gitStatusReader ?? gitStatus;
+  const codexVersionReader = dependencies.codexVersionReader
+    ?? ((cwd) => readCodexVersion({ cwd }));
+  const playwrightProbeRunner = dependencies.playwrightProbeRunner ?? runPlaywrightProbe;
+  const beforeStatus = await statusReader(repositoryRoot);
+  const playwright = await playwrightProbeRunner(
+    repositoryRoot,
+    dependencies.sessionRoots ?? getSessionRoots(),
+  );
+  const afterStatus = await statusReader(repositoryRoot);
+  if (afterStatus !== beforeStatus) {
+    throw new Error("Git status changed during Playwright-only live verification.");
+  }
+  return {
+    status: "completed",
+    mode: "playwright-only",
+    platform,
+    architecture: process.arch,
+    node_version: process.version,
+    codex_version: await codexVersionReader(repositoryRoot),
+    playwright,
+    git_unchanged: true,
+  };
+}
+
 export function parseVerifyRoutingArguments(argv) {
   let outputPath = null;
   let schemaOnly = false;
+  let playwrightOnly = false;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--schema-only") {
@@ -1260,6 +1316,13 @@ export function parseVerifyRoutingArguments(argv) {
         throw new Error("--schema-only may be provided only once.");
       }
       schemaOnly = true;
+      continue;
+    }
+    if (argument === "--playwright-only") {
+      if (playwrightOnly) {
+        throw new Error("--playwright-only may be provided only once.");
+      }
+      playwrightOnly = true;
       continue;
     }
     if (argument !== "--output") {
@@ -1275,12 +1338,16 @@ export function parseVerifyRoutingArguments(argv) {
     outputPath = resolve(value);
     index += 1;
   }
-  return { outputPath, schemaOnly };
+  if (schemaOnly && playwrightOnly) {
+    throw new Error("--schema-only and --playwright-only are mutually exclusive.");
+  }
+  return { outputPath, schemaOnly, playwrightOnly };
 }
 
 export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const verify = dependencies.verifyRouting ?? verifyRouting;
   const verifySchemaOnly = dependencies.verifyOutputSchemaLive ?? verifyOutputSchemaLive;
+  const verifyPlaywright = dependencies.verifyPlaywrightOnly ?? verifyPlaywrightOnly;
   const outputWriter = dependencies.writeJsonOutput ?? writeJsonOutput;
   const writeStdout = dependencies.writeStdout ?? ((value) => process.stdout.write(value));
   const writeStderr = dependencies.writeStderr ?? ((value) => process.stderr.write(value));
@@ -1291,7 +1358,11 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     if (options.outputPath !== null && isPathInside(REPOSITORY_ROOT, options.outputPath)) {
       throw new Error("--output must be outside the repository so live verification leaves Git unchanged.");
     }
-    const result = options.schemaOnly ? await verifySchemaOnly() : await verify();
+    const result = options.schemaOnly
+      ? await verifySchemaOnly()
+      : options.playwrightOnly
+        ? await verifyPlaywright()
+        : await verify();
     await outputWriter(options.outputPath, result);
     writeStdout(`${JSON.stringify(result)}\n`);
     return 0;

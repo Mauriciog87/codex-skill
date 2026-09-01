@@ -33,6 +33,10 @@ import {
   loadExecutorResultContract,
   validateExecutorResultContract,
 } from "./executor-result-contract.mjs";
+import {
+  createPlaywrightMcpRuntimeOverrides,
+  validatePlaywrightMcpConfiguration,
+} from "./playwright-mcp-configuration.mjs";
 
 export { RESULT_SCHEMA_PATH };
 
@@ -367,6 +371,8 @@ export function createExecutorDeveloperInstructions(profileName) {
     "Do not invoke the sol-luna-orchestration skill, delegate, or launch another Codex session.",
     "Complete only the supplied briefing and preserve unrelated changes.",
     "Do not alter orchestration policy, approval policy, or sandbox configuration, and do not use bypasses.",
+    "This is a non-interactive turn. Do not call request_user_input or trigger a live approval prompt.",
+    "If essential operator input is missing, return blocked and place the questions in operator_requests.",
     "Return only the result required by the supplied JSON schema.",
     "Always include operator_requests; use an empty array unless status is blocked and operator input is required.",
     "Use completed only when the assigned work and requested checks succeeded; otherwise use blocked or failed.",
@@ -377,12 +383,16 @@ export function createExecutorDeveloperInstructions(profileName) {
 export function buildProfileAppServerArguments({
   profile: profileName,
   sandboxMode,
+  playwrightOutputDirectory,
 }) {
   const profile = requireExecutorProfile(profileName, sandboxMode);
   return buildAppServerArguments({
     fastMode: profile.fastMode,
     configuredServiceTier: profile.configuredServiceTier,
     modelVerbosity: MODEL_VERBOSITY,
+    configurationOverrides: profileName === "playwright"
+      ? createPlaywrightMcpRuntimeOverrides(playwrightOutputDirectory)
+      : [],
   });
 }
 
@@ -627,16 +637,11 @@ export async function verifyPlaywrightMcp({
       `The Playwright MCP preflight returned invalid JSON: ${error.message}`,
     );
   }
-  if (
-    configuration?.name !== "playwright" ||
-    configuration.enabled !== true ||
-    configuration.transport?.type !== "stdio"
-  ) {
-    throw new ExecutorConfigurationError(
-      "The Playwright MCP must be installed, enabled, and configured with stdio transport.",
-    );
+  try {
+    return validatePlaywrightMcpConfiguration(configuration);
+  } catch (error) {
+    throw new ExecutorConfigurationError(error.message);
   }
-  return configuration;
 }
 
 export async function readBriefing(stream = process.stdin) {
@@ -1021,12 +1026,6 @@ async function runExecutor({
       ...environment,
       [ORCHESTRATION_ROLE_ENV]: "executor",
       CODEX_EXECUTOR_PROFILE: profile.name,
-      ...(profile.name === "playwright"
-        ? {
-            PLAYWRIGHT_MCP_ISOLATED: "true",
-            PLAYWRIGHT_MCP_OUTPUT_DIR: playwrightOutputDirectory,
-          }
-        : {}),
     };
     let appServerResult;
     try {
@@ -1039,6 +1038,9 @@ async function runExecutor({
         serviceTier: profile.serviceTier,
         configuredServiceTier: profile.configuredServiceTier,
         fastMode: profile.fastMode,
+        configurationOverrides: profile.name === "playwright"
+          ? createPlaywrightMcpRuntimeOverrides(playwrightOutputDirectory)
+          : [],
         sandboxMode: options.sandboxMode,
         developerInstructions: createExecutorDeveloperInstructions(profile.name),
         briefing: briefing.trim(),
@@ -1124,7 +1126,11 @@ async function runExecutor({
         blockers: [appServerResult.blockedReason],
         warnings: protocolWarnings,
       });
-      return { result, exitCode: 1 };
+      return {
+        result,
+        operatorRequests: appServerResult.operatorRequests ?? [],
+        exitCode: 1,
+      };
     }
 
     if (appServerResult.turnStatus !== "completed") {

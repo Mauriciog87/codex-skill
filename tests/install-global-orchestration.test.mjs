@@ -122,6 +122,12 @@ test("updateGlobalConfig preserves unrelated values and is idempotent", () => {
     "hooks = true",
     "codex_hooks = true",
     "",
+    "[mcp_servers.playwright]",
+    "enabled = false",
+    'command = "custom"',
+    'args = ["@playwright/mcp@latest"]',
+    "startup_timeout_sec = 30",
+    "",
   ].join("\r\n");
   const first = updateGlobalConfig(original);
   assert.equal(first.changed, true);
@@ -135,10 +141,19 @@ test("updateGlobalConfig preserves unrelated values and is idempotent", () => {
   assert.match(first.content, /^max_threads = 4\r$/m);
   assert.match(first.content, /^codex_hooks = true\r$/m);
   assert.match(first.content, /^fast_mode = false\r$/m);
+  assert.match(first.content, /^\[mcp_servers\.playwright\]\r$/m);
+  assert.match(first.content, /^enabled = true\r$/m);
+  assert.match(first.content, /^command = "npx"\r$/m);
+  assert.match(first.content, /^args = \["--yes","@playwright\/mcp@0\.0\.80"\]\r$/m);
+  assert.match(first.content, /^startup_timeout_sec = 30\r$/m);
   assert.equal(updateGlobalConfig(first.content).changed, false);
   assert.throws(
     () => updateGlobalConfig('model = "one"\nmodel = "two"\n'),
     /duplicate top-level model/,
+  );
+  assert.throws(
+    () => updateGlobalConfig('mcp_servers.playwright.command = "npx"\n'),
+    /ambiguous Playwright MCP definition/,
   );
 });
 
@@ -220,6 +235,8 @@ test("installGlobalOrchestration is idempotent and removes a validated legacy co
   assert.match(await readFile(fixture.configPath, "utf8"), /^model_verbosity = "low"$/m);
   assert.match(await readFile(fixture.configPath, "utf8"), /^codex_hooks = true$/m);
   assert.match(await readFile(fixture.configPath, "utf8"), /^\[\[hooks\.PreToolUse\]\]$/m);
+  assert.match(await readFile(fixture.configPath, "utf8"), /^\[mcp_servers\.playwright\]$/m);
+  assert.match(await readFile(fixture.configPath, "utf8"), /^args = \["--yes","@playwright\/mcp@0\.0\.80"\]$/m);
   assert.equal(
     await readFile(fixture.deliveryConfigPath, "utf8"),
     '{\n  "automatic_delivery": true\n}\n',

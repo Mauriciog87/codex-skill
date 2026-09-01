@@ -51,16 +51,106 @@ function settingsNotification() {
   });
 }
 
+function defaultServerRequestParams(method) {
+  const itemId = "server-request-item";
+  if (method === "item/permissions/requestApproval") {
+    return {
+      threadId,
+      turnId,
+      itemId,
+      environmentId: null,
+      cwd: process.cwd(),
+      reason: "Mock permission request",
+      permissions: {},
+      startedAtMs: 1,
+    };
+  }
+  if (method === "mcpServer/elicitation/request") {
+    return {
+      threadId,
+      turnId,
+      serverName: "playwright",
+      mode: "form",
+      message: "Mock elicitation",
+      requestedSchema: { type: "object", properties: {} },
+    };
+  }
+  if (method === "item/tool/requestUserInput") {
+    return {
+      threadId,
+      turnId,
+      itemId,
+      isBlocking: true,
+      autoResolutionMs: null,
+      questions: [
+        {
+          id: "decision",
+          header: "Decision",
+          question: "Continue?",
+          options: [
+            { label: "Yes", description: "Continue the task." },
+            { label: "No", description: "Stop the task." },
+          ],
+          isOther: false,
+          isSecret: false,
+        },
+      ],
+    };
+  }
+  return { threadId, turnId, itemId, reason: "Mock approval request" };
+}
+
+function completeTurn() {
+  if (scenario.toolName !== undefined) {
+    notification("item/started", {
+      threadId,
+      turnId,
+      item: {
+        type: "mcpToolCall",
+        server: "playwright",
+        tool: scenario.toolName,
+      },
+    });
+  }
+  const item = {
+    type: "agentMessage",
+    id: "message-1",
+    text: scenario.finalResponse ?? JSON.stringify(payload),
+    phase: "final_answer",
+  };
+  const emitItem = () => notification("item/completed", { threadId, turnId, item });
+  const emitTerminal = () => notification("turn/completed", {
+    threadId,
+    turn: { id: turnId, status: scenario.turnStatus ?? "completed" },
+  });
+  if (scenario.terminalBeforeItem === true) {
+    process.stdout.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        method: "turn/completed",
+        params: { threadId, turn: { id: turnId, status: scenario.turnStatus ?? "completed" } },
+      })}\n${JSON.stringify({
+        jsonrpc: "2.0",
+        method: "item/completed",
+        params: { threadId, turnId, item },
+      })}\n`,
+    );
+  } else {
+    emitItem();
+    emitTerminal();
+  }
+}
+
 async function handle(message) {
   await capture(message);
-  if (scenario.invalidJsonAfter === message.method) {
+  if (scenario.invalidJsonAfter !== undefined && scenario.invalidJsonAfter === message.method) {
     process.stdout.write("not-json\n");
     return;
   }
-  if (scenario.exitAfter === message.method) {
+  if (scenario.exitAfter !== undefined && scenario.exitAfter === message.method) {
     process.exit(7);
   }
-  if (scenario.hangAfter === message.method) {
+  if (scenario.hangAfter !== undefined && scenario.hangAfter === message.method) {
     return;
   }
   if (message.method === "initialize") {
@@ -70,7 +160,7 @@ async function handle(message) {
   if (message.method === "initialized") {
     return;
   }
-  if (scenario.rpcErrorAt === message.method) {
+  if (scenario.rpcErrorAt !== undefined && scenario.rpcErrorAt === message.method) {
     send({
       jsonrpc: "2.0",
       id: message.id,
@@ -123,51 +213,11 @@ async function handle(message) {
         jsonrpc: "2.0",
         id: 900,
         method: scenario.serverRequest,
-        params: { threadId, turnId },
+        params: scenario.serverRequestParams ?? defaultServerRequestParams(scenario.serverRequest),
       });
       return;
     }
-    if (scenario.toolName !== undefined) {
-      notification("item/started", {
-        threadId,
-        turnId,
-        item: {
-          type: "mcpToolCall",
-          server: "playwright",
-          tool: scenario.toolName,
-        },
-      });
-    }
-    const item = {
-      type: "agentMessage",
-      id: "message-1",
-      text: scenario.finalResponse ?? JSON.stringify(payload),
-      phase: "final_answer",
-    };
-    const emitItem = () => notification("item/completed", { threadId, turnId, item });
-    const emitTerminal = () => notification("turn/completed", {
-      threadId,
-      turn: { id: turnId, status: scenario.turnStatus ?? "completed" },
-    });
-    if (scenario.terminalBeforeItem === true) {
-      process.stdout.write(
-        `${JSON.stringify({
-          jsonrpc: "2.0",
-          method: "turn/completed",
-          params: {
-            threadId,
-            turn: { id: turnId, status: scenario.turnStatus ?? "completed" },
-          },
-        })}\n${JSON.stringify({
-          jsonrpc: "2.0",
-          method: "item/completed",
-          params: { threadId, turnId, item },
-        })}\n`,
-      );
-    } else {
-      emitItem();
-      emitTerminal();
-    }
+    completeTurn();
     return;
   }
   if (message.method === "turn/interrupt") {
@@ -182,10 +232,10 @@ async function handle(message) {
     if (scenario.hangAfterServerResponse === true) {
       return;
     }
-    notification("turn/completed", {
-      threadId,
-      turn: { id: turnId, status: "interrupted" },
-    });
+    notification("serverRequest/resolved", { threadId, requestId: "900" });
+    if (scenario.continueAfterServerResponse === true) {
+      completeTurn();
+    }
   }
 }
 

@@ -56,6 +56,7 @@ const PROFILE_DEFINITIONS = {
     instructions: [
       "Use only the configured Playwright MCP tools for the browser task and keep repository files unchanged.",
       "You may navigate, inspect, and interact fully with localhost and explicitly named development or test environments.",
+      "Actions explicitly requested by the briefing against localhost or a named development or test environment are already authorized; perform them without requesting live input.",
       "Treat external sites as observation-only unless the briefing explicitly authorizes a named state-changing action and destination.",
       "Never purchase, delete, publish, send messages, change account or security settings, or mutate production systems.",
       "Do not call browser_run_code_unsafe or an equivalent unsafe browser execution tool.",

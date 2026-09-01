@@ -8,7 +8,10 @@ import {
   dispatchAssignmentAction,
   readAssignment,
 } from "../.agents/skills/sol-luna-orchestration/scripts/control-plane.mjs";
-import { invokeDurableExecutor } from "../.agents/skills/sol-luna-orchestration/scripts/durable-executor.mjs";
+import {
+  createContractBriefing,
+  invokeDurableExecutor,
+} from "../.agents/skills/sol-luna-orchestration/scripts/durable-executor.mjs";
 import { cleanupAssignmentWorktree, runGit } from "../.agents/skills/sol-luna-orchestration/scripts/git-workspace.mjs";
 import {
   ORCHESTRATION_GENERATION_ENV,
@@ -98,6 +101,49 @@ async function dispatch(record, op, authority, payload, fixture) {
     )
   ).record;
 }
+
+test("contract briefing carries acknowledged non-sensitive answers into a retry", () => {
+  const record = {
+    assignment_id: "assignment-id",
+    attempt: 2,
+    base_revision: "a".repeat(40),
+    writer: false,
+    allowed_write_roots: [],
+    delivery: { mode: "manual" },
+    previous_attempts: [
+      {
+        operator_requests: [
+          {
+            question: "Which environment?",
+            answer: "staging",
+            state: "acknowledged",
+            sensitive: false,
+          },
+          {
+            question: "API token?",
+            answer: "do-not-repeat",
+            state: "acknowledged",
+            sensitive: true,
+          },
+          {
+            question: "Unanswered question?",
+            answer: "ignored",
+            state: "answered",
+            sensitive: false,
+          },
+        ],
+      },
+    ],
+  };
+
+  const briefing = createContractBriefing(record, "Continue the browser check.");
+
+  assert.match(briefing, /Operator answers from previous attempts:/);
+  assert.match(briefing, /Which environment\?\": \"staging\"/);
+  assert.doesNotMatch(briefing, /API token|do-not-repeat/);
+  assert.doesNotMatch(briefing, /Unanswered question|ignored/);
+  assert.match(briefing, /Continue the browser check\.$/);
+});
 
 test("durable execution rejects an invalid output contract before creating state or a worktree", async () => {
   const fixture = await createFixture();

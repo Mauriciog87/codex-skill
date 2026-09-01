@@ -104,10 +104,20 @@ test("profile registry and operational guidance stay aligned", async () => {
   assert.match(launcher, /--profile/);
   assert.match(launcher, /CODEX_EXECUTOR_PROFILE/);
   assert.match(launcher, /service_tier/);
-  assert.match(launcher, /PLAYWRIGHT_MCP_ISOLATED/);
+  assert.match(launcher, /createPlaywrightMcpRuntimeOverrides/);
   assert.match(launcher, /playwright_mcp:verified/);
   assert.doesNotMatch(launcher, /"exec"|output-last-message/);
   assert.doesNotMatch(launcher, /EXECUTOR_MODEL|EXECUTOR_REASONING_EFFORT/);
+
+  const playwrightConfiguration = await readFile(
+    ".agents/skills/sol-luna-orchestration/scripts/playwright-mcp-configuration.mjs",
+    "utf8",
+  );
+  assert.match(playwrightConfiguration, /--isolated/);
+  assert.match(playwrightConfiguration, /--output-dir/);
+  assert.match(playwrightConfiguration, /default_tools_approval_mode=\"approve\"/);
+  assert.match(playwrightConfiguration, /browser_run_code_unsafe/);
+  assert.match(playwrightConfiguration, /mcp_servers\.playwright\.cwd/);
 
   const appServerClient = await readFile(
     ".agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs",

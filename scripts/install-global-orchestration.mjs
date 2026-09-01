@@ -25,6 +25,10 @@ import {
   getDeliveryConfigurationPath,
   parseDeliveryConfiguration,
 } from "../.agents/skills/sol-luna-orchestration/scripts/delivery-configuration.mjs";
+import {
+  PLAYWRIGHT_MCP_ARGUMENTS,
+  PLAYWRIGHT_MCP_COMMAND,
+} from "../.agents/skills/sol-luna-orchestration/scripts/playwright-mcp-configuration.mjs";
 
 export const SKILL_NAME = "sol-luna-orchestration";
 export const LEGACY_SKILL_NAME = "sol-sol-orchestration";
@@ -226,21 +230,23 @@ function setTopLevelValues(lines, values) {
   }
 }
 
-function setAgentsValues(lines, values) {
+function setTableValues(lines, tableName, values) {
+  const escapedTableName = tableName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const tableMatcher = new RegExp(`^\\s*\\[${escapedTableName}\\]\\s*(?:#.*)?$`);
   const sectionHeaders = lines
     .map((line, index) => ({ line, index }))
-    .filter(({ line }) => /^\s*\[agents\]\s*(?:#.*)?$/.test(line));
+    .filter(({ line }) => tableMatcher.test(line));
   if (sectionHeaders.length > 1) {
-    throw new Error("Global config contains duplicate [agents] sections.");
+    throw new Error(`Global config contains duplicate [${tableName}] sections.`);
   }
 
   if (sectionHeaders.length === 0) {
     if (lines.length > 0 && lines.at(-1).trim() !== "") {
       lines.push("");
     }
-    lines.push("[agents]");
+    lines.push(`[${tableName}]`);
     for (const [key, value] of Object.entries(values)) {
-      lines.push(`${key} = ${value}`);
+      lines.push(`${key} = ${JSON.stringify(value)}`);
     }
     return;
   }
@@ -264,9 +270,9 @@ function setAgentsValues(lines, values) {
       }
     }
     if (matches.length > 1) {
-      throw new Error(`Global config contains duplicate [agents].${key} entries.`);
+      throw new Error(`Global config contains duplicate [${tableName}].${key} entries.`);
     }
-    const replacement = `${key} = ${value}`;
+    const replacement = `${key} = ${JSON.stringify(value)}`;
     if (matches.length === 1) {
       lines[matches[0]] = replacement;
     } else {
@@ -282,50 +288,30 @@ function setAgentsValues(lines, values) {
   }
 }
 
-function setFeaturesValues(lines, values) {
-  const sectionHeaders = lines
-    .map((line, index) => ({ line, index }))
-    .filter(({ line }) => /^\s*\[features\]\s*(?:#.*)?$/.test(line));
-  if (sectionHeaders.length > 1) {
-    throw new Error("Global config contains duplicate [features] sections.");
-  }
-  if (sectionHeaders.length === 0) {
-    if (lines.length > 0 && lines.at(-1).trim() !== "") {
-      lines.push("");
-    }
-    lines.push("[features]");
-    for (const [key, value] of Object.entries(values)) {
-      lines.push(`${key} = ${value}`);
-    }
-    return;
-  }
+function setAgentsValues(lines, values) {
+  setTableValues(lines, "agents", values);
+}
 
-  const start = sectionHeaders[0].index + 1;
-  let end = lines.length;
-  for (let index = start; index < lines.length; index += 1) {
-    if (isTableHeader(lines[index])) {
-      end = index;
-      break;
-    }
+function setFeaturesValues(lines, values) {
+  setTableValues(lines, "features", values);
+}
+
+function setPlaywrightMcpValues(lines) {
+  const firstTable = lines.findIndex(isTableHeader);
+  const topLevelEnd = firstTable === -1 ? lines.length : firstTable;
+  const ambiguous = lines.some((line, index) =>
+    /^\s*mcp_servers\.playwright(?:\.|\s*=)/.test(line) ||
+    /^\s*\[\[mcp_servers\.playwright\]\]\s*(?:#.*)?$/.test(line) ||
+    (index < topLevelEnd && /^\s*mcp_servers\s*=/.test(line)),
+  );
+  if (ambiguous) {
+    throw new Error("Global config contains an ambiguous Playwright MCP definition.");
   }
-  for (const [key, value] of Object.entries(values)) {
-    const matcher = keyMatcher(key);
-    const matches = [];
-    for (let index = start; index < end; index += 1) {
-      if (matcher.test(lines[index])) {
-        matches.push(index);
-      }
-    }
-    if (matches.length > 1) {
-      throw new Error(`Global config contains duplicate [features].${key} entries.`);
-    }
-    if (matches.length === 1) {
-      lines[matches[0]] = `${key} = ${value}`;
-    } else {
-      lines.splice(end, 0, `${key} = ${value}`);
-      end += 1;
-    }
-  }
+  setTableValues(lines, "mcp_servers.playwright", {
+    enabled: true,
+    command: PLAYWRIGHT_MCP_COMMAND,
+    args: PLAYWRIGHT_MCP_ARGUMENTS,
+  });
 }
 
 function managedHooksLines(hookScriptPath) {
@@ -408,6 +394,7 @@ export function updateGlobalConfig(content, { hookScriptPath = null } = {}) {
   });
   setAgentsValues(shape.lines, { max_depth: 1, max_threads: 4 });
   setFeaturesValues(shape.lines, { fast_mode: false });
+  setPlaywrightMcpValues(shape.lines);
   if (hookScriptPath !== null) {
     setFeaturesValues(shape.lines, { hooks: true });
     updateManagedHooks(shape.lines, hookScriptPath);

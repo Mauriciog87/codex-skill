@@ -33,6 +33,7 @@ The installer is idempotent and performs a complete preflight before changing an
 - links the canonical skill to `$HOME/.agents/skills/sol-luna-orchestration`;
 - uses a junction on Windows and a directory symlink on macOS or Linux;
 - configures the global root as Sol/xhigh/Standard with low verbosity;
+- installs and pins the `playwright` MCP to `npx --yes @playwright/mcp@0.0.80`;
 - preserves unrelated Codex configuration and instructions;
 - installs the Ultra SessionStart and PreToolUse hooks without changing an existing `hooks.json`;
 - migrates validated Sol-Sol and Sol-Terra links and managed blocks;
@@ -225,9 +226,11 @@ Dead leases are removed only after their registered process identity is confirme
 
 ## Playwright profile
 
-The `playwright` profile verifies that the `playwright` MCP is installed, enabled, and configured over stdio before Codex starts. Each run receives an isolated browser profile and a unique output directory under the operating system's temporary directory. The launcher removes those artifacts in `finally`, so it does not create `.playwright-mcp` in the repository.
+The `playwright` profile verifies that the `playwright` MCP is installed, enabled, configured over stdio, and pinned to `npx --yes @playwright/mcp@0.0.80` before Codex starts. `npm run install:global` installs or repairs that exact configuration while preserving unrelated MCP settings. For this profile only, the launcher gives the App Server process `mcp_servers.playwright.default_tools_approval_mode="approve"`, so briefing-authorized browser actions can run non-interactively, and adds `browser_run_code_unsafe` to that process's MCP deny-list. These overrides are not written to global configuration. Each run gives the MCP process a unique temporary working directory and extends the pinned arguments with its official `--isolated` and `--output-dir` options pointing to the same location. The launcher removes that directory in `finally`, so implicit outputs and explicit relative screenshot names cannot create artifacts in the repository.
 
 The session must emit an actual Playwright MCP tool call. A successful result includes `playwright_mcp:verified` in `checks`; the executor cannot add that verification itself.
+
+Executor turns are non-interactive and start with App Server approval policy `never`. Command and file approvals are declined, permission grants return an empty grant, and MCP elicitations are declined using the response shape required by the installed App Server. A non-blocking user-input request receives an empty answer and execution continues. A blocking, non-sensitive question becomes a durable operator request; after the answer is acknowledged and the assignment is retried, the answer is included in the next briefing. Sensitive input is never written to durable state and fails closed.
 
 Full interaction is allowed on localhost and explicitly named development or test environments. External sites are observation-only unless the briefing explicitly authorizes a named state-changing action and destination. Purchases, deletion, publishing, messaging, account or security changes, production mutation, and `browser_run_code_unsafe` are always prohibited.
 
@@ -262,9 +265,11 @@ There is no TTL, heartbeat, automatic recovery, shared-checkout write fallback, 
 ```text
 npm test
 npm run verify:platform
+npm run verify:live -- --schema-only
+npm run verify:live -- --playwright-only
 npm run verify:live
 ```
 
 The unit suite covers the control plane from routing through delivery. It tests JSON-RPC ordering and failures, profile routing, durable state transitions, action replay, resource leases, worktree isolation, immutable candidates, automatic-delivery precedence, manual integration, candidate-only commits, push delivery, delivery retry, required checks and artifacts, independent review, and operator gates. It also exercises dashboard security, deterministic fault simulation, tiers and terminal colors, capacity races, Ultra fencing, process identity, fail-closed recovery, history retention, version 1 migration, Playwright evidence, installer rollback, and platform-specific paths.
 
-`verify:platform` is the authentication-free compatibility gate and includes a live fingerprint check for the current process. Live verification generates the installed App Server schemas, checks the root and every profile against protocol and rollout evidence, uses temporary repositories for write tests, and confirms that read-only checks leave this repository unchanged. Add `--output <path-outside-the-repository>` to either command when an evidence artifact is required.
+`verify:platform` is the authentication-free compatibility gate and includes a live fingerprint check for the current process. It also verifies the exact App Server response contracts used for approvals, permission grants, user input, and MCP elicitation. `verify:live -- --schema-only` runs one root turn against the production output schema. `verify:live -- --playwright-only` runs one isolated localhost Playwright interaction without invoking the other profiles. The full live verification checks the root and every profile against protocol and rollout evidence, uses temporary repositories for write tests, and confirms that read-only checks leave this repository unchanged. Add `--output <path-outside-the-repository>` when an evidence artifact is required.

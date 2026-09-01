@@ -43,6 +43,7 @@ function runMock(scenario = {}, overrides = {}) {
     serviceTier,
     configuredServiceTier: serviceTier === "fast" ? "fast" : "default",
     fastMode: serviceTier === "fast",
+    configurationOverrides: overrides.configurationOverrides ?? [],
     sandboxMode: overrides.sandboxMode ?? "read-only",
     developerInstructions: "Act as a bounded executor.",
     briefing: "Complete the bounded test task.",
@@ -62,6 +63,7 @@ test("App Server arguments pin local orchestration safeguards without exec fallb
   const args = buildAppServerArguments({
     fastMode: true,
     configuredServiceTier: "fast",
+    configurationOverrides: ['mcp_servers.playwright.default_tools_approval_mode="approve"'],
   });
   assert.ok(args.includes('model_verbosity="low"'));
   assert.ok(args.includes('service_tier="fast"'));
@@ -69,6 +71,7 @@ test("App Server arguments pin local orchestration safeguards without exec fallb
   assert.ok(args.includes("features.multi_agent=false"));
   assert.ok(args.includes("agents.max_depth=1"));
   assert.ok(args.includes("agents.max_threads=1"));
+  assert.ok(args.includes('mcp_servers.playwright.default_tools_approval_mode="approve"'));
   assert.deepEqual(args.slice(-3), ["app-server", "--listen", "stdio://"]);
   assert.equal(args.includes("exec"), false);
   assert.equal(args.includes("--json"), false);
@@ -83,6 +86,7 @@ test("App Server launches the resolved native Codex executable", async () => {
     platform: "win32",
     architecture: "x64",
     environment,
+    configurationOverrides: ['mcp_servers.playwright.default_tools_approval_mode="approve"'],
     commandResolver: async (command, options) => {
       assert.equal(command, "codex");
       assert.equal(options.platform, "win32");
@@ -98,6 +102,7 @@ test("App Server launches the resolved native Codex executable", async () => {
 
   assert.equal(result.turnStatus, "completed");
   assert.equal(invocation.command, nativeExecutable);
+  assert.ok(invocation.args.includes('mcp_servers.playwright.default_tools_approval_mode="approve"'));
   assert.deepEqual(invocation.args.slice(-3), ["app-server", "--listen", "stdio://"]);
   assert.equal(invocation.options.env, environment);
   assert.equal(invocation.options.windowsHide, true);
@@ -173,6 +178,8 @@ test("handshake correlates responses and accepts settings notification before re
   assert.equal(messages[0].params.capabilities.experimentalApi, true);
   assert.equal(messages.some((message) => message.method === "initialized"), true);
   assert.equal(messages.some((message) => message.method === "model/list"), true);
+  const thread = messages.find((message) => message.method === "thread/start");
+  assert.equal(thread.params.approvalPolicy, "never");
   const update = messages.find((message) => message.method === "thread/settings/update");
   assert.deepEqual(update.params, {
     threadId: "mock-thread",
@@ -250,25 +257,106 @@ test("thread and settings contradictions preserve observed routing", async () =>
   );
 });
 
-test("approval and elicitation requests are declined and reported blocked", async (context) => {
+test("App Server approval protocols receive method-specific decline responses", async (context) => {
   const root = await mkdtemp(join(tmpdir(), "app-server-approval-"));
   context.after(() => rm(root, { recursive: true, force: true }));
-  for (const method of [
-    "item/commandExecution/requestApproval",
-    "item/permissions/requestApproval",
-    "mcpServer/elicitation/request",
-    "item/tool/requestUserInput",
-  ]) {
+  for (const method of ["item/commandExecution/requestApproval", "item/fileChange/requestApproval"]) {
     const capturePath = join(root, `${method.replaceAll("/", "-")}.jsonl`);
     const result = await runMock({ serverRequest: method }, { capturePath });
-    assert.match(result.blockedReason, /Declined/);
+    assert.match(result.blockedReason, /Declined App Server approval request/);
     const messages = (await readFile(capturePath, "utf8"))
       .trim()
       .split(/\r?\n/)
       .map(JSON.parse);
     const response = messages.find((message) => message.id === 900 && message.method === undefined);
-    assert.ok(response.result?.decision === "decline" || response.result?.action === "decline" || response.error?.code === -32000);
+    assert.deepEqual(response.result, { decision: "decline" });
   }
+});
+
+test("permission and MCP elicitation declines satisfy their response contracts", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "app-server-interaction-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const cases = [
+    ["item/permissions/requestApproval", { permissions: {}, scope: "turn" }],
+    ["mcpServer/elicitation/request", { action: "decline", content: null }],
+  ];
+  for (const [method, expected] of cases) {
+    const capturePath = join(root, `${method.replaceAll("/", "-")}.jsonl`);
+    const result = await runMock({ serverRequest: method }, { capturePath });
+    assert.match(result.blockedReason, /Declined App Server/);
+    const messages = (await readFile(capturePath, "utf8"))
+      .trim()
+      .split(/\r?\n/)
+      .map(JSON.parse);
+    const response = messages.find((message) => message.id === 900 && message.method === undefined);
+    assert.deepEqual(response.result, expected);
+    assert.equal(response.error, undefined);
+  }
+});
+
+test("blocking user input becomes durable operator requests", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "app-server-user-input-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const capturePath = join(root, "requests.jsonl");
+  const result = await runMock(
+    { serverRequest: "item/tool/requestUserInput" },
+    { capturePath },
+  );
+  assert.match(result.blockedReason, /Decision: Continue\?/);
+  assert.deepEqual(result.operatorRequests, [
+    {
+      question: "Decision: Continue?",
+      choices: ["Yes", "No"],
+      source: "app_server_user_input",
+      sensitive: false,
+    },
+  ]);
+  const messages = (await readFile(capturePath, "utf8"))
+    .trim()
+    .split(/\r?\n/)
+    .map(JSON.parse);
+  const response = messages.find((message) => message.id === 900 && message.method === undefined);
+  assert.deepEqual(response.result, { answers: {} });
+});
+
+test("non-blocking user input continues without answers", async () => {
+  const result = await runMock({
+    serverRequest: "item/tool/requestUserInput",
+    continueAfterServerResponse: true,
+    serverRequestParams: {
+      threadId: "mock-thread",
+      turnId: "mock-turn",
+      itemId: "input-item",
+      isBlocking: false,
+      questions: [{ id: "optional", header: "Optional", question: "Add detail?", options: null }],
+    },
+  });
+  assert.equal(result.turnStatus, "completed");
+  assert.equal(result.blockedReason, null);
+  assert.deepEqual(result.operatorRequests, []);
+  assert.ok(result.warnings.includes("App Server non-blocking user input request was resolved without answers."));
+});
+
+test("secret and malformed user input requests fail closed without durable content", async () => {
+  const secret = await runMock({
+    serverRequest: "item/tool/requestUserInput",
+    serverRequestParams: {
+      threadId: "mock-thread",
+      turnId: "mock-turn",
+      itemId: "input-item",
+      isBlocking: true,
+      questions: [{ id: "secret", header: "Secret", question: "Token?", options: null, isSecret: true }],
+    },
+  });
+  assert.match(secret.blockedReason, /secret input/);
+  assert.deepEqual(secret.operatorRequests, []);
+
+  const malformed = await runMock({
+    serverRequest: "item/tool/requestUserInput",
+    serverRequestParams: { threadId: "mock-thread", turnId: "mock-turn" },
+  });
+  assert.match(malformed.blockedReason, /malformed/);
+  assert.deepEqual(malformed.operatorRequests, []);
 });
 
 test("tool notifications record Playwright evidence and unsafe use", async () => {

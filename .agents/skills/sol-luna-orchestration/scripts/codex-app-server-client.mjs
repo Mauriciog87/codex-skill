@@ -3,8 +3,14 @@ import { createInterface } from "node:readline";
 import { resolveCodexInvocation } from "./codex-command.mjs";
 
 const MAX_CAPTURE_LENGTH = 32_768;
+const MAX_OPERATOR_QUESTIONS = 3;
+const MAX_OPERATOR_CHOICES = 20;
 const FORCE_KILL_DELAY_MS = 1_000;
 const DEFAULT_TIMEOUT_MS = 600_000;
+const APPROVAL_REQUEST_METHODS = new Set([
+  "item/commandExecution/requestApproval",
+  "item/fileChange/requestApproval",
+]);
 
 export const MINIMUM_CODEX_VERSION = "0.147.0";
 
@@ -74,7 +80,9 @@ export function buildAppServerArguments({
   fastMode,
   configuredServiceTier,
   modelVerbosity = "low",
+  configurationOverrides = [],
 }) {
+  const overrideArguments = configurationOverrides.flatMap((value) => ["-c", value]);
   return [
     "-c",
     `model_verbosity=${JSON.stringify(modelVerbosity)}`,
@@ -88,6 +96,7 @@ export function buildAppServerArguments({
     "agents.max_depth=1",
     "-c",
     "agents.max_threads=1",
+    ...overrideArguments,
     "app-server",
     "--listen",
     "stdio://",
@@ -121,26 +130,173 @@ function findModel(modelListResult, modelName) {
   );
 }
 
-function isApprovalRequest(method) {
-  return method.endsWith("/requestApproval");
-}
-
-function isPermissionApprovalRequest(method) {
-  return method === "item/permissions/requestApproval";
-}
-
-function isElicitationRequest(method) {
-  return method === "mcpServer/elicitation/request";
-}
-
-function isUserInputRequest(method) {
-  return method === "item/tool/requestUserInput";
-}
-
 function requestDetail(params) {
   return typeof params?.reason === "string" && params.reason.length > 0
     ? ` Reason: ${params.reason.slice(0, 1_000)}`
     : "";
+}
+
+function invalidServerRequest(method, message) {
+  return {
+    response: { error: { code: -32602, message } },
+    blockedReason: `Rejected malformed App Server request ${method}.`,
+    operatorRequests: [],
+    warnings: [],
+  };
+}
+
+function validRequestEnvelope(params, { item = true, turn = true } = {}) {
+  return (
+    params !== null &&
+    typeof params === "object" &&
+    !Array.isArray(params) &&
+    typeof params.threadId === "string" &&
+    (!turn || typeof params.turnId === "string") &&
+    (!item || typeof params.itemId === "string")
+  );
+}
+
+function normalizeUserInputQuestions(params) {
+  if (
+    !validRequestEnvelope(params) ||
+    !Array.isArray(params.questions) ||
+    params.questions.length < 1 ||
+    params.questions.length > MAX_OPERATOR_QUESTIONS ||
+    (params.isBlocking !== undefined && typeof params.isBlocking !== "boolean") ||
+    Buffer.byteLength(JSON.stringify(params), "utf8") > MAX_CAPTURE_LENGTH
+  ) {
+    return null;
+  }
+  const normalized = [];
+  for (const value of params.questions) {
+    if (
+      value === null ||
+      typeof value !== "object" ||
+      Array.isArray(value) ||
+      typeof value.id !== "string" ||
+      value.id.length === 0 ||
+      typeof value.header !== "string" ||
+      typeof value.question !== "string" ||
+      value.question.trim().length === 0 ||
+      (value.isSecret !== undefined && typeof value.isSecret !== "boolean") ||
+      (value.isOther !== undefined && typeof value.isOther !== "boolean") ||
+      !(value.options === null || value.options === undefined || Array.isArray(value.options)) ||
+      (Array.isArray(value.options) && value.options.length > MAX_OPERATOR_CHOICES)
+    ) {
+      return null;
+    }
+    const choices = [];
+    for (const option of value.options ?? []) {
+      if (
+        option === null ||
+        typeof option !== "object" ||
+        Array.isArray(option) ||
+        typeof option.label !== "string" ||
+        option.label.trim().length === 0
+      ) {
+        return null;
+      }
+      choices.push(option.label.trim());
+    }
+    if (value.isOther === true) {
+      choices.push("Other");
+    }
+    normalized.push({
+      question: value.header.trim().length > 0
+        ? `${value.header.trim()}: ${value.question.trim()}`
+        : value.question.trim(),
+      choices,
+      secret: value.isSecret === true,
+    });
+  }
+  return normalized;
+}
+
+export function createServerRequestDecision(method, params) {
+  if (APPROVAL_REQUEST_METHODS.has(method)) {
+    if (!validRequestEnvelope(params)) {
+      return invalidServerRequest(method, "Approval request parameters are invalid.");
+    }
+    return {
+      response: { result: { decision: "decline" } },
+      blockedReason: `Declined App Server approval request ${method}.${requestDetail(params)}`,
+      operatorRequests: [],
+      warnings: [],
+    };
+  }
+  if (method === "item/permissions/requestApproval") {
+    if (
+      !validRequestEnvelope(params) ||
+      typeof params.cwd !== "string" ||
+      params.permissions === null ||
+      typeof params.permissions !== "object" ||
+      Array.isArray(params.permissions)
+    ) {
+      return invalidServerRequest(method, "Permission request parameters are invalid.");
+    }
+    return {
+      response: { result: { permissions: {}, scope: "turn" } },
+      blockedReason: `Declined App Server approval request ${method}.${requestDetail(params)}`,
+      operatorRequests: [],
+      warnings: [],
+    };
+  }
+  if (method === "mcpServer/elicitation/request") {
+    if (
+      !validRequestEnvelope(params, { item: false, turn: false }) ||
+      typeof params.serverName !== "string" ||
+      !["form", "openai/form", "url"].includes(params.mode) ||
+      typeof params.message !== "string"
+    ) {
+      return invalidServerRequest(method, "MCP elicitation parameters are invalid.");
+    }
+    return {
+      response: { result: { action: "decline", content: null } },
+      blockedReason: `Declined App Server interaction request ${method}.`,
+      operatorRequests: [],
+      warnings: [],
+    };
+  }
+  if (method === "item/tool/requestUserInput") {
+    const questions = normalizeUserInputQuestions(params);
+    if (questions === null) {
+      return invalidServerRequest(method, "User input request parameters are invalid.");
+    }
+    if (params.isBlocking === false) {
+      return {
+        response: { result: { answers: {} } },
+        blockedReason: null,
+        operatorRequests: [],
+        warnings: ["App Server non-blocking user input request was resolved without answers."],
+      };
+    }
+    if (questions.some((question) => question.secret)) {
+      return {
+        response: { result: { answers: {} } },
+        blockedReason: "App Server requested secret input that cannot be stored by a durable executor.",
+        operatorRequests: [],
+        warnings: [],
+      };
+    }
+    const operatorRequests = questions.map(({ question, choices }) => ({
+      question,
+      choices,
+      source: "app_server_user_input",
+      sensitive: false,
+    }));
+    return {
+      response: { result: { answers: {} } },
+      blockedReason: `App Server requested operator input: ${operatorRequests.map((request) => request.question).join(" | ")}`,
+      operatorRequests,
+      warnings: [],
+    };
+  }
+  return {
+    response: { error: { code: -32601, message: "Unsupported server request." } },
+    blockedReason: `Declined unsupported App Server request ${method}.${requestDetail(params)}`,
+    operatorRequests: [],
+    warnings: [],
+  };
 }
 
 class JsonRpcConnection {
@@ -158,6 +314,7 @@ class JsonRpcConnection {
     this.stderr = "";
     this.warnings = [];
     this.agentMessages = [];
+    this.operatorRequests = [];
     this.playwrightMcpUsed = false;
     this.unsafePlaywrightToolUsed = false;
     this.blocked = createDeferred();
@@ -286,54 +443,17 @@ class JsonRpcConnection {
   }
 
   handleServerRequest(message) {
-    if (isPermissionApprovalRequest(message.method)) {
-      this.send({
-        jsonrpc: "2.0",
-        id: message.id,
-        error: { code: -32000, message: "Permission escalation was declined." },
-      });
-      this.markBlocked(
-        `Declined App Server approval request ${message.method}.${requestDetail(message.params)}`,
-      );
-      return;
-    }
-    if (isApprovalRequest(message.method)) {
-      this.send({ jsonrpc: "2.0", id: message.id, result: { decision: "decline" } });
-      this.markBlocked(
-        `Declined App Server approval request ${message.method}.${requestDetail(message.params)}`,
-      );
-      return;
-    }
-    if (isElicitationRequest(message.method)) {
-      this.send({
-        jsonrpc: "2.0",
-        id: message.id,
-        result: { action: "decline", content: null },
-      });
-      this.markBlocked(
-        `Declined App Server interaction request ${message.method}.${requestDetail(message.params)}`,
-      );
-      return;
-    }
-    if (isUserInputRequest(message.method)) {
-      this.send({
-        jsonrpc: "2.0",
-        id: message.id,
-        error: { code: -32000, message: "Interactive input is unavailable." },
-      });
-      this.markBlocked(
-        `Declined App Server interaction request ${message.method}.${requestDetail(message.params)}`,
-      );
-      return;
-    }
+    const decision = createServerRequestDecision(message.method, message.params);
     this.send({
       jsonrpc: "2.0",
       id: message.id,
-      error: { code: -32601, message: "Unsupported server request." },
+      ...decision.response,
     });
-    this.markBlocked(
-      `Declined unsupported App Server request ${message.method}.${requestDetail(message.params)}`,
-    );
+    this.operatorRequests.push(...decision.operatorRequests);
+    this.warnings.push(...decision.warnings);
+    if (decision.blockedReason !== null) {
+      this.markBlocked(decision.blockedReason);
+    }
   }
 
   handleNotification(message) {
@@ -533,6 +653,7 @@ export async function runAppServerTurn({
   serviceTier,
   configuredServiceTier,
   fastMode,
+  configurationOverrides = [],
   sandboxMode,
   developerInstructions,
   briefing,
@@ -551,7 +672,11 @@ export async function runAppServerTurn({
   }
   const expected = { model, reasoningEffort, serviceTier };
   const protocolTier = serviceTier === "fast" ? "priority" : null;
-  const args = buildAppServerArguments({ fastMode, configuredServiceTier });
+  const args = buildAppServerArguments({
+    fastMode,
+    configuredServiceTier,
+    configurationOverrides,
+  });
   let child;
   try {
     const invocation = await commandResolver(command, {
@@ -595,6 +720,7 @@ export async function runAppServerTurn({
       model,
       cwd,
       sandbox: sandboxMode,
+      approvalPolicy: "never",
       developerInstructions,
       serviceTier: protocolTier,
     });
@@ -652,6 +778,7 @@ export async function runAppServerTurn({
       turnStatus,
       finalResponse: connection.agentMessages.at(-1) ?? null,
       blockedReason,
+      operatorRequests: connection.operatorRequests,
       playwrightMcpUsed: connection.playwrightMcpUsed,
       unsafePlaywrightToolUsed: connection.unsafePlaywrightToolUsed,
       warnings: connection.warnings,
