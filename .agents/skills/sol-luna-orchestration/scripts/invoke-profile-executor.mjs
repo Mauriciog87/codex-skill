@@ -13,6 +13,7 @@ import {
 import { readDeliveryConfiguration } from "./delivery-configuration.mjs";
 import {
   AppServerError,
+  AppServerTimeoutError,
   buildAppServerArguments,
   runAppServerTurn,
 } from "./codex-app-server-client.mjs";
@@ -974,6 +975,7 @@ function configurationFailure(message, options, details = {}) {
       model: details.model ?? null,
       reasoningEffort: details.reasoningEffort ?? null,
       serviceTier: details.serviceTier ?? null,
+      routingVerified: details.routingVerified ?? false,
       sandboxMode: options.sandboxMode,
       summary: message,
       blockers: [message],
@@ -1046,6 +1048,7 @@ async function runExecutor({
         briefing: briefing.trim(),
         outputSchema: outputContract.schema,
         timeoutMs: options.timeoutSeconds * 1000,
+        idleTimeoutMs: profile.idleTimeoutMs,
         signal,
         onProcessStarted: onAppServerStarted,
       });
@@ -1053,12 +1056,41 @@ async function runExecutor({
       if (!(error instanceof AppServerError)) {
         throw error;
       }
+      const warnings = error.stderr ? [error.stderr] : [];
+      let model = error.actualModel ?? null;
+      let reasoningEffort = error.actualReasoningEffort ?? null;
+      let routingVerified = false;
+      if (
+        error instanceof AppServerTimeoutError &&
+        error.settingsRoutingVerified === true &&
+        typeof error.threadId === "string"
+      ) {
+        try {
+          const routing = await verifySessionRouting(
+            error.threadId,
+            profile.model,
+            profile.reasoningEffort,
+            { sessionRoots },
+          );
+          model = routing.model;
+          reasoningEffort = routing.reasoningEffort;
+          routingVerified = true;
+        } catch (routingError) {
+          if (!(routingError instanceof RoutingVerificationError)) {
+            throw routingError;
+          }
+          model = routingError.actualModel ?? model;
+          reasoningEffort = routingError.actualReasoningEffort ?? reasoningEffort;
+          warnings.push(`Could not verify routing from the rollout after the timeout: ${routingError.message}`);
+        }
+      }
       return configurationFailure(error.message, options, {
         threadId: error.threadId ?? null,
-        model: error.actualModel ?? null,
-        reasoningEffort: error.actualReasoningEffort ?? null,
+        model,
+        reasoningEffort,
         serviceTier: error.actualServiceTier ?? null,
-        warnings: error.stderr ? [error.stderr] : [],
+        routingVerified,
+        warnings,
       });
     }
 

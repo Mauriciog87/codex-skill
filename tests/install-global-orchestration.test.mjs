@@ -189,6 +189,8 @@ test("updateGlobalInstructions manages one exact block and rejects conflicts", (
   assert.match(first.content, new RegExp(MANAGED_BLOCK_START));
   assert.match(first.content, new RegExp(MANAGED_BLOCK_END));
   assert.match(first.content, /\$sol-luna-orchestration/);
+  assert.match(first.content, /Rebases, merges, cherry-picks, reverts/);
+  assert.match(first.content, /Do not ask `explore` to scan commits/);
   assert.equal(updateGlobalInstructions(first.content).changed, false);
   assert.throws(
     () => updateGlobalInstructions(`${MANAGED_BLOCK_START}\nmissing end\n`),

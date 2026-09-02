@@ -141,6 +141,26 @@ function completeTurn() {
   }
 }
 
+function runTurn() {
+  for (const event of scenario.turnEvents ?? []) {
+    setTimeout(() => {
+      notification(event.method, {
+        threadId: event.threadId ?? threadId,
+        turnId: event.turnId ?? turnId,
+        ...(event.params ?? {}),
+      });
+    }, event.delayMs);
+  }
+  if (scenario.stallAfterTurnStart === true) {
+    return;
+  }
+  if (Number.isFinite(scenario.completeAfterMs)) {
+    setTimeout(completeTurn, scenario.completeAfterMs);
+    return;
+  }
+  completeTurn();
+}
+
 async function handle(message) {
   await capture(message);
   if (scenario.invalidJsonAfter !== undefined && scenario.invalidJsonAfter === message.method) {
@@ -217,7 +237,7 @@ async function handle(message) {
       });
       return;
     }
-    completeTurn();
+    runTurn();
     return;
   }
   if (message.method === "turn/interrupt") {

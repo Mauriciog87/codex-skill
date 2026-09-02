@@ -8,6 +8,7 @@ const PROFILE_DEFINITIONS = {
     configuredServiceTier: "fast",
     fastMode: true,
     sandboxMode: "read-only",
+    idleTimeoutMs: 120_000,
     concurrencyPool: "luna",
     workspaceStrategy: "shared-read-only",
     capabilities: ["workspace-read", "operator-request"],
@@ -15,6 +16,7 @@ const PROFILE_DEFINITIONS = {
     instructions: [
       "Explore the assigned question without modifying files or running state-changing commands.",
       "Search broadly, read only the evidence needed, and stop when the briefing can be answered.",
+      "Do not scan commit history to guess whether a rebase, merge, cherry-pick, or revert will conflict. Analyze only conflicts Git has already reported and only when the briefing asks one focused question about specific unmerged paths; otherwise return blocked.",
       "Report a direct conclusion, path:line evidence, relevant contracts, risks, and unresolved questions.",
       "Do not return raw file dumps or long command output, and identify inferences explicitly.",
       "Return blocked and recommend escalation to the root when the task requires architectural decisions, security judgment, concurrency analysis, distributed invariants, or resolution of contradictory contracts.",
@@ -118,6 +120,7 @@ export const EXECUTOR_PROFILES = Object.freeze(
         configuredServiceTier: profile.configuredServiceTier,
         fastMode: profile.fastMode,
         sandboxMode: profile.sandboxMode,
+        idleTimeoutMs: profile.idleTimeoutMs ?? null,
         concurrencyPool: profile.concurrencyPool,
         concurrencyLimit: profile.concurrencyLimit ?? null,
         workspaceStrategy: profile.workspaceStrategy,

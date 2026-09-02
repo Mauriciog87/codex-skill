@@ -30,7 +30,10 @@ import {
   verifySessionRouting,
 } from "../.agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs";
 import { acquireUltraLock, releaseUltraLock } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
-import { AppServerProtocolError } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
+import {
+  AppServerIdleTimeoutError,
+  AppServerProtocolError,
+} from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
 import { loadExecutorResultContract } from "../.agents/skills/sol-luna-orchestration/scripts/executor-result-contract.mjs";
 
 const OUTPUT_CONTRACT = await loadExecutorResultContract();
@@ -545,6 +548,7 @@ test("invokeExecutor returns verified profile metadata and status exit codes", a
       sessionRoots: [sessionsRoot],
       playwrightMcpVerifier: async () => ({ enabled: true }),
       appServerRunner: async (appServerOptions) => {
+        assert.equal(appServerOptions.idleTimeoutMs, profile.idleTimeoutMs);
         if (profileName === "playwright") {
           assertPlaywrightRuntimeOverrides(appServerOptions.configurationOverrides);
         } else {
@@ -683,6 +687,62 @@ test("invokeExecutor preserves profile without claiming routing after App Server
   assert.equal(execution.result.reasoning_effort, null);
   assert.equal(execution.result.service_tier, null);
   assert.equal(execution.result.routing_verified, false);
+});
+
+test("idle timeout reports verified routing only when settings and rollout agree", async (context) => {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "sol-luna-idle-routing-test-"));
+  context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const sessionsRoot = join(temporaryRoot, "sessions");
+  const threadId = "idle-timeout-verified";
+  await writeRoutingMetadata(sessionsRoot, threadId, "max", "gpt-5.6-luna");
+
+  function idleError(id) {
+    return new AppServerIdleTimeoutError(
+      "The executor went 120 seconds without reporting progress for the active thread.",
+      {
+        threadId: id,
+        actualModel: "gpt-5.6-luna",
+        actualReasoningEffort: "max",
+        actualServiceTier: "fast",
+        settingsRoutingVerified: true,
+      },
+    );
+  }
+
+  const verified = await invokeExecutor({
+    briefing: "Explore the bounded test task.",
+    options: profileOptions(temporaryRoot, "explore"),
+    coordinationOptions: { homeDirectory: temporaryRoot },
+    sessionRoots: [sessionsRoot],
+    appServerRunner: async () => {
+      throw idleError(threadId);
+    },
+  });
+  assert.equal(verified.exitCode, 2);
+  assert.equal(verified.result.status, "failed");
+  assert.equal(verified.result.routing_verified, true);
+  assert.equal(verified.result.model, "gpt-5.6-luna");
+  assert.equal(verified.result.reasoning_effort, "max");
+  assert.equal(verified.result.service_tier, "fast");
+  assert.match(verified.result.summary, /without reporting progress for the active thread/);
+
+  const mismatchedThreadId = "idle-timeout-mismatched";
+  await writeRoutingMetadata(sessionsRoot, mismatchedThreadId, "high", "gpt-5.5");
+  const unverified = await invokeExecutor({
+    briefing: "Explore the bounded test task.",
+    options: profileOptions(temporaryRoot, "explore"),
+    coordinationOptions: { homeDirectory: temporaryRoot },
+    sessionRoots: [sessionsRoot],
+    appServerRunner: async () => {
+      throw idleError(mismatchedThreadId);
+    },
+  });
+  assert.equal(unverified.exitCode, 2);
+  assert.equal(unverified.result.routing_verified, false);
+  assert.equal(unverified.result.model, "gpt-5.5");
+  assert.equal(unverified.result.reasoning_effort, "high");
+  assert.ok(unverified.result.warnings.some((warning) =>
+    warning.startsWith("Could not verify routing from the rollout after the timeout:")));
 });
 
 test("declined App Server interaction returns blocked with verified routing", async (context) => {

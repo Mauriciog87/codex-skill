@@ -6,11 +6,13 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
+  AppServerIdleTimeoutError,
   AppServerProtocolError,
   AppServerRoutingError,
   AppServerTimeoutError,
   MINIMUM_CODEX_VERSION,
   buildAppServerArguments,
+  createIdleWatchdog,
   isCompatibleCodexVersion,
   normalizeAppServerServiceTier,
   runAppServerTurn,
@@ -49,6 +51,7 @@ function runMock(scenario = {}, overrides = {}) {
     briefing: "Complete the bounded test task.",
     outputSchema: OUTPUT_SCHEMA,
     timeoutMs: overrides.timeoutMs ?? 2_000,
+    idleTimeoutMs: overrides.idleTimeoutMs ?? null,
     platform: overrides.platform ?? process.platform,
     architecture: overrides.architecture ?? process.arch,
     commandResolver: overrides.commandResolver
@@ -57,6 +60,41 @@ function runMock(scenario = {}, overrides = {}) {
       ?? spawnMock(scenario, overrides.capturePath),
     onProcessStarted: overrides.onProcessStarted,
   });
+}
+
+function createManualTimer() {
+  let currentTime = 0;
+  let nextId = 1;
+  const timers = new Map();
+  return {
+    now: () => currentTime,
+    schedule(callback, delayMs) {
+      const timer = { id: nextId, unref() {} };
+      nextId += 1;
+      timers.set(timer.id, { callback, dueAt: currentTime + delayMs });
+      return timer;
+    },
+    cancel(timer) {
+      timers.delete(timer.id);
+    },
+    advance(delayMs) {
+      const targetTime = currentTime + delayMs;
+      while (true) {
+        const next = [...timers.entries()]
+          .filter(([, value]) => value.dueAt <= targetTime)
+          .sort((left, right) => left[1].dueAt - right[1].dueAt)[0];
+        if (next === undefined) {
+          break;
+        }
+        const [id, value] = next;
+        timers.delete(id);
+        currentTime = value.dueAt;
+        value.callback();
+      }
+      currentTime = targetTime;
+    },
+    pending: () => timers.size,
+  };
 }
 
 test("App Server arguments pin local orchestration safeguards without exec fallback", () => {
@@ -75,6 +113,39 @@ test("App Server arguments pin local orchestration safeguards without exec fallb
   assert.deepEqual(args.slice(-3), ["app-server", "--listen", "stdio://"]);
   assert.equal(args.includes("exec"), false);
   assert.equal(args.includes("--json"), false);
+});
+
+test("idle watchdog resets its deadline and cleans up its timer", () => {
+  const timer = createManualTimer();
+  const timeouts = [];
+  const watchdog = createIdleWatchdog({
+    idleTimeoutMs: 120_000,
+    onTimeout: (details) => timeouts.push(details),
+    now: timer.now,
+    schedule: timer.schedule,
+    cancel: timer.cancel,
+  });
+  watchdog.start("thread-1", "turn-1");
+  timer.advance(119_999);
+  assert.equal(timeouts.length, 0);
+  watchdog.progress("item/started");
+  timer.advance(119_999);
+  assert.equal(timeouts.length, 0);
+  timer.advance(1);
+  assert.deepEqual(timeouts, [{
+    threadId: "thread-1",
+    turnId: "turn-1",
+    idleTimeoutMs: 120_000,
+    idleDurationMs: 120_000,
+    lastProgressMethod: "item/started",
+    lastProgressAt: 119_999,
+  }]);
+  assert.equal(timer.pending(), 0);
+  watchdog.start("thread-2", "turn-2");
+  watchdog.stop();
+  timer.advance(120_000);
+  assert.equal(timeouts.length, 1);
+  assert.equal(timer.pending(), 0);
 });
 
 test("App Server launches the resolved native Codex executable", async () => {
@@ -395,4 +466,83 @@ test("global timeout force-terminates an unresponsive App Server", async () => {
     AppServerTimeoutError,
   );
   assert.ok(Date.now() - startedAt < 3_000);
+});
+
+test("idle timeout stops a silent active turn and keeps the last progress details", async () => {
+  const startedAt = Date.now();
+  await assert.rejects(
+    runMock(
+      { stallAfterTurnStart: true, ignoreSigterm: true },
+      { timeoutMs: 2_000, idleTimeoutMs: 100 },
+    ),
+    (error) => {
+      assert.ok(error instanceof AppServerIdleTimeoutError);
+      assert.equal(error.threadId, "mock-thread");
+      assert.equal(error.turnId, "mock-turn");
+      assert.equal(error.lastProgressMethod, "turn/start");
+      assert.equal(error.idleTimeoutMs, 100);
+      assert.equal(error.settingsRoutingVerified, true);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - startedAt < 3_000);
+});
+
+test("only active-thread item notifications reset the idle timeout", async () => {
+  const completed = await runMock(
+    {
+      turnEvents: [{
+        delayMs: 300,
+        method: "item/started",
+        params: { item: { type: "commandExecution", id: "command-1" } },
+      }],
+      completeAfterMs: 650,
+    },
+    { timeoutMs: 2_000, idleTimeoutMs: 500 },
+  );
+  assert.equal(completed.turnStatus, "completed");
+
+  await assert.rejects(
+    runMock(
+      {
+        stallAfterTurnStart: true,
+        turnEvents: [
+          {
+            delayMs: 100,
+            method: "item/started",
+            threadId: "other-thread",
+            params: { item: { type: "commandExecution", id: "other-command" } },
+          },
+          {
+            delayMs: 200,
+            method: "thread/tokenUsage/updated",
+            params: { tokenUsage: { total: 1 } },
+          },
+        ],
+      },
+      { timeoutMs: 2_000, idleTimeoutMs: 300 },
+    ),
+    (error) =>
+      error instanceof AppServerIdleTimeoutError &&
+      error.lastProgressMethod === "turn/start",
+  );
+});
+
+test("global timeout still ends a turn that keeps reporting item progress", async () => {
+  await assert.rejects(
+    runMock(
+      {
+        turnEvents: [{
+          delayMs: 250,
+          method: "item/started",
+          params: { item: { type: "commandExecution", id: "command-1" } },
+        }],
+        completeAfterMs: 800,
+      },
+      { timeoutMs: 500, idleTimeoutMs: 400 },
+    ),
+    (error) =>
+      error instanceof AppServerTimeoutError &&
+      !(error instanceof AppServerIdleTimeoutError),
+  );
 });

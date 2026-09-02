@@ -18,7 +18,15 @@ The launchers talk to the [experimental Codex App Server](https://developers.ope
 
 Every role uses `model_verbosity = "low"`. Fast profiles force `features.fast_mode = true`, while Standard roles force it to `false`. Reasoning effort and output verbosity are independent settings.
 
+Once `turn/start` succeeds, `explore` gets 120 seconds to report `item/*` progress for the active thread. Each matching event restarts the clock. The existing 900-second timeout still caps the whole run, and the other profiles use only that total timeout.
+
 Routing requires two matching sources of evidence. `thread/settings/updated` confirms the effective model, effort, and protocol tier, while the rollout `turn_context` confirms the model and effort used for the turn. Protocol `priority` is reported publicly as `fast`; protocol `default` is reported as `standard`.
+
+## Fast path for Git operations
+
+Rebases, merges, cherry-picks, reverts, and conflict resolution stay with the root. Before changing history, the root checks the current checkout, working tree, linked worktrees, upstream, and refs. It then fetches the latest remote refs and runs the Git operation in a state that can still be aborted or recovered. Only the conflicts Git actually reports should drive the resolution.
+
+Do not use `explore` to scan the commit history and guess what might conflict. If Git stops on a real conflict, the root may ask `explore` one focused question about the intent behind those specific files. The root still makes the edit. If that run stalls or fails, do not repeat the same request. Stop and ask the operator when the checkout is dirty, another Git operation is already in progress, or the target branch is checked out in another worktree. This does not change who may push or force-push.
 
 ## Installation
 

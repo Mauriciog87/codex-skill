@@ -85,16 +85,21 @@ test("profile registry and operational guidance stay aligned", async () => {
           profile.sandboxMode,
           profile.workspaceStrategy,
           profile.capabilities,
+          profile.idleTimeoutMs,
         ],
       ]),
     ),
     {
-      explore: ["gpt-5.6-luna", "max", "fast", "read-only", "shared-read-only", ["workspace-read", "operator-request"]],
-      "implement-lite": ["gpt-5.6-luna", "max", "fast", "workspace-write", "isolated-worktree", ["workspace-read", "workspace-write", "operator-request"]],
-      playwright: ["gpt-5.6-luna", "max", "standard", "read-only", "shared-read-only", ["workspace-read", "browser", "operator-request"]],
-      implement: ["gpt-5.6-sol", "high", "standard", "workspace-write", "isolated-worktree", ["workspace-read", "workspace-write", "operator-request"]],
-      review: ["gpt-5.6-sol", "high", "standard", "read-only", "candidate-worktree", ["workspace-read", "review"]],
+      explore: ["gpt-5.6-luna", "max", "fast", "read-only", "shared-read-only", ["workspace-read", "operator-request"], 120_000],
+      "implement-lite": ["gpt-5.6-luna", "max", "fast", "workspace-write", "isolated-worktree", ["workspace-read", "workspace-write", "operator-request"], null],
+      playwright: ["gpt-5.6-luna", "max", "standard", "read-only", "shared-read-only", ["workspace-read", "browser", "operator-request"], null],
+      implement: ["gpt-5.6-sol", "high", "standard", "workspace-write", "isolated-worktree", ["workspace-read", "workspace-write", "operator-request"], null],
+      review: ["gpt-5.6-sol", "high", "standard", "read-only", "candidate-worktree", ["workspace-read", "review"], null],
     },
+  );
+  assert.match(
+    EXECUTOR_PROFILES.explore.instructions.join(" "),
+    /Do not scan commit history to guess whether a rebase, merge, cherry-pick, or revert will conflict/,
   );
 
   const launcher = await readFile(
@@ -131,6 +136,8 @@ test("profile registry and operational guidance stay aligned", async () => {
   assert.match(appServerClient, /agents\.max_depth=1/);
   assert.match(appServerClient, /agents\.max_threads=1/);
   assert.match(appServerClient, /onProcessStarted/);
+  assert.match(appServerClient, /AppServerIdleTimeoutError/);
+  assert.match(appServerClient, /without reporting progress for the active thread/);
   assert.doesNotMatch(appServerClient, /"exec"|--json|output-last-message/);
 
   const ultraLauncher = await readFile(
@@ -255,7 +262,15 @@ test("profile registry and operational guidance stay aligned", async () => {
     assert.match(content, /durable/i);
     assert.match(content, /delivery/i);
     assert.match(content, /force-push|force/i);
+    assert.match(content, /Fast path for Git operations/);
+    assert.match(content, /Rebases, merges, cherry-picks, reverts/);
+    assert.match(content, /guess what might conflict/);
+    assert.match(content, /120 seconds to report `item\/\*` progress/);
   }
+
+  const installer = await readFile("scripts/install-global-orchestration.mjs", "utf8");
+  assert.match(installer, /Rebases, merges, cherry-picks, reverts/);
+  assert.match(installer, /Do not ask `explore` to scan commits/);
 });
 
 test("cross-platform workflows keep offline and live verification separated", async () => {

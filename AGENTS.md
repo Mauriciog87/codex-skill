@@ -93,6 +93,14 @@ node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs recove
 9. Inspect executor evidence instead of repeating discovery unless verification requires it.
 10. Request Ultra only for an explicit exceptional reason and pause while it owns the repository.
 
+## Fast path for Git operations
+
+Rebases, merges, cherry-picks, reverts, and conflict resolution stay with the root. Loading the skill does not mean they must be delegated. Before changing history, the root checks the current checkout, working tree, linked worktrees, upstream, and refs. It then fetches the latest remote refs and runs the Git operation in a state that can still be aborted or recovered. Only the conflicts Git actually reports should drive the resolution.
+
+Do not send `explore` off to scan the commit history and guess what might conflict. If Git stops on a real conflict, the root may ask `explore` one focused question about the intent behind those specific files. The root still makes the edit. If that run stalls or fails, do not repeat the same request; work from the conflict Git has already exposed.
+
+Stop and ask the operator when the checkout is dirty, another Git operation is already in progress, or the target branch is checked out in another worktree. This does not change who may push or force-push.
+
 ## Executor responsibilities
 
 1. Complete only the briefing and preserve unrelated changes.
@@ -101,6 +109,8 @@ node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs recove
 4. Return the required structured result with changed files, checks, blockers, and warnings.
 
 `explore` returns no changed files and escalates architectural, security, concurrency, distributed-invariant, or contradictory-contract decisions. `implement-lite` escalates expanded or cross-cutting work to `implement`. Neither implementation profile self-approves. `review` returns `APPROVE` or `COMMENT` with completed status, or `REQUEST_CHANGES` with blocked status and at least one blocker.
+
+Once `turn/start` succeeds, `explore` gets 120 seconds to report `item/*` progress for the active thread. Each matching event restarts the clock. The 900-second timeout still caps the whole run, and the other profiles use only that total timeout.
 
 `playwright` keeps repository files unchanged, uses the configured Playwright MCP in an isolated temporary environment, and never calls `browser_run_code_unsafe`. Full interaction is limited to localhost and named dev/test targets. External state changes require explicit destination-specific authorization, and purchases, deletion, publishing, messaging, account/security changes, or production mutation are prohibited.
 

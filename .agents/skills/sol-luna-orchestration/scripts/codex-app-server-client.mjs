@@ -25,7 +25,79 @@ export class AppServerError extends Error {
 export class AppServerProtocolError extends AppServerError {}
 export class AppServerRoutingError extends AppServerError {}
 export class AppServerTimeoutError extends AppServerError {}
+export class AppServerIdleTimeoutError extends AppServerTimeoutError {}
 export class AppServerInterruptedError extends AppServerError {}
+
+export function createIdleWatchdog({
+  idleTimeoutMs,
+  onTimeout,
+  now = Date.now,
+  schedule = setTimeout,
+  cancel = clearTimeout,
+}) {
+  if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) {
+    throw new AppServerProtocolError("idleTimeoutMs must be a positive number.");
+  }
+  if (typeof onTimeout !== "function") {
+    throw new AppServerProtocolError("Idle watchdog requires an onTimeout callback.");
+  }
+  let timer = null;
+  let active = false;
+  let threadId = null;
+  let turnId = null;
+  let lastProgressMethod = null;
+  let lastProgressAt = null;
+
+  function stop() {
+    active = false;
+    if (timer !== null) {
+      cancel(timer);
+      timer = null;
+    }
+  }
+
+  function arm() {
+    if (timer !== null) {
+      cancel(timer);
+    }
+    timer = schedule(() => {
+      timer = null;
+      if (!active) {
+        return;
+      }
+      active = false;
+      onTimeout({
+        threadId,
+        turnId,
+        idleTimeoutMs,
+        idleDurationMs: now() - lastProgressAt,
+        lastProgressMethod,
+        lastProgressAt,
+      });
+    }, idleTimeoutMs);
+    timer?.unref?.();
+  }
+
+  return {
+    start(nextThreadId, nextTurnId) {
+      threadId = nextThreadId;
+      turnId = nextTurnId;
+      lastProgressMethod = "turn/start";
+      lastProgressAt = now();
+      active = true;
+      arm();
+    },
+    progress(method) {
+      if (!active) {
+        return;
+      }
+      lastProgressMethod = method;
+      lastProgressAt = now();
+      arm();
+    },
+    stop,
+  };
+}
 
 function appendLimited(current, addition) {
   const combined = `${current}${addition}`;
@@ -302,7 +374,7 @@ export function createServerRequestDecision(method, params) {
 class JsonRpcConnection {
   constructor(
     child,
-    { timeoutMs, signal },
+    { timeoutMs, idleTimeoutMs, signal },
   ) {
     this.child = child;
     this.signal = signal;
@@ -322,6 +394,19 @@ class JsonRpcConnection {
     this.failure.promise.catch(() => {});
     this.closing = false;
     this.closed = false;
+    this.idleWatchdog = idleTimeoutMs === null
+      ? null
+      : createIdleWatchdog({
+        idleTimeoutMs,
+        onTimeout: (details) => {
+          this.fail(
+            new AppServerIdleTimeoutError(
+              `The executor went ${idleTimeoutMs / 1_000} seconds without reporting progress for the active thread.`,
+              details,
+            ),
+          );
+        },
+      });
     this.lineReader = createInterface({ input: child.stdout, crlfDelay: Infinity });
     this.lineReader.on("line", (line) => this.handleLine(line));
     child.stderr.on("data", (chunk) => {
@@ -461,6 +546,7 @@ class JsonRpcConnection {
     const belongsToActiveThread =
       this.activeThreadId === null || entry.params?.threadId === this.activeThreadId;
     if (belongsToActiveThread && entry.method.startsWith("item/")) {
+      this.idleWatchdog?.progress(entry.method);
       const serialized = JSON.stringify(entry);
       if (/mcp__playwright__|"server"\s*:\s*"playwright"|"serverName"\s*:\s*"playwright"/i.test(serialized)) {
         this.playwrightMcpUsed = true;
@@ -481,6 +567,9 @@ class JsonRpcConnection {
         }
       }
     }
+    if (belongsToActiveThread && entry.method === "turn/completed") {
+      this.idleWatchdog?.stop();
+    }
     const waiterIndex = this.notificationWaiters.findIndex(
       (waiter) => waiter.method === entry.method && waiter.predicate(entry.params),
     );
@@ -497,6 +586,7 @@ class JsonRpcConnection {
 
   markBlocked(reason) {
     if (!this.blocked.settled) {
+      this.idleWatchdog?.stop();
       this.blocked.settled = true;
       this.blocked.resolve(reason);
     }
@@ -506,6 +596,7 @@ class JsonRpcConnection {
     if (this.closing || this.failure.settled) {
       return;
     }
+    this.idleWatchdog?.stop();
     this.failure.settled = true;
     this.failure.reject(error);
     for (const { deferred } of this.pending.values()) {
@@ -535,6 +626,7 @@ class JsonRpcConnection {
     }
     this.closing = true;
     clearTimeout(this.timeout);
+    this.idleWatchdog?.stop();
     this.signal?.removeEventListener("abort", this.abortListener);
     this.lineReader.close();
     if (this.closed) {
@@ -659,6 +751,7 @@ export async function runAppServerTurn({
   briefing,
   outputSchema,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  idleTimeoutMs = null,
   signal,
   platform = process.platform,
   architecture = process.arch,
@@ -669,6 +762,9 @@ export async function runAppServerTurn({
 }) {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new AppServerProtocolError("timeoutMs must be a positive number.");
+  }
+  if (idleTimeoutMs !== null && (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0)) {
+    throw new AppServerProtocolError("idleTimeoutMs must be null or a positive number.");
   }
   const expected = { model, reasoningEffort, serviceTier };
   const protocolTier = serviceTier === "fast" ? "priority" : null;
@@ -695,10 +791,12 @@ export async function runAppServerTurn({
   }
   const connection = new JsonRpcConnection(child, {
     timeoutMs,
+    idleTimeoutMs,
     signal,
   });
   let threadId = null;
   let turnId = null;
+  let effectiveRouting = null;
   try {
     if (typeof onProcessStarted === "function") {
       if (!Number.isInteger(child.pid) || child.pid < 1) {
@@ -738,7 +836,7 @@ export async function runAppServerTurn({
       serviceTier: protocolTier,
     });
     validateEmptySettingsResult(settingsResult);
-    const effectiveRouting = validateSettingsNotification(
+    effectiveRouting = validateSettingsNotification(
       await settingsNotification,
       threadId,
       expected,
@@ -756,6 +854,7 @@ export async function runAppServerTurn({
     if (typeof turnId !== "string") {
       throw new AppServerProtocolError("turn/start did not return a turn id.", { threadId });
     }
+    connection.idleWatchdog?.start(threadId, turnId);
     const completion = await Promise.race([
       terminalNotification.then((params) => ({ type: "terminal", params })),
       connection.blocked.promise.then((reason) => ({ type: "blocked", reason })),
@@ -788,11 +887,19 @@ export async function runAppServerTurn({
     if (error instanceof AppServerError) {
       error.threadId ??= threadId;
       error.stderr ??= connection.stderr;
+      error.settingsRoutingVerified ??= effectiveRouting !== null;
+      error.actualModel ??= effectiveRouting?.model ?? null;
+      error.actualReasoningEffort ??= effectiveRouting?.reasoningEffort ?? null;
+      error.actualServiceTier ??= effectiveRouting?.serviceTier ?? null;
       throw error;
     }
     throw new AppServerProtocolError(error.message, {
       threadId,
       stderr: connection.stderr,
+      settingsRoutingVerified: effectiveRouting !== null,
+      actualModel: effectiveRouting?.model ?? null,
+      actualReasoningEffort: effectiveRouting?.reasoningEffort ?? null,
+      actualServiceTier: effectiveRouting?.serviceTier ?? null,
     });
   } finally {
     await connection.close();
