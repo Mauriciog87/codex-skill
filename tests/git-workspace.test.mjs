@@ -159,7 +159,7 @@ test("legacy worktree assignments can be archived and cleaned through their exac
     assert.equal(abandoned.exitCode, 0, abandoned.stdout.toString() + abandoned.stderr.toString());
     record = await readAssignment(fixture.repository, record.assignment_id, fixture.options);
     assert.equal(record.state, "abandoned");
-    assert.ok(record.workspace.archive_path.startsWith(legacyWorktrees));
+    assert.equal(await realpath(dirname(record.workspace.archive_path)), await realpath(legacyWorktrees));
     const cleaned = await command("cleanup", record.state_revision);
     assert.equal(cleaned.exitCode, 0, cleaned.stdout.toString() + cleaned.stderr.toString());
     assert.equal((await readAssignment(fixture.repository, record.assignment_id, fixture.options)).workspace.cleaned, true);

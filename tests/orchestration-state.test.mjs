@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -81,7 +81,7 @@ async function addLinkedWorktree(fixture) {
   await runGit(["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "--allow-empty", "-m", "initial"], { cwd: fixture.repository });
   const linked = join(fixture.root, "linked");
   await runGit(["worktree", "add", "--detach", linked, "HEAD"], { cwd: fixture.repository });
-  return linked;
+  return realpath(linked);
 }
 
 test("linked writers exclude main takeover and inherit the same Ultra generation", async (context) => {
