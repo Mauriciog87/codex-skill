@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { runGit } from "../.agents/skills/sol-luna-orchestration/scripts/git-workspace.mjs";
 import {
   ControlPlaneError,
   assertEpochAssignmentsComplete,
@@ -22,6 +23,7 @@ import {
 } from "../.agents/skills/sol-luna-orchestration/scripts/control-plane.mjs";
 import {
   acquireUltraLock,
+  beginExecutorRun,
   getRepositoryState,
 } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
 import { reconcileReviewAssignment } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-control.mjs";
@@ -30,7 +32,8 @@ async function createFixture() {
   const root = await mkdtemp(join(tmpdir(), "sol-luna-control-plane-"));
   const repository = join(root, "repository");
   const home = join(root, "home");
-  await mkdir(join(repository, ".git"), { recursive: true });
+  await mkdir(repository, { recursive: true });
+  await runGit(["init"], { cwd: repository });
   await mkdir(home, { recursive: true });
   return {
     root,
@@ -103,6 +106,103 @@ test("path contracts normalize separators and compare concrete roots", () => {
   assert.equal(pathWithinRoots("src/generated/file.js", ["src"], ["src/generated"]), false);
   for (const invalid of ["../secret", "/absolute", "C:/absolute"] ) {
     assert.throws(() => normalizeRepositoryPath(invalid), ControlPlaneError);
+  }
+});
+
+test("invalid integration is rejected before its effect or journal preparation", async () => {
+  const fixture = await createFixture();
+  try {
+    const record = await createAssignment({ cwd: fixture.repository, request: request(), briefing: "No approval.", ...fixture.options });
+    const state = await getRepositoryState(fixture.repository, fixture.options);
+    const events = join(state.assignmentsDirectory, record.assignment_id, "events");
+    const before = await readdir(events);
+    let effects = 0;
+    await assert.rejects(dispatchAssignmentAction(fixture.repository, createAction({
+      op: "integrate_candidate", authority: "root", record, payload: { candidate_id: "b".repeat(64) },
+    }), { ...fixture.options, beforeTransition: async () => { effects += 1; } }), /cannot run|state|candidate/i);
+    assert.equal(effects, 0);
+    assert.deepEqual(await readdir(events), before);
+    assert.deepEqual(await readAssignment(fixture.repository, record.assignment_id, fixture.options), record);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("transition recovery replays effects only when durable evidence is still pending", async () => {
+  for (const boundary of ["prepared", "effect", "record", "applied"]) {
+    const fixture = await createFixture();
+    try {
+      let record = await createAssignment({ cwd: fixture.repository, request: request(), briefing: "Recover integration.", ...fixture.options });
+      record = await transition(fixture, record, "start_assignment", "root", { workspace: { path: join(fixture.root, "worktree") } });
+      record = await transition(fixture, record, "publish_result", "executor", { result: result(), candidate: candidate(record), operator_requests: [] });
+      record = await transition(fixture, record, "claim_result", "root");
+      record = await transition(fixture, record, "approve_candidate", "root", { candidate_id: record.candidate.candidate_id, kind: "root" });
+      const action = createAction({ op: "integrate_candidate", authority: "root", record, payload: { candidate_id: record.candidate.candidate_id } });
+      let writes = 0;
+      let applied = false;
+      const effect = async () => {
+        if (!applied) { applied = true; writes += 1; }
+        return { target_revision_before: record.base_revision, applied_diff_sha256: record.candidate.diff_sha256 };
+      };
+      await assert.rejects(dispatchAssignmentAction(fixture.repository, action, {
+        ...fixture.options, beforeTransition: effect,
+        onTransitionBoundary: (stage) => { if (stage === boundary) throw new Error(`crash-${stage}`); },
+      }), new RegExp(`crash-${boundary}`));
+      if (boundary === "record") {
+        const state = await getRepositoryState(fixture.repository, fixture.options);
+        const eventPath = join(state.assignmentsDirectory, record.assignment_id, "events", `${action.action_id}.json`);
+        const before = await readFile(eventPath, "utf8");
+        const current = await readAssignment(fixture.repository, record.assignment_id, fixture.options);
+        await assert.rejects(dispatchAssignmentAction(fixture.repository, createAction({ op: "cleanup_workspace", authority: "root", record: current }), fixture.options));
+        assert.equal(await readFile(eventPath, "utf8"), before);
+      }
+      const replay = await dispatchAssignmentAction(fixture.repository, action, { ...fixture.options, beforeTransition: effect });
+      assert.equal(replay.record.state, "integrated");
+      assert.equal(writes, 1);
+      await assert.rejects(dispatchAssignmentAction(fixture.repository, { ...action, payload: { candidate_id: "c".repeat(64) } }, fixture.options), (error) => error.code === "action-id-reuse");
+      const state = await getRepositoryState(fixture.repository, fixture.options);
+      const event = JSON.parse(await readFile(join(state.assignmentsDirectory, record.assignment_id, "events", `${action.action_id}.json`), "utf8"));
+      assert.equal(event.status, "applied");
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a takeover blocks mutations of assignments created before its epoch", async () => {
+  const fixture = await createFixture();
+  try {
+    const record = await createAssignment({ cwd: fixture.repository, request: request(), briefing: "Predates takeover.", ...fixture.options });
+    await acquireUltraLock({ cwd: fixture.repository, reason: "Exclusive decision", sandboxMode: "read-only", ...fixture.options });
+    await assert.rejects(transition(fixture, record, "start_assignment", "root"), (error) => error.code === "repository-locked");
+    assert.equal((await readAssignment(fixture.repository, record.assignment_id, fixture.options)).state, "queued");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("workspace removal fails before effects while an associated executor is live or unknown", async () => {
+  const fixture = await createFixture();
+  try {
+    let record = await createAssignment({ cwd: fixture.repository, request: request(), briefing: "Wait for executor shutdown.", ...fixture.options });
+    record = await transition(fixture, record, "start_assignment", "root", { workspace: { path: join(fixture.root, "worktree") } });
+    await beginExecutorRun({ cwd: fixture.repository, profile: "implement", model: "gpt-5.6-sol", ...fixture.options, environment: { ...fixture.options.environment, CODEX_ORCHESTRATION_ASSIGNMENT_ID: record.assignment_id } });
+    record = await transition(fixture, record, "mark_recovery_required", "root", { reason: "Interrupted run" });
+    const state = await getRepositoryState(fixture.repository, fixture.options);
+    const runPath = join(state.runsDirectory, (await readdir(state.runsDirectory))[0]);
+    const run = JSON.parse(await readFile(runPath, "utf8"));
+    for (const runState of ["active", "completed", "abandoned"]) {
+      await writeFile(runPath, JSON.stringify({ ...run, state: runState }));
+      for (const status of ["same", "unknown"]) {
+        let calls = 0;
+        await assert.rejects(dispatchAssignmentAction(fixture.repository, createAction({ op: "archive_workspace", authority: "root", record }), {
+          ...fixture.options, processInspector: async () => ({ status }), beforeTransition: async () => { calls += 1; return { archive_path: "archive" }; },
+        }), /live or unknown executor/);
+        assert.equal(calls, 0);
+      }
+    }
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
   }
 });
 

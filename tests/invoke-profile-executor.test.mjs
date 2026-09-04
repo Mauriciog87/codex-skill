@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp as createTemporaryDirectory, mkdir, rm, writeFile } from "node:fs/promises";
+import { runGit } from "../.agents/skills/sol-luna-orchestration/scripts/git-workspace.mjs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -37,6 +38,12 @@ import {
 import { loadExecutorResultContract } from "../.agents/skills/sol-luna-orchestration/scripts/executor-result-contract.mjs";
 
 const OUTPUT_CONTRACT = await loadExecutorResultContract();
+
+async function mkdtemp(prefix) {
+  const directory = await createTemporaryDirectory(prefix);
+  await runGit(["init"], { cwd: directory });
+  return directory;
+}
 
 function assertPlaywrightRuntimeOverrides(overrides) {
   assert.equal(overrides.length, 4);

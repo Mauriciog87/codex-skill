@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { runGit } from "../.agents/skills/sol-luna-orchestration/scripts/git-workspace.mjs";
+import { evaluateHook } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs";
 import {
   ORCHESTRATION_LOCK_ENV,
   ORCHESTRATION_GENERATION_ENV,
@@ -30,7 +32,8 @@ async function createFixture(context, prefix = "sol-ultra-state-") {
   context.after(() => rm(root, { recursive: true, force: true }));
   const homeDirectory = join(root, "home");
   const repository = join(root, "repository");
-  await mkdir(join(repository, ".git"), { recursive: true });
+  await mkdir(repository, { recursive: true });
+  await runGit(["init"], { cwd: repository });
   return { root, homeDirectory, repository };
 }
 
@@ -74,10 +77,62 @@ function testProcessIdentity(pid, fingerprint = `start-${pid}`) {
   };
 }
 
+async function addLinkedWorktree(fixture) {
+  await runGit(["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "--allow-empty", "-m", "initial"], { cwd: fixture.repository });
+  const linked = join(fixture.root, "linked");
+  await runGit(["worktree", "add", "--detach", linked, "HEAD"], { cwd: fixture.repository });
+  return linked;
+}
+
+test("linked writers exclude main takeover and inherit the same Ultra generation", async (context) => {
+  const fixture = await createFixture(context, "common-repository-lock-");
+  const linked = await addLinkedWorktree(fixture);
+  const lease = await beginExecutorRun({ cwd: linked, profile: "implement", model: "gpt-5.6-sol", homeDirectory: fixture.homeDirectory });
+  await assert.rejects(acquireUltraLock({ cwd: fixture.repository, reason: "Must wait", sandboxMode: "read-only", homeDirectory: fixture.homeDirectory }), /executor run.*active/);
+  await finishExecutorRun(lease, completedExecution("implement", "high"));
+  const lock = await acquireUltraLock({ cwd: fixture.repository, reason: "Exclusive", sandboxMode: "read-only", homeDirectory: fixture.homeDirectory });
+  const hook = { hook_event_name: "PreToolUse", cwd: linked, tool_name: "apply_patch" };
+  const environment = { CODEX_HOME: join(fixture.homeDirectory, ".codex") };
+  const blockedHook = await evaluateHook(hook, { environment });
+  assert.equal(blockedHook.hookSpecificOutput.permissionDecision, "deny");
+  assert.equal(await evaluateHook(hook, { environment: { ...environment, ...epochEnvironment(lock) } }), null);
+  const ownedLease = await beginExecutorRun({ cwd: linked, profile: "implement", model: "gpt-5.6-sol", homeDirectory: fixture.homeDirectory, environment: epochEnvironment(lock) });
+  assert.equal(ownedLease.repository_key, lock.repository_key);
+  assert.equal(ownedLease.generation, lock.generation);
+  await finishExecutorRun(ownedLease, completedExecution("implement", "high"));
+  await releaseUltraLock({ cwd: linked, lockId: lock.lock_id, generation: lock.generation, homeDirectory: fixture.homeDirectory });
+});
+
+test("legacy worktree locks remain recoverable and retain their generation after worktree removal", async (context) => {
+  const fixture = await createFixture(context, "legacy-linked-lock-");
+  const linked = await addLinkedWorktree(fixture);
+  const options = { homeDirectory: fixture.homeDirectory };
+  const lock = await acquireUltraLock({ cwd: fixture.repository, reason: "Old worktree domain", sandboxMode: "read-only", ...options });
+  const canonical = await getRepositoryState(fixture.repository, options);
+  const legacyKey = getRepositoryKey(linked);
+  const legacyDirectory = join(dirname(canonical.stateDirectory), legacyKey);
+  await rename(canonical.stateDirectory, legacyDirectory);
+  const metadataPath = join(legacyDirectory, "repository-state.json");
+  const metadata = JSON.parse(await readFile(metadataPath, "utf8"));
+  await writeFile(metadataPath, JSON.stringify({ ...metadata, repository: linked, repository_key: legacyKey, current_generation: 7, related_repositories: [] }));
+  await writeFile(join(legacyDirectory, "ultra.lock", "lock.json"), JSON.stringify({ ...lock, repository: linked, repository_key: legacyKey, generation: 7 }));
+  const status = await getOrchestrationStatus(fixture.repository, options);
+  assert.equal(status.legacy_namespaces[0].lock_id, lock.lock_id);
+  assert.equal(status.legacy_namespaces[0].blocked, true);
+  await assert.rejects(beginExecutorRun({ cwd: fixture.repository, profile: "review", model: "gpt-5.6-sol", ...options }), /pending legacy state/);
+  await assert.rejects(recoverUltraLock({ cwd: fixture.repository, lockId: lock.lock_id, ...options, processInspector: async () => ({ status: "unknown" }) }), /unknown/);
+  await recoverUltraLock({ cwd: fixture.repository, lockId: lock.lock_id, ...options, processInspector: async () => ({ status: "dead" }) });
+  await runGit(["worktree", "remove", linked], { cwd: fixture.repository });
+  const next = await acquireUltraLock({ cwd: fixture.repository, reason: "New common epoch", sandboxMode: "read-only", ...options });
+  assert.equal(next.generation, 8);
+  assert.equal(JSON.parse(await readFile(metadataPath, "utf8")).current_generation, 7);
+});
+
 test("Ultra lock acquisition is exclusive and repository scoped", async (context) => {
   const fixture = await createFixture(context);
   const otherRepository = join(fixture.root, "other-repository");
-  await mkdir(join(otherRepository, ".git"), { recursive: true });
+  await mkdir(otherRepository, { recursive: true });
+  await runGit(["init"], { cwd: otherRepository });
   const first = await acquireUltraLock({
     cwd: fixture.repository,
     reason: "First repository",
@@ -835,9 +890,10 @@ test("legacy v1 locks block v2 acquisition and require explicit recovery confirm
     }),
     /invalid JSON/,
   );
-  assert.equal((await readUltraLock(fixture.repository, {
+  await assert.rejects(readUltraLock(fixture.repository, {
     homeDirectory: fixture.homeDirectory,
-  })).lock_id, "legacy-lock");
+  }), /invalid JSON/);
+  assert.equal(JSON.parse(await readFile(state.lockPath, "utf8")).lock_id, "legacy-lock");
   await rm(state.metadataPath, { force: false });
   await recoverUltraLock({
     cwd: fixture.repository,
@@ -950,7 +1006,8 @@ test("Luna and Sol capacity acquisition is atomic and releases in finally paths"
 test("machine capacity spans repositories and Playwright is capped at two", async (context) => {
   const fixture = await createFixture(context, "sol-luna-global-capacity-");
   const otherRepository = join(fixture.root, "other-repository");
-  await mkdir(join(otherRepository, ".git"), { recursive: true });
+  await mkdir(otherRepository, { recursive: true });
+  await runGit(["init"], { cwd: otherRepository });
   const playwrightLeases = [
     await beginExecutorRun({
       cwd: fixture.repository,

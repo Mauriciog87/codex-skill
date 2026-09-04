@@ -22,6 +22,7 @@ import {
   abandonExecutorRun,
   beginExecutorRun,
   finishExecutorRun,
+  getRepositoryState,
   registerExecutorProcess,
 } from "./orchestration-state.mjs";
 import {
@@ -1278,12 +1279,18 @@ export async function invokeExecutor(input) {
   }
   let lease;
   try {
+    if (input.options.coordinationCwd !== undefined) {
+      const stateOptions = { ...(input.coordinationOptions ?? {}), environment };
+      const executionState = await getRepositoryState(input.options.cwd, stateOptions);
+      const coordinationState = await getRepositoryState(input.options.coordinationCwd, stateOptions);
+      if (executionState.key !== coordinationState.key) throw new ExecutorConfigurationError("Executor workspace belongs to another repository.");
+    }
     lease = await beginExecutorRun({
       cwd: input.options.cwd,
       profile: profile.name,
       model: profile.model,
-      environment,
       ...(input.coordinationOptions ?? {}),
+      environment,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

@@ -412,6 +412,7 @@ export async function invokeDurableExecutor({
       options: {
         profile: record.profile,
         cwd: workspace.path,
+        coordinationCwd: record.repository,
         sandboxMode: profile.sandboxMode,
         timeoutSeconds: options.timeoutSeconds,
       },

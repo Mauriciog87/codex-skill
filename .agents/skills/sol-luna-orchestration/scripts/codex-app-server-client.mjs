@@ -648,6 +648,32 @@ class JsonRpcConnection {
   }
 }
 
+export async function readCodexConfig({
+  cwd,
+  environment = process.env,
+  command = "codex",
+  timeoutMs = 15_000,
+  commandResolver = resolveCodexInvocation,
+  spawnImplementation = spawnChildProcess,
+} = {}) {
+  const invocation = await commandResolver(command, { platform: process.platform, architecture: process.arch, environment });
+  const child = spawnImplementation(invocation.executable, ["--strict-config", "app-server", "--listen", "stdio://"], {
+    cwd, env: invocation.environment, windowsHide: true, shell: false, stdio: ["pipe", "pipe", "pipe"],
+  });
+  const connection = new JsonRpcConnection(child, { timeoutMs, idleTimeoutMs: null });
+  try {
+    await connection.request("initialize", { clientInfo: { name: "sol-luna-config-validation", version: "1.0.0" }, capabilities: { experimentalApi: true } });
+    connection.notify("initialized", {});
+    const result = await connection.request("config/read", { includeLayers: false });
+    if (connection.blocked.settled || !result?.config || typeof result.config !== "object" || Array.isArray(result.config)) {
+      throw new AppServerProtocolError("config/read did not return an effective configuration.");
+    }
+    return result.config;
+  } finally {
+    await connection.close();
+  }
+}
+
 function validateModelCapability(modelListResult, expected) {
   const model = findModel(modelListResult, expected.model);
   if (model === undefined) {

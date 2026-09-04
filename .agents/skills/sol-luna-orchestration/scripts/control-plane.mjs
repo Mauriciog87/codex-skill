@@ -6,10 +6,16 @@ import {
   OrchestrationStateError,
   atomicCreate,
   atomicWrite,
+  assertRepositoryQuiescent,
+  assertNoLegacyRepositoryWork,
+  ensureRepositoryMetadata,
+  getLegacyRepositoryStates,
   getEntry,
   getRepositoryState,
   readJson,
+  readLockFromState,
   readUltraLock,
+  resolveAssignmentState,
   withStateMutex,
 } from "./orchestration-state.mjs";
 
@@ -448,7 +454,7 @@ function validateRecord(record, assignmentId) {
 
 export async function readAssignment(cwd, assignmentId, options = {}) {
   const id = validateAssignmentId(assignmentId);
-  const state = await getRepositoryState(cwd, options);
+  const state = await resolveAssignmentState(cwd, id, options);
   const paths = assignmentPaths(state, id);
   if ((await getEntry(paths.record)) === null) {
     throw new ControlPlaneError(`Assignment not found: ${id}`, "assignment-not-found");
@@ -458,23 +464,22 @@ export async function readAssignment(cwd, assignmentId, options = {}) {
 
 export async function readAssignmentBriefing(cwd, assignmentId, options = {}) {
   const id = validateAssignmentId(assignmentId);
-  const state = await getRepositoryState(cwd, options);
+  const state = await resolveAssignmentState(cwd, id, options);
   const payload = await readJson(assignmentPaths(state, id).payload, `Assignment ${id} payload`);
   return requireString(payload.briefing, "Assignment briefing");
 }
 
 export async function listAssignments(cwd, options = {}) {
   const state = await getRepositoryState(cwd, options);
-  if ((await getEntry(state.assignmentsDirectory)) === null) {
-    return [];
-  }
-  const entries = await readdir(state.assignmentsDirectory, { withFileTypes: true });
   const records = [];
-  for (const entry of entries.filter((item) => item.isDirectory()).sort((a, b) => a.name.localeCompare(b.name))) {
-    if (!UUID_PATTERN.test(entry.name)) {
-      continue;
+  for (const namespace of [state, ...(await getLegacyRepositoryStates(state)).map((entry) => entry.state)]) {
+    if ((await getEntry(namespace.assignmentsDirectory)) === null) continue;
+    const entries = await readdir(namespace.assignmentsDirectory, { withFileTypes: true });
+    for (const entry of entries.filter((item) => item.isDirectory()).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (!UUID_PATTERN.test(entry.name)) continue;
+      if (records.some((record) => record.assignment_id === entry.name)) throw new ControlPlaneError("Ambiguous assignment namespace.", "invalid-state");
+      records.push(validateRecord(await readJson(assignmentPaths(namespace, entry.name).record, "Assignment"), entry.name));
     }
-    records.push(await readAssignment(state.repository, entry.name, options));
   }
   return records;
 }
@@ -590,6 +595,7 @@ export async function createAssignment({
     updated_at: timestamp,
   };
   return withStateMutex(state, async () => {
+    await assertNoLegacyRepositoryWork(state);
     const lock = await readUltraLock(state.repository, { environment, homeDirectory, platform });
     if (lockId === null && lock !== null) {
       throw new ControlPlaneError("Repository has an active or recovery-required Ultra takeover.", "repository-locked");
@@ -696,8 +702,60 @@ function validateAction(record, action) {
   };
 }
 
-export function reduceAssignment(record, inputAction, timestamp = new Date().toISOString()) {
+const EFFECT_OPERATIONS = new Set(["integrate_candidate", "record_commit", "record_push", "archive_workspace", "cleanup_workspace"]);
+
+export function validateEffectRequest(record, inputAction) {
   const action = validateAction(record, inputAction);
+  const payload = action.payload;
+  if (new Set(["integrate_candidate", "record_commit", "record_push"]).has(action.op)) {
+    requireState(record, [{ integrate_candidate: "integration_pending", record_commit: "commit_pending", record_push: "push_pending" }[action.op]], action.op);
+    requireCandidate(record, payload.candidate_id);
+    if (record.approval?.candidate_id !== record.candidate.candidate_id || !record.approval.root_approved ||
+        (record.operator_approval_required && !record.approval.operator_approved) ||
+        (record.review_policy === "independent" && (record.review?.reviewed_candidate_id !== record.candidate.candidate_id || !["APPROVE", "COMMENT"].includes(record.review.verdict)))) {
+      throw new ControlPlaneError("Candidate approval or review is missing or stale.", "invalid-transition");
+    }
+    if (action.op !== "integrate_candidate" && (record.integration?.candidate_id !== record.candidate.candidate_id || !["commit", "push"].includes(record.delivery.mode))) {
+      throw new ControlPlaneError("Delivery requires the approved integration.", "invalid-transition");
+    }
+    if (action.op === "record_push" && (record.delivery.mode !== "push" || record.delivery.commit?.candidate_id !== record.candidate.candidate_id)) {
+      throw new ControlPlaneError("Push requires the exact recorded candidate commit.", "invalid-transition");
+    }
+    if (action.op === "integrate_candidate") {
+      if (payload.target_revision_before !== undefined) requireGitRevision(payload.target_revision_before, "target_revision_before");
+      if (payload.applied_diff_sha256 !== undefined && payload.applied_diff_sha256 !== record.candidate.diff_sha256) throw new ControlPlaneError("Integration evidence does not match the candidate diff.", "stale-candidate");
+    }
+    if (action.op === "record_commit" && payload.publication_ref !== undefined && payload.publication_ref !== `refs/codex-orchestration/deliveries/${record.assignment_id}/${record.attempt}`) {
+      throw new ControlPlaneError("Commit publication ref does not match the assignment.", "invalid-action");
+    }
+    if (action.op === "record_push") {
+      const expected = { commit_revision: record.delivery.commit.commit_revision, remote: record.delivery.remote, branch: record.delivery.branch, remote_ref: `refs/heads/${record.delivery.branch}` };
+      for (const [key, value] of Object.entries(expected)) {
+        if (payload[key] !== undefined && payload[key] !== value) throw new ControlPlaneError("Push request contradicts the recorded delivery.", "invalid-action");
+      }
+    }
+  } else if (action.op === "archive_workspace" || action.op === "cleanup_workspace") {
+    if (action.op === "cleanup_workspace") requireState(record, ["acknowledged", "abandoned"], action.op);
+    if (record.workspace === null || record.workspace.shared === true || !record.workspace.path || ["queued", "running"].includes(record.state)) {
+      throw new ControlPlaneError("Workspace cannot be removed or archived in this state.", "invalid-transition");
+    }
+  } else if (action.op === "retry_assignment") {
+    requireState(record, [...RETRYABLE_STATES], action.op);
+    if (record.operator_requests.some((request) => request.state !== "acknowledged")) {
+      throw new ControlPlaneError("Every operator request must be acknowledged before retry.", "invalid-transition");
+    }
+    if (payload.base_revision !== undefined) requireGitRevision(payload.base_revision, "base_revision");
+  } else if (action.op === "abandon_assignment") {
+    if (TERMINAL_STATES.has(record.state) || record.state === "running") {
+      throw new ControlPlaneError(`Cannot abandon assignment in ${record.state}.`, "invalid-transition");
+    }
+    requireString(payload.reason, "reason");
+  }
+  return action;
+}
+
+export function reduceAssignment(record, inputAction, timestamp = new Date().toISOString()) {
+  const action = validateEffectRequest(record, inputAction);
   const actionDigest = sha256(canonicalJson(action));
   const next = structuredClone(record);
   const payload = action.payload;
@@ -841,7 +899,7 @@ export function reduceAssignment(record, inputAction, timestamp = new Date().toI
     if (kind === "operator" && !record.operator_approval_required) {
       throw new ControlPlaneError("Assignment does not require operator approval.", "invalid-transition");
     }
-    const approval = record.approval ?? {
+    const approval = next.approval ?? {
       candidate_id: record.candidate.candidate_id,
       root_approved: false,
       operator_approved: false,
@@ -1076,13 +1134,55 @@ function redactedActionEvent(
   };
 }
 
+function validateActionEvent(event, actionId, assignmentId) {
+  if (event?.schema_version !== CONTROL_PLANE_VERSION || event.action_id !== actionId || event.assignment_id !== assignmentId ||
+      !["prepared", "applied"].includes(event.status) || !Number.isInteger(event.before_revision) || event.before_revision < 0 ||
+      event.after_revision !== event.before_revision + 1 || !/^[a-f0-9]{64}$/.test(event.action_sha256 ?? "") ||
+      !/^[a-f0-9]{64}$/.test(event.request_sha256 ?? event.action_sha256 ?? "")) {
+    throw new ControlPlaneError("Assignment action journal is malformed.", "invalid-state");
+  }
+  return event;
+}
+
+async function assertAssignmentEpoch(state, record, operation, options) {
+  const recoveryAction = ["abandon_assignment", "archive_workspace", "cleanup_workspace"].includes(operation);
+  if (!state.canonicalState || !recoveryAction) await assertNoLegacyRepositoryWork(state);
+  const canonicalLock = await readLockFromState(state.canonicalState ?? state);
+  if (state.canonicalState && canonicalLock !== null) throw new ControlPlaneError("Canonical repository is locked during legacy recovery.", "repository-locked");
+  const lock = await readLockFromState(state);
+  if (record.lock_id === null && lock !== null) {
+    throw new ControlPlaneError("Repository has an active or recovery-required Ultra takeover.", "repository-locked");
+  }
+  if ((record.lock_id !== null || record.generation !== null) && !(recoveryAction && lock === null)) {
+    if (
+      lock === null ||
+      lock.version !== 2 ||
+      lock.lock_id !== record.lock_id ||
+      lock.generation !== record.generation
+    ) {
+      throw new ControlPlaneError("Assignment action belongs to a stale Ultra epoch.", "stale-epoch");
+    }
+    if (
+      lock.state === "recovery-required" &&
+      !new Set(["abandon_assignment", "archive_workspace", "cleanup_workspace"]).has(operation)
+    ) {
+      throw new ControlPlaneError("Ultra epoch requires recovery before this action.", "recovery-required");
+    }
+  }
+}
+
 export async function dispatchAssignmentAction(cwd, inputAction, options = {}) {
   const assignmentId = validateAssignmentId(inputAction.assignment_id);
-  const state = await getRepositoryState(cwd, options);
+  const state = await resolveAssignmentState(cwd, assignmentId, options);
   const paths = assignmentPaths(state, assignmentId);
   const timestamp = (options.now ?? (() => new Date()))().toISOString();
   return withStateMutex(state, async () => {
     const record = validateRecord(await readJson(paths.record, `Assignment ${assignmentId}`), assignmentId);
+    if (record.repository_key !== state.key || resolve(record.repository) !== resolve(state.repository)) {
+      throw new ControlPlaneError("Assignment repository identity does not match its namespace.", "repository-mismatch");
+    }
+    validateAction({ ...record, state_revision: inputAction.expected_state_revision }, inputAction);
+    await assertAssignmentEpoch(state, record, inputAction.op, options);
     const normalizedRequest = validateAction(
       { ...record, state_revision: inputAction.expected_state_revision },
       inputAction,
@@ -1090,12 +1190,12 @@ export async function dispatchAssignmentAction(cwd, inputAction, options = {}) {
     const requestDigest = sha256(canonicalJson(normalizedRequest));
     const eventPath = join(paths.events, `${normalizedRequest.action_id}.json`);
     if ((await getEntry(eventPath)) !== null) {
-      const event = await readJson(eventPath, `Assignment action ${normalizedRequest.action_id}`);
+      const event = validateActionEvent(await readJson(eventPath, `Assignment action ${normalizedRequest.action_id}`), normalizedRequest.action_id, assignmentId);
       if ((event.request_sha256 ?? event.action_sha256) !== requestDigest) {
         throw new ControlPlaneError("action_id was reused with different content.", "action-id-reuse");
       }
       const current = validateRecord(await readJson(paths.record, `Assignment ${assignmentId}`), assignmentId);
-      if (event.status === "applied" || current.last_action_id === normalizedRequest.action_id) {
+      if (event.status === "applied" || (current.last_action_id === normalizedRequest.action_id && current.last_action_sha256 === event.action_sha256 && current.state_revision === event.after_revision)) {
         if (event.status !== "applied") {
           await atomicWrite(
             eventPath,
@@ -1113,28 +1213,28 @@ export async function dispatchAssignmentAction(cwd, inputAction, options = {}) {
         return { record: current, idempotent: true };
       }
     }
-    const requestedAction = validateAction(record, inputAction);
-    if (record.lock_id !== null || record.generation !== null) {
-      const lock = await readUltraLock(state.repository, options);
-      if (
-        lock === null ||
-        lock.version !== 2 ||
-        lock.lock_id !== record.lock_id ||
-        lock.generation !== record.generation
-      ) {
-        throw new ControlPlaneError("Assignment action belongs to a stale Ultra epoch.", "stale-epoch");
-      }
-      if (
-        lock.state === "recovery-required" &&
-        !new Set(["abandon_assignment", "archive_workspace", "cleanup_workspace"]).has(requestedAction.op)
-      ) {
-        throw new ControlPlaneError("Ultra epoch requires recovery before this action.", "recovery-required");
-      }
+    const requestedAction = validateEffectRequest(record, inputAction);
+    if (["archive_workspace", "cleanup_workspace", "abandon_assignment", "retry_assignment"].includes(requestedAction.op)) {
+      await assertRepositoryQuiescent(state, record.assignment_id, options);
     }
+    if (options.beforeTransition !== undefined && (typeof options.beforeTransition !== "function" || !EFFECT_OPERATIONS.has(requestedAction.op))) {
+      throw new ControlPlaneError("This action cannot execute a transition effect.", "invalid-action");
+    }
+    if (!options.beforeTransition) reduceAssignment(record, requestedAction, timestamp);
     if (requestedAction.op === "start_assignment") {
       const records = await listAssignments(state.repository, options);
       if (hasActiveOverlap(record, records, options.platform ?? process.platform)) {
         throw new ControlPlaneError("Assignment write roots overlap an active resource lease.", "resource-capacity");
+      }
+    }
+    if (record.last_action_id !== null) {
+      const lastPath = join(paths.events, `${record.last_action_id}.json`);
+      const last = validateActionEvent(await readJson(lastPath, "Last assignment action"), record.last_action_id, assignmentId);
+      if (last.status === "prepared") {
+        if (last.action_sha256 !== record.last_action_sha256 || last.after_revision !== record.state_revision) {
+          throw new ControlPlaneError("Pending action cannot be reconciled with its record.", "ambiguous-action");
+        }
+        await atomicWrite(lastPath, { ...last, status: "applied" });
       }
     }
     let action = requestedAction;
@@ -1151,6 +1251,13 @@ export async function dispatchAssignmentAction(cwd, inputAction, options = {}) {
     if ((await getEntry(eventPath)) === null) {
       await atomicCreate(eventPath, prepared);
     }
+    await options.onTransitionBoundary?.("prepared", record);
+    if (state.canonicalState) {
+      await ensureRepositoryMetadata({
+        ...state.canonicalState,
+        relatedRepositories: [...state.canonicalState.relatedRepositories, state.repository],
+      });
+    }
     if (typeof options.beforeTransition === "function") {
       const effectPayload = await options.beforeTransition(record, requestedAction);
       action = {
@@ -1159,6 +1266,7 @@ export async function dispatchAssignmentAction(cwd, inputAction, options = {}) {
       };
       actionDigest = sha256(canonicalJson(action));
     }
+    await options.onTransitionBoundary?.("effect", record);
     const next = reduceAssignment(record, action, timestamp);
     prepared = redactedActionEvent(
       action,
@@ -1171,7 +1279,9 @@ export async function dispatchAssignmentAction(cwd, inputAction, options = {}) {
     );
     await atomicWrite(eventPath, prepared);
     await atomicWrite(paths.record, next);
+    await options.onTransitionBoundary?.("record", next);
     await atomicWrite(eventPath, { ...prepared, status: "applied" });
+    await options.onTransitionBoundary?.("applied", next);
     return { record: next, idempotent: false };
   });
 }
@@ -1374,13 +1484,15 @@ function publicAssignment(record) {
 export async function getControlPlaneStatus(cwd, options = {}) {
   const state = await getRepositoryState(cwd, options);
   const records = await listAssignments(state.repository, options);
+  const planner = planResidualActions(records, options.platform ?? process.platform);
+  if ((await getLegacyRepositoryStates(state)).some((entry) => entry.blocked)) planner.mechanical = [];
   return {
     schema_version: CONTROL_PLANE_VERSION,
     status: "completed",
     repository: state.repository,
     repository_key: state.key,
     assignments: sortAssignments(records).map(publicAssignment),
-    planner: planResidualActions(records, options.platform ?? process.platform),
+    planner,
   };
 }
 

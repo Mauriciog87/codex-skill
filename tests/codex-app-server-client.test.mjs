@@ -16,6 +16,7 @@ import {
   isCompatibleCodexVersion,
   normalizeAppServerServiceTier,
   runAppServerTurn,
+  readCodexConfig,
 } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
 import { loadExecutorResultContract } from "../.agents/skills/sol-luna-orchestration/scripts/executor-result-contract.mjs";
 
@@ -113,6 +114,37 @@ test("App Server arguments pin local orchestration safeguards without exec fallb
   assert.deepEqual(args.slice(-3), ["app-server", "--listen", "stdio://"]);
   assert.equal(args.includes("exec"), false);
   assert.equal(args.includes("--json"), false);
+});
+
+test("config preflight uses only initialize and config/read without model overrides", async (context) => {
+  const temporary = await mkdtemp(join(tmpdir(), "config-rpc-test-"));
+  context.after(() => rm(temporary, { recursive: true, force: true }));
+  const capturePath = join(temporary, "rpc.jsonl");
+  const config = { model: "gpt-5.6-sol", agents: { max_threads: 4 } };
+  const result = await readCodexConfig({
+    cwd: temporary,
+    commandResolver: async (_, { environment }) => ({ executable: "logical-codex", environment }),
+    spawnImplementation: (command, args, options) => {
+      assert.equal(command, "logical-codex");
+      assert.deepEqual(args, ["--strict-config", "app-server", "--listen", "stdio://"]);
+      assert.equal(options.shell, false);
+      return spawnMock({ config }, capturePath)(command, args, options);
+    },
+  });
+  assert.deepEqual(result, config);
+  const messages = (await readFile(capturePath, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.deepEqual(messages.map((entry) => entry.method), ["initialize", "initialized", "config/read"]);
+  assert.deepEqual(messages.at(-1).params, { includeLayers: false });
+});
+
+test("config preflight fails closed on invalid JSON, RPC errors, early exit and timeout", async () => {
+  for (const scenario of [{ invalidJsonAfter: "config/read" }, { rpcErrorAt: "config/read" }, { exitAfter: "config/read" }, { hangAfter: "config/read", ignoreSigterm: true }]) {
+    await assert.rejects(readCodexConfig({
+      cwd: TEST_DIRECTORY, timeoutMs: 1000,
+      commandResolver: async (_, { environment }) => ({ executable: "codex", environment }),
+      spawnImplementation: spawnMock(scenario),
+    }), (error) => error instanceof AppServerProtocolError || error instanceof AppServerTimeoutError);
+  }
 });
 
 test("idle watchdog resets its deadline and cleans up its timer", () => {

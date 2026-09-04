@@ -4,6 +4,7 @@ import {
   copyFile,
   lstat,
   mkdir,
+  mkdtemp,
   readFile,
   readlink,
   realpath,
@@ -13,7 +14,9 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { setTomlValues, tomlStatements } from "./toml-config.mjs";
+import { readCodexConfig } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -186,128 +189,20 @@ function renderText({ bom, lines, newline, trailingNewline }) {
   return `${bom}${body}${trailingNewline && body.length > 0 ? newline : ""}`;
 }
 
-function isTableHeader(line) {
-  return /^\s*\[\[?[^\]]+\]\]?\s*(?:#.*)?$/.test(line);
-}
-
-function keyMatcher(key) {
-  return new RegExp(`^\\s*${key}\\s*=`);
-}
-
 function setTopLevelValues(lines, values) {
-  const firstTable = lines.findIndex(isTableHeader);
-  const topLevelEnd = firstTable === -1 ? lines.length : firstTable;
-  const missing = [];
-
-  for (const [key, value] of Object.entries(values)) {
-    const matcher = keyMatcher(key);
-    const matches = [];
-    for (let index = 0; index < topLevelEnd; index += 1) {
-      if (matcher.test(lines[index])) {
-        matches.push(index);
-      }
-    }
-    if (matches.length > 1) {
-      throw new Error(`Global config contains duplicate top-level ${key} entries.`);
-    }
-    const replacement = `${key} = ${JSON.stringify(value)}`;
-    if (matches.length === 1) {
-      lines[matches[0]] = replacement;
-    } else {
-      missing.push(replacement);
-    }
-  }
-
-  if (missing.length > 0) {
-    let insertion = firstTable === -1 ? lines.length : firstTable;
-    while (insertion > 0 && lines[insertion - 1].trim() === "") {
-      insertion -= 1;
-    }
-    lines.splice(insertion, 0, ...missing);
-    if (firstTable !== -1) {
-      lines.splice(insertion + missing.length, 0, "");
-    }
-  }
-}
-
-function setTableValues(lines, tableName, values) {
-  const escapedTableName = tableName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const tableMatcher = new RegExp(`^\\s*\\[${escapedTableName}\\]\\s*(?:#.*)?$`);
-  const sectionHeaders = lines
-    .map((line, index) => ({ line, index }))
-    .filter(({ line }) => tableMatcher.test(line));
-  if (sectionHeaders.length > 1) {
-    throw new Error(`Global config contains duplicate [${tableName}] sections.`);
-  }
-
-  if (sectionHeaders.length === 0) {
-    if (lines.length > 0 && lines.at(-1).trim() !== "") {
-      lines.push("");
-    }
-    lines.push(`[${tableName}]`);
-    for (const [key, value] of Object.entries(values)) {
-      lines.push(`${key} = ${JSON.stringify(value)}`);
-    }
-    return;
-  }
-
-  const start = sectionHeaders[0].index + 1;
-  let end = lines.length;
-  for (let index = start; index < lines.length; index += 1) {
-    if (isTableHeader(lines[index])) {
-      end = index;
-      break;
-    }
-  }
-
-  const missing = [];
-  for (const [key, value] of Object.entries(values)) {
-    const matcher = keyMatcher(key);
-    const matches = [];
-    for (let index = start; index < end; index += 1) {
-      if (matcher.test(lines[index])) {
-        matches.push(index);
-      }
-    }
-    if (matches.length > 1) {
-      throw new Error(`Global config contains duplicate [${tableName}].${key} entries.`);
-    }
-    const replacement = `${key} = ${JSON.stringify(value)}`;
-    if (matches.length === 1) {
-      lines[matches[0]] = replacement;
-    } else {
-      missing.push(replacement);
-    }
-  }
-  if (missing.length > 0) {
-    let insertion = end;
-    while (insertion > start && lines[insertion - 1].trim() === "") {
-      insertion -= 1;
-    }
-    lines.splice(insertion, 0, ...missing);
-  }
+  setTomlValues(lines, "", values);
 }
 
 function setAgentsValues(lines, values) {
-  setTableValues(lines, "agents", values);
+  setTomlValues(lines, "agents", values);
 }
 
 function setFeaturesValues(lines, values) {
-  setTableValues(lines, "features", values);
+  setTomlValues(lines, "features", values);
 }
 
 function setPlaywrightMcpValues(lines) {
-  const firstTable = lines.findIndex(isTableHeader);
-  const topLevelEnd = firstTable === -1 ? lines.length : firstTable;
-  const ambiguous = lines.some((line, index) =>
-    /^\s*mcp_servers\.playwright(?:\.|\s*=)/.test(line) ||
-    /^\s*\[\[mcp_servers\.playwright\]\]\s*(?:#.*)?$/.test(line) ||
-    (index < topLevelEnd && /^\s*mcp_servers\s*=/.test(line)),
-  );
-  if (ambiguous) {
-    throw new Error("Global config contains an ambiguous Playwright MCP definition.");
-  }
-  setTableValues(lines, "mcp_servers.playwright", {
+  setTomlValues(lines, "mcp_servers.playwright", {
     enabled: true,
     command: PLAYWRIGHT_MCP_COMMAND,
     args: PLAYWRIGHT_MCP_ARGUMENTS,
@@ -343,7 +238,9 @@ function managedHooksLines(hookScriptPath) {
 }
 
 function updateManagedHooks(lines, hookScriptPath) {
+  const commentLines = new Set(tomlStatements(lines).filter((entry) => entry.kind === "comment").map((entry) => entry.start));
   for (let index = 0; index < lines.length; index += 1) {
+    if (!commentLines.has(index)) continue;
     if (lines[index].trim() === LEGACY_MANAGED_HOOKS_START) {
       lines[index] = MANAGED_HOOKS_START;
     }
@@ -354,6 +251,7 @@ function updateManagedHooks(lines, hookScriptPath) {
   const starts = [];
   const ends = [];
   for (let index = 0; index < lines.length; index += 1) {
+    if (!commentLines.has(index)) continue;
     const line = lines[index].trim();
     if (line === MANAGED_HOOKS_START) {
       starts.push(index);
@@ -537,11 +435,47 @@ function uniqueLegacySpecifications(specifications, platform) {
   return [...unique.values()];
 }
 
+export async function validateConfigUpdate(original, proposed, configReader = readCodexConfig) {
+  const temporary = await mkdtemp(join(tmpdir(), "sol-luna-config-preflight-"));
+  const home = join(temporary, "home");
+  const codexHome = join(home, ".codex");
+  const environment = { ...process.env, HOME: home, USERPROFILE: home, CODEX_HOME: codexHome };
+  for (const key of Object.keys(environment)) {
+    if (/^(OPENAI_API_KEY|CODEX_API_KEY|CODEX_CONFIG.*)$/i.test(key)) delete environment[key];
+  }
+  try {
+    await mkdir(codexHome, { recursive: true });
+    for (const [content, verifyManaged] of [[original ?? "", false], [proposed, true]]) {
+      await writeFile(join(codexHome, "config.toml"), content, { encoding: "utf8", mode: 0o600 });
+      const config = await configReader({ cwd: temporary, environment });
+      if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("Codex config/read returned no configuration.");
+      if (verifyManaged) {
+        const expected = {
+          model: "gpt-5.6-sol", model_reasoning_effort: "xhigh", model_verbosity: "low", service_tier: "default", plan_mode_reasoning_effort: "xhigh",
+          "agents.max_depth": 1, "agents.max_threads": 4, "features.fast_mode": false, "features.hooks": true,
+          "mcp_servers.playwright.enabled": true, "mcp_servers.playwright.command": PLAYWRIGHT_MCP_COMMAND, "mcp_servers.playwright.args": PLAYWRIGHT_MCP_ARGUMENTS,
+        };
+        for (const [path, value] of Object.entries(expected)) {
+          let actual = path.split(".").reduce((object, key) => object?.[key], config);
+          if (path === "agents.max_threads" && actual === undefined) actual = config.agents?.max_concurrent_threads_per_session;
+          if (path === "agents.max_threads" && config.agents?.max_concurrent_threads_per_session !== undefined && config.agents.max_concurrent_threads_per_session !== value) {
+            throw new Error("Codex config/read returned contradictory agent capacity.");
+          }
+          if (JSON.stringify(actual) !== JSON.stringify(value)) throw new Error(`Codex config/read did not confirm managed setting ${path}.`);
+        }
+      }
+    }
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+}
+
 export async function installGlobalOrchestration({
   repositoryRoot = DEFAULT_REPOSITORY_ROOT,
   homeDirectory = homedir(),
   codexHome = getCodexHome(process.env, homeDirectory),
   platform = process.platform,
+  configReader = readCodexConfig,
 } = {}) {
   const linkType = getSkillLinkType(platform);
   const canonicalDirectory = resolve(repositoryRoot, ".agents", "skills", SKILL_NAME);
@@ -624,6 +558,7 @@ export async function installGlobalOrchestration({
   const configUpdate = updateGlobalConfig(originalConfig, { hookScriptPath: globalHookScript });
   const globalInstructions = await selectGlobalInstructions(codexHome);
   const instructionsUpdate = updateGlobalInstructions(globalInstructions.content);
+  await validateConfigUpdate(originalConfig, configUpdate.content, configReader);
 
   let linkCreated = false;
   let configWritten = false;

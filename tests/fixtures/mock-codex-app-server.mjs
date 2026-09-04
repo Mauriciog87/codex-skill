@@ -201,6 +201,10 @@ async function handle(message) {
     });
     return;
   }
+  if (message.method === "config/read") {
+    result(message.id, { config: scenario.config ?? { model: "gpt-5.6-sol" } });
+    return;
+  }
   if (message.method === "thread/start") {
     result(message.id, {
       model: scenario.threadModel ?? model,

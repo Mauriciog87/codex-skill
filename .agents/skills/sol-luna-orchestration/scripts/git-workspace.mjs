@@ -22,9 +22,11 @@ import {
   getEntry,
   getRepositoryState,
   readJson,
+  resolveAssignmentState,
 } from "./orchestration-state.mjs";
 
 const MAX_PROCESS_OUTPUT = 131_072;
+const MAX_GIT_OUTPUT = 64 * 1024 * 1024;
 
 function worktreeName(record, prefix = "work") {
   return `${prefix}-${record.assignment_id.replaceAll("-", "").slice(0, 16)}-${record.attempt}`;
@@ -82,6 +84,8 @@ export function runProcess(executable, args, {
   input = null,
   timeoutMs = 900_000,
   spawnImplementation = spawn,
+  dataOutput = false,
+  maxOutputBytes = MAX_GIT_OUTPUT,
 } = {}) {
   return new Promise((resolvePromise, rejectPromise) => {
     let child;
@@ -98,23 +102,46 @@ export function runProcess(executable, args, {
       return;
     }
     let stdout = Buffer.alloc(0);
+    const stdoutChunks = [];
+    let stdoutBytes = 0;
     let stderr = Buffer.alloc(0);
     let settled = false;
+    let failure = null;
+    let killTimer;
     const finish = (callback) => {
       if (settled) {
         return;
       }
       settled = true;
       clearTimeout(timer);
+      clearTimeout(killTimer);
       callback();
     };
-    const timer = setTimeout(() => {
+    const stop = (error) => {
+      if (failure !== null) return;
+      failure = error;
       child.kill("SIGTERM");
-      finish(() => rejectPromise(new GitWorkspaceError(`${executable} timed out.`, "process-timeout")));
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 1000);
+      killTimer.unref();
+    };
+    const timer = setTimeout(() => {
+      stop(new GitWorkspaceError(`${executable} timed out.`, "process-timeout"));
     }, timeoutMs);
     timer.unref();
     child.stdout.on("data", (chunk) => {
-      stdout = appendLimited(stdout, Buffer.from(chunk));
+      if (failure !== null) return;
+      const bytes = Buffer.from(chunk);
+      if (dataOutput) {
+        stdoutBytes += bytes.length;
+        if (stdoutBytes > maxOutputBytes) {
+          stdoutChunks.length = 0;
+          stop(new GitWorkspaceError(`${executable} output exceeds ${maxOutputBytes} bytes. No partial data was accepted.`, "process-output-limit"));
+        } else {
+          stdoutChunks.push(bytes);
+        }
+      } else {
+        stdout = appendLimited(stdout, bytes);
+      }
     });
     child.stderr.on("data", (chunk) => {
       stderr = appendLimited(stderr, Buffer.from(chunk));
@@ -123,12 +150,17 @@ export function runProcess(executable, args, {
       finish(() => rejectPromise(new GitWorkspaceError(`${executable} failed to start: ${error.message}`, "process-start-failed")));
     });
     child.once("close", (code, signal) => {
-      finish(() => resolvePromise({
+      finish(() => failure !== null ? rejectPromise(failure) : resolvePromise({
         exitCode: Number.isInteger(code) ? code : 1,
         signal: signal ?? null,
-        stdout,
+        stdout: dataOutput ? Buffer.concat(stdoutChunks, stdoutBytes) : stdout,
         stderr,
       }));
+    });
+    child.stdin.on?.("error", (error) => {
+      if (error.code !== "EPIPE" && error.code !== "ERR_STREAM_DESTROYED") {
+        stop(new GitWorkspaceError(`${executable} input failed: ${error.message}`, "process-input-failed"));
+      }
     });
     if (input === null) {
       child.stdin.end();
@@ -146,9 +178,9 @@ export function gitArgumentsForPlatform(args, platform = process.platform) {
 
 export async function runGit(args, options = {}) {
   const effectiveArgs = gitArgumentsForPlatform(args);
-  const result = await runProcess("git", effectiveArgs, options);
+  const result = await runProcess("git", effectiveArgs, { ...options, dataOutput: true });
   if (result.exitCode !== 0 && options.allowFailure !== true) {
-    const detail = result.stderr.toString("utf8").trim() || result.stdout.toString("utf8").trim();
+    const detail = result.stderr.toString("utf8").trim() || result.stdout.subarray(-MAX_PROCESS_OUTPUT).toString("utf8").trim();
     throw new GitWorkspaceError(
       `git ${args[0]} failed${detail ? `: ${detail}` : "."}`,
       "git-command-failed",
@@ -662,6 +694,34 @@ export async function createCandidate(record, workspacePath, {
   }
 }
 
+async function assertCandidateWorkspace(record, repository, options, failureCode = "candidate-workspace-mismatch") {
+  const state = await getRepositoryState(record.repository, options);
+  await ensureWorktreesDirectory(state);
+  const temporaryIndex = join(state.worktreesDirectory, `.verify-index-${randomUUID()}`);
+  const environment = { ...(options.environment ?? process.env), GIT_INDEX_FILE: temporaryIndex };
+  const gitOptions = { ...options, cwd: repository, environment };
+  try {
+    await runGit(["read-tree", record.candidate.candidate_revision], gitOptions);
+    const paths = record.candidate.changed_paths;
+    const tracked = parseNullSeparatedPaths((await runGit(["ls-files", "-z", "--", ...paths], gitOptions)).stdout);
+    const trackedSet = normalizedSet(tracked, options.platform ?? process.platform);
+    for (const path of paths) {
+      if (!trackedSet.has(normalizedPath(path, options.platform ?? process.platform)) &&
+          (await getEntry(resolveContainedPath(repository, path))) !== null) {
+        throw new GitWorkspaceError(`Candidate deletion is not present: ${path}`, failureCode);
+      }
+    }
+    if (tracked.length > 0) await runGit(["add", "-A", "--", ...tracked], gitOptions);
+    const captured = (await runGit(["write-tree"], gitOptions)).stdoutText.trim();
+    const expected = (await runGit(["rev-parse", `${record.candidate.candidate_revision}^{tree}`], gitOptions)).stdoutText.trim();
+    if (captured !== expected) {
+      throw new GitWorkspaceError("Workspace content or modes differ from the candidate.", failureCode);
+    }
+  } finally {
+    await rm(temporaryIndex, { force: true });
+  }
+}
+
 export async function integrateCandidate(record, targetCwd, options = {}) {
   if (record.candidate === null) {
     throw new GitWorkspaceError("Assignment does not have a candidate.", "candidate-not-found");
@@ -670,6 +730,18 @@ export async function integrateCandidate(record, targetCwd, options = {}) {
   if (resolve(target.repository) !== resolve(record.repository)) {
     throw new GitWorkspaceError("Integration target belongs to another repository.", "repository-mismatch");
   }
+  const patch = await runGit(
+    ["diff", "--binary", "--full-index", record.base_revision, record.candidate.candidate_revision],
+    { ...options, cwd: target.repository },
+  );
+  const patchDigest = sha256(patch.stdout);
+  if (patchDigest !== record.candidate.diff_sha256) {
+    throw new GitWorkspaceError("Candidate diff no longer matches its identity.", "candidate-integrity-failed");
+  }
+  const actualPaths = parseNullSeparatedPaths((await runGit(["diff", "--name-only", "--no-renames", "-z", record.base_revision, record.candidate.candidate_revision], { ...options, cwd: target.repository })).stdout);
+  if (!normalizedPathsEqual(actualPaths, record.candidate.changed_paths, options.platform ?? process.platform)) {
+    throw new GitWorkspaceError("Candidate path set differs from its actual Git changes.", "candidate-integrity-failed");
+  }
   const targetStatus = await readWorkspaceStatus(target.repository, options);
   const dirty = changedPaths(targetStatus).filter((path) =>
     record.candidate.changed_paths.some((candidatePath) =>
@@ -677,16 +749,19 @@ export async function integrateCandidate(record, targetCwd, options = {}) {
     )
   );
   if (dirty.length > 0) {
-    const alreadyApplied = await runGit(
-      ["diff", "--quiet", record.candidate.candidate_revision, "--", ...record.candidate.changed_paths],
-      { ...options, cwd: target.repository, allowFailure: true },
-    );
     const alreadyStaged = await runGit(["diff", "--cached", "--quiet", "--", ...record.candidate.changed_paths], {
       ...options,
       cwd: target.repository,
       allowFailure: true,
     });
-    if (alreadyApplied.exitCode === 0 && alreadyStaged.exitCode === 0) {
+    let alreadyApplied = false;
+    try {
+      await assertCandidateWorkspace(record, target.repository, options);
+      alreadyApplied = true;
+    } catch (error) {
+      if (error.code !== "candidate-workspace-mismatch") throw error;
+    }
+    if (alreadyApplied && alreadyStaged.exitCode === 0) {
       return {
         candidate_id: record.candidate.candidate_id,
         target_revision_before: target.head,
@@ -712,14 +787,6 @@ export async function integrateCandidate(record, targetCwd, options = {}) {
       throw new GitWorkspaceError(`Integration path changed since assignment base: ${path}`, "integration-stale-path");
     }
   }
-  const patch = await runGit(
-    ["diff", "--binary", "--full-index", record.base_revision, record.candidate.candidate_revision],
-    { ...options, cwd: target.repository },
-  );
-  const patchDigest = sha256(patch.stdout);
-  if (patchDigest !== record.candidate.diff_sha256) {
-    throw new GitWorkspaceError("Candidate diff no longer matches its identity.", "candidate-integrity-failed");
-  }
   await runGit(["apply", "--check", "--binary", "-"], {
     ...options,
     cwd: target.repository,
@@ -738,6 +805,7 @@ export async function integrateCandidate(record, targetCwd, options = {}) {
   if (staged.exitCode !== 0) {
     throw new GitWorkspaceError("Candidate integration unexpectedly staged changes.", "integration-staged");
   }
+  await assertCandidateWorkspace(record, target.repository, options);
   return {
     candidate_id: record.candidate.candidate_id,
     target_revision_before: target.head,
@@ -859,6 +927,8 @@ async function inspectPublicationCommit(record, revision, branchRef, options) {
 }
 
 async function synchronizeDeliveryIndex(record, revision, repository, options) {
+  await assertDeliveryIndex(record, revision, repository, options);
+  await assertCandidateWorkspace(record, repository, options, "delivery-path-dirty");
   await runGit(["reset", "--mixed", revision, "--", ...record.candidate.changed_paths], {
     ...options,
     cwd: repository,
@@ -875,6 +945,27 @@ async function synchronizeDeliveryIndex(record, revision, repository, options) {
   });
   if (cached.exitCode !== 0 || working.exitCode !== 0) {
     throw new GitWorkspaceError("Delivery commit could not synchronize the candidate paths.", "delivery-index-sync-failed");
+  }
+}
+
+async function assertDeliveryIndex(record, revision, repository, options) {
+  const parent = (await runGit(["rev-parse", `${revision}^`], { ...options, cwd: repository })).stdoutText.trim();
+  for (const expected of [parent, revision]) {
+    const compared = await runGit(["diff", "--cached", "--quiet", expected, "--", ...record.candidate.changed_paths], {
+      ...options, cwd: repository, allowFailure: true,
+    });
+    if (compared.exitCode === 0) return;
+    if (compared.exitCode !== 1) throw new GitWorkspaceError("Cannot inspect the delivery index.", "delivery-index-invalid");
+  }
+  throw new GitWorkspaceError("Candidate paths contain new staged changes after publication.", "delivery-index-dirty");
+}
+
+async function publishDeliveryRefs(repository, instructions, options) {
+  const result = await runGit(["update-ref", "--stdin"], {
+    ...options, cwd: repository, input: ["start", ...instructions, "prepare", "commit", ""].join("\n"), allowFailure: true,
+  });
+  if (result.exitCode !== 0) {
+    throw new GitWorkspaceError("Delivery refs changed while publishing. Inspect and retry the recorded delivery.", "publication-branch-diverged");
   }
 }
 
@@ -903,6 +994,14 @@ export async function commitIntegratedCandidate(record, targetCwd, options = {})
     })).stdoutText.trim().toLowerCase();
     if (branchRevision === revision) {
       await synchronizeDeliveryIndex(record, revision, target.repository, options);
+    } else if (branchRevision === evidence.parent_revision) {
+      await assertDeliveryIndex(record, revision, target.repository, options);
+      await assertCandidateWorkspace(record, target.repository, options, "delivery-path-dirty");
+      await publishDeliveryRefs(target.repository, [
+        `verify ${publicationRef} ${revision}`,
+        `update ${branchRef} ${revision} ${branchRevision}`,
+      ], options);
+      await synchronizeDeliveryIndex(record, revision, target.repository, options);
     } else {
       const ancestor = await runGit(["merge-base", "--is-ancestor", revision, branchRevision], {
         ...options,
@@ -913,6 +1012,18 @@ export async function commitIntegratedCandidate(record, targetCwd, options = {})
         throw new GitWorkspaceError("Delivery branch diverged from the recorded commit.", "publication-branch-diverged");
       }
     }
+    return { ...evidence, idempotent: true };
+  }
+  const headMessage = (await runGit(["show", "-s", "--format=%B", target.head], { ...options, cwd: target.repository })).stdoutText.split(/\r?\n/);
+  if (headMessage.includes(`Codex-Assignment-ID: ${record.assignment_id}`)) {
+    const evidence = await inspectPublicationCommit(record, target.head, branchRef, options);
+    await assertDeliveryIndex(record, target.head, target.repository, options);
+    await assertCandidateWorkspace(record, target.repository, options, "delivery-path-dirty");
+    await publishDeliveryRefs(target.repository, [
+      `create ${publicationRef} ${target.head}`,
+      `verify ${branchRef} ${target.head}`,
+    ], options);
+    await synchronizeDeliveryIndex(record, target.head, target.repository, options);
     return { ...evidence, idempotent: true };
   }
   const candidatePaths = record.candidate.changed_paths;
@@ -949,55 +1060,7 @@ export async function commitIntegratedCandidate(record, targetCwd, options = {})
   );
   const environment = { ...(options.environment ?? process.env), GIT_INDEX_FILE: temporaryIndex };
   try {
-    await runGit(["read-tree", record.candidate.candidate_revision], {
-      ...options,
-      cwd: target.repository,
-      environment,
-    });
-    const candidateTrackedPaths = parseNullSeparatedPaths((await runGit(
-      ["ls-files", "-z", "--", ...candidatePaths],
-      { ...options, cwd: target.repository, environment },
-    )).stdout);
-    const trackedPathSet = normalizedSet(candidateTrackedPaths, options.platform ?? process.platform);
-    const unexpectedPaths = [];
-    for (const path of candidatePaths) {
-      if (
-        !trackedPathSet.has(normalizedPath(path, options.platform ?? process.platform)) &&
-        (await getEntry(resolveContainedPath(target.repository, path))) !== null
-      ) {
-        unexpectedPaths.push(path);
-      }
-    }
-    const capture = candidateTrackedPaths.length === 0
-      ? { exitCode: 0 }
-      : await runGit(["add", "-A", "--", ...candidateTrackedPaths], {
-          ...options,
-          cwd: target.repository,
-          environment,
-          allowFailure: true,
-        });
-    const expectedCandidateTree = (await runGit(
-      ["rev-parse", `${record.candidate.candidate_revision}^{tree}`],
-      { ...options, cwd: target.repository },
-    )).stdoutText.trim().toLowerCase();
-    const capturedCandidateTree = capture.exitCode === 0
-      ? (await runGit(["write-tree"], {
-          ...options,
-          cwd: target.repository,
-          environment,
-        })).stdoutText.trim().toLowerCase()
-      : null;
-    if (unexpectedPaths.length > 0 || capturedCandidateTree !== expectedCandidateTree) {
-      throw new GitWorkspaceError(
-        "Integrated candidate paths changed before delivery.",
-        "delivery-path-dirty",
-        {
-          capture_failed: capture.exitCode !== 0,
-          tree_mismatch: capturedCandidateTree !== expectedCandidateTree,
-          unexpected_paths: unexpectedPaths,
-        },
-      );
-    }
+    await assertCandidateWorkspace(record, target.repository, options, "delivery-path-dirty");
     await runGit(["read-tree", target.head], { ...options, cwd: target.repository, environment });
     await runGit(["apply", "--cached", "--binary", "-"], {
       ...options,
@@ -1030,21 +1093,10 @@ export async function commitIntegratedCandidate(record, targetCwd, options = {})
       environment,
       input: commitMessage,
     })).stdoutText.trim().toLowerCase();
-    const refUpdate = await runGit(
-      ["update-ref", publicationRef, commitRevision, "0".repeat(commitRevision.length)],
-      { ...options, cwd: target.repository, allowFailure: true },
-    );
-    if (refUpdate.exitCode !== 0) {
-      throw new GitWorkspaceError("Delivery publication ref already exists.", "publication-ref-exists");
-    }
-    const branchUpdate = await runGit(["update-ref", branchRef, commitRevision, target.head], {
-      ...options,
-      cwd: target.repository,
-      allowFailure: true,
-    });
-    if (branchUpdate.exitCode !== 0) {
-      throw new GitWorkspaceError("Delivery branch moved while the commit was being published.", "publication-branch-diverged");
-    }
+    await publishDeliveryRefs(target.repository, [
+      `create ${publicationRef} ${commitRevision}`,
+      `update ${branchRef} ${commitRevision} ${target.head}`,
+    ], options);
     await synchronizeDeliveryIndex(record, commitRevision, target.repository, options);
     return inspectPublicationCommit(record, commitRevision, branchRef, options);
   } finally {
@@ -1279,7 +1331,7 @@ export async function archiveAssignmentWorktree(record, options = {}) {
   if (typeof record.workspace?.path !== "string" || record.workspace.path.length === 0) {
     throw new GitWorkspaceError("Assignment does not have a worktree.", "worktree-not-found");
   }
-  const state = await getRepositoryState(record.repository, options);
+  const state = await resolveAssignmentState(record.repository, record.assignment_id, options);
   await ensureWorktreesDirectory(state);
   const source = await assertControlledWorktreePath(state, record.workspace.path);
   const shortDestination = await assertControlledWorktreePath(state, join(
@@ -1337,7 +1389,7 @@ export async function cleanupAssignmentWorktree(record, options = {}) {
   if (typeof record.workspace?.path !== "string" || record.workspace.path.length === 0) {
     return { cleaned: false, reason: "no-worktree" };
   }
-  const state = await getRepositoryState(record.repository, options);
+  const state = await resolveAssignmentState(record.repository, record.assignment_id, options);
   await ensureWorktreesDirectory(state);
   const controlled = await assertControlledWorktreePath(
     state,

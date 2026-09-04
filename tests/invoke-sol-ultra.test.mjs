@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { runGit } from "../.agents/skills/sol-luna-orchestration/scripts/git-workspace.mjs";
 import {
   DEFAULT_ULTRA_SANDBOX_MODE,
   DEFAULT_ULTRA_TIMEOUT_SECONDS,
@@ -30,7 +31,8 @@ async function createFixture(context) {
   const repository = join(root, "repository");
   const sessionsRoot = join(root, "sessions");
   const homeDirectory = join(root, "home");
-  await mkdir(join(repository, ".git"), { recursive: true });
+  await mkdir(repository, { recursive: true });
+  await runGit(["init"], { cwd: repository });
   return { root, repository, sessionsRoot, homeDirectory };
 }
 

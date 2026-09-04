@@ -5,15 +5,14 @@ import {
   lstat,
   mkdir,
   readFile,
-  realpath,
   readdir,
   rename,
   rm,
-  stat,
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, parse, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
+import { resolveRepositoryIdentity } from "./repository-identity.mjs";
 import {
   ProcessIdentityError,
   createProcessIdentity,
@@ -152,24 +151,6 @@ export function isProcessAlive(pid, kill = process.kill) {
   return isPidAlive(pid, kill);
 }
 
-async function findRepositoryRoot(cwd) {
-  const metadata = await stat(cwd);
-  if (!metadata.isDirectory()) {
-    throw new OrchestrationStateError(`Repository cwd is not a directory: ${cwd}`);
-  }
-  let current = await realpath(cwd);
-  const root = parse(current).root;
-  while (true) {
-    if ((await getEntry(join(current, ".git"))) !== null) {
-      return current;
-    }
-    if (current === root) {
-      return await realpath(cwd);
-    }
-    current = dirname(current);
-  }
-}
-
 export function getRepositoryKey(repository, platform = process.platform) {
   const normalized = resolve(repository).replace(/^\\\\\?\\/, "");
   const keyed = platform === "win32" ? normalized.toLowerCase() : normalized;
@@ -187,7 +168,16 @@ export async function getRepositoryState(
   cwd,
   { environment = process.env, homeDirectory = homedir(), platform = process.platform } = {},
 ) {
-  const repository = await findRepositoryRoot(resolve(cwd));
+  let identity;
+  try {
+    identity = await resolveRepositoryIdentity(resolve(cwd));
+  } catch (error) {
+    throw new OrchestrationStateError(`Repository identity could not be verified: ${error.message}`);
+  }
+  return { ...repositoryStatePaths(identity.repository, { environment, homeDirectory, platform }), ...identity };
+}
+
+function repositoryStatePaths(repository, { environment = process.env, homeDirectory, platform = process.platform } = {}) {
   const key = getRepositoryKey(repository, platform);
   const stateDirectory = join(
     getCodexHome(environment, homeDirectory),
@@ -220,6 +210,67 @@ export async function getRepositoryState(
     globalMutexDirectory: globalState.mutexDirectory,
     globalRunsDirectory: globalState.runsDirectory,
   };
+}
+
+export async function getLegacyRepositoryStates(state) {
+  const repositories = new Set(state.relatedRepositories ?? []);
+  const ownMetadata = await readRepositoryMetadata(state);
+  for (const path of ownMetadata?.related_repositories ?? []) repositories.add(path);
+  const assignments = await getEntry(state.assignmentsDirectory);
+  if (assignments !== null) {
+    for (const entry of await readdir(state.assignmentsDirectory, { withFileTypes: true })) {
+      if (!entry.isDirectory()) throw new OrchestrationStateError("Assignment namespace contains an unexpected entry.");
+      const record = await readJson(join(state.assignmentsDirectory, entry.name, "record.json"), "Assignment identity");
+      for (const attempt of [record, ...(record.previous_attempts ?? [])]) {
+        for (const path of [attempt.workspace?.path, attempt.workspace?.archive_path]) {
+          if (typeof path !== "string") continue;
+          const nested = relative(state.worktreesDirectory, path);
+          if (nested && !nested.startsWith("..") && !nested.includes(":")) repositories.add(path);
+        }
+      }
+    }
+  }
+  const states = [];
+  for (const repository of repositories) {
+    const key = getRepositoryKey(repository);
+    if (key === state.key) continue;
+    const directory = join(dirname(state.stateDirectory), key);
+    if ((await getEntry(directory)) === null) continue;
+    const legacy = repositoryStatePaths(repository, { environment: { CODEX_HOME: resolve(state.stateDirectory, "../../..") } });
+    legacy.mutexDirectory = state.mutexDirectory;
+    legacy.canonicalState = state;
+    const metadata = await readRepositoryMetadata(legacy);
+    const lock = await readLockFromState(legacy);
+    const runs = await readRuns(legacy);
+    const pending = [];
+    if ((await getEntry(legacy.assignmentsDirectory)) !== null) {
+      for (const entry of await readdir(legacy.assignmentsDirectory, { withFileTypes: true })) {
+        if (!entry.isDirectory()) throw new OrchestrationStateError("Legacy assignment namespace is malformed.");
+        const record = await readJson(join(legacy.assignmentsDirectory, entry.name, "record.json"), "Legacy assignment");
+        if (!["acknowledged", "abandoned"].includes(record.state) || (record.workspace?.path && !record.workspace.cleaned && !record.workspace.shared)) pending.push(record.assignment_id);
+      }
+    }
+    states.push({ state: legacy, metadata, lock, runs, pending, blocked: lock !== null || runs.some((run) => run.state === "active") || pending.length > 0 });
+  }
+  return states;
+}
+
+export async function assertNoLegacyRepositoryWork(state) {
+  const legacy = (await getLegacyRepositoryStates(state.canonicalState ?? state)).filter((entry) => entry.blocked);
+  if (legacy.length > 0) {
+    throw new OrchestrationStateError("Linked worktree namespaces contain pending legacy state. Inspect status and recover exact locks or assignments before starting new work.");
+  }
+}
+
+export async function resolveAssignmentState(cwd, assignmentId, options = {}) {
+  const state = await getRepositoryState(cwd, options);
+  const candidates = [state, ...(await getLegacyRepositoryStates(state)).map((entry) => entry.state)];
+  const found = [];
+  for (const candidate of candidates) {
+    if ((await getEntry(join(candidate.assignmentsDirectory, assignmentId, "record.json"))) !== null) found.push(candidate);
+  }
+  if (found.length > 1) throw new OrchestrationStateError("Assignment id exists in multiple repository namespaces.");
+  return found[0] ?? state;
 }
 
 export function getGlobalCapacityState({
@@ -367,7 +418,7 @@ function validateLock(lock) {
   return lock;
 }
 
-async function readLockFromState(state) {
+export async function readLockFromState(state) {
   if ((await getEntry(state.lockDirectory)) === null) {
     return null;
   }
@@ -385,6 +436,7 @@ function validateRepositoryMetadata(value, state) {
     value.current_generation < 0 ||
     !Number.isInteger(value.history_sequence) ||
     value.history_sequence < 0 ||
+    (value.related_repositories !== undefined && (!Array.isArray(value.related_repositories) || value.related_repositories.some((path) => typeof path !== "string" || path.length === 0))) ||
     typeof value.updated_at !== "string"
   ) {
     throw new OrchestrationStateError("Repository generation metadata is malformed.");
@@ -402,9 +454,15 @@ async function readRepositoryMetadata(state) {
   );
 }
 
-async function ensureRepositoryMetadata(state) {
+export async function ensureRepositoryMetadata(state) {
   const existing = await readRepositoryMetadata(state);
   if (existing !== null) {
+    const related = [...new Set([...(existing.related_repositories ?? []), ...(state.relatedRepositories ?? [])])];
+    if (JSON.stringify(related) !== JSON.stringify(existing.related_repositories ?? [])) {
+      const updated = { ...existing, related_repositories: related };
+      await atomicWrite(state.metadataPath, updated);
+      return updated;
+    }
     return existing;
   }
   const metadata = {
@@ -413,6 +471,7 @@ async function ensureRepositoryMetadata(state) {
     repository_key: state.key,
     current_generation: 0,
     history_sequence: 0,
+    related_repositories: state.relatedRepositories ?? [],
     updated_at: new Date().toISOString(),
   };
   await atomicCreate(state.metadataPath, metadata);
@@ -446,6 +505,7 @@ function validateRun(run, entryName) {
     !(run.generation === null || (Number.isInteger(run.generation) && run.generation >= 1)) ||
     !(run.lock_id === null || (typeof run.lock_id === "string" && run.lock_id.length > 0)) ||
     (run.lock_id === null) !== (run.generation === null)
+    || (run.assignment_id !== undefined && run.assignment_id !== null && !/^[0-9a-f-]{36}$/i.test(run.assignment_id))
   ) {
     throw new OrchestrationStateError(`Executor run ${entryName} is malformed.`);
   }
@@ -662,6 +722,21 @@ function resolveProcessInspector({ processInspector, processAlive } = {}) {
   return inspectProcessIdentity;
 }
 
+export async function assertRepositoryQuiescent(state, assignmentId, options = {}) {
+  const runs = (await readRuns(state)).filter((run) => run.assignment_id === assignmentId ||
+    (run.state === "active" && (run.assignment_id === undefined || run.assignment_id === null)));
+  for (const run of runs) {
+    if (run.version === LEGACY_STATE_VERSION) {
+      if (isProcessAlive(run.pid)) throw new OrchestrationStateError("Workspace still has a live or unknown legacy executor.");
+    } else {
+      const inspections = await inspectProcesses(run.processes, resolveProcessInspector(options));
+      if (inspections.some((entry) => !["dead", "reused"].includes(entry.status))) {
+        throw new OrchestrationStateError("Workspace still has a live or unknown executor process.");
+      }
+    }
+  }
+}
+
 async function removeDeadActiveRuns(state, options = {}) {
   const processInspector = resolveProcessInspector(options);
   const repositoryState = typeof state.historyDirectory === "string";
@@ -792,6 +867,7 @@ function requireMatchingRun(run, lease) {
 
 export async function readUltraLock(cwd, options = {}) {
   const state = await getRepositoryState(cwd, options);
+  await assertNoLegacyRepositoryWork(state);
   return readLockFromState(state);
 }
 
@@ -810,6 +886,7 @@ export async function acquireUltraLock({
   }
   const state = await getRepositoryState(cwd, { environment, homeDirectory });
   return withStateMutex(state, async () => {
+    await assertNoLegacyRepositoryWork(state);
     const existingLock = await readLockFromState(state);
     if (existingLock !== null) {
       if (existingLock.version === LEGACY_STATE_VERSION) {
@@ -826,10 +903,18 @@ export async function acquireUltraLock({
     if (activeRuns.length > 0) {
       throw new OrchestrationStateError(`Cannot acquire Ultra takeover while ${activeRuns.length} executor run(s) are active.`);
     }
+    if ((await getEntry(state.assignmentsDirectory)) !== null) {
+      for (const entry of await readdir(state.assignmentsDirectory, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const assignment = await readJson(join(state.assignmentsDirectory, entry.name, "record.json"), "Assignment execution state");
+        if (assignment.state === "running") throw new OrchestrationStateError("Cannot acquire Ultra takeover while an assignment is running.");
+      }
+    }
     const ownerIdentity = await processIdentityProvider({ pid });
     validateProcessIdentity(ownerIdentity);
     const metadata = await ensureRepositoryMetadata(state);
-    const generation = metadata.current_generation + 1;
+    const legacyGenerations = (await getLegacyRepositoryStates(state)).map((entry) => entry.metadata?.current_generation ?? 0);
+    const generation = Math.max(metadata.current_generation, ...legacyGenerations) + 1;
     await atomicWrite(state.metadataPath, {
       ...metadata,
       current_generation: generation,
@@ -969,6 +1054,7 @@ export async function beginExecutorRun({
     const globalRuns = await removeDeadActiveRuns(globalState, { processInspector, processAlive });
     assertCapacityAvailable("Machine-wide", capacityUsage(globalRuns), pool, profile);
     return withStateMutex(state, async () => {
+      await assertNoLegacyRepositoryWork(state);
       const repositoryRuns = await removeDeadActiveRuns(state, { processInspector, processAlive });
       assertNoLegacyState(await readLockFromState(state), await readRuns(state));
       assertCapacityAvailable("Repository", capacityUsage(repositoryRuns), pool, profile);
@@ -1003,6 +1089,7 @@ export async function beginExecutorRun({
       const run = {
         version: ORCHESTRATION_STATE_VERSION,
         run_id: runId,
+        assignment_id: environment.CODEX_ORCHESTRATION_ASSIGNMENT_ID ?? null,
         repository: state.repository,
         repository_key: state.key,
         state: "active",
@@ -1346,8 +1433,15 @@ export async function recoverUltraLock({
   processAlive,
   confirmLegacyRecovery = false,
 }) {
-  const state = await getRepositoryState(cwd, { environment, homeDirectory });
+  const canonical = await getRepositoryState(cwd, { environment, homeDirectory });
+  const matches = [];
+  for (const namespace of [canonical, ...(await getLegacyRepositoryStates(canonical)).map((entry) => entry.state)]) {
+    if ((await readLockFromState(namespace))?.lock_id === lockId) matches.push(namespace);
+  }
+  if (matches.length > 1) throw new OrchestrationStateError("Lock id exists in multiple repository namespaces.");
+  const state = matches[0] ?? canonical;
   return withStateMutex(state, async () => {
+    if (state.canonicalState) await ensureRepositoryMetadata(canonical);
     const lock = await readLockFromState(state);
     if (lock === null) {
       throw new OrchestrationStateError("Repository does not have an Ultra lock.");
@@ -1475,6 +1569,13 @@ export async function readOrchestrationHistory(
   const state = await getRepositoryState(cwd, { environment, homeDirectory });
   return withStateMutex(state, async () => {
     const history = await readHistoryEntries(state);
+    const legacy = await getLegacyRepositoryStates(state);
+    for (const entry of legacy) {
+      const previous = await readHistoryEntries(entry.state);
+      history.events.push(...previous.events);
+      history.warnings.push(...previous.warnings);
+    }
+    if (legacy.length > 0) history.events.sort((a, b) => a.timestamp.localeCompare(b.timestamp) || a.repository_key.localeCompare(b.repository_key) || a.sequence - b.sequence);
     return {
       status: "completed",
       repository: state.repository,
@@ -1506,6 +1607,10 @@ export async function getOrchestrationStatus(cwd, options = {}) {
       const lock = await readLockFromState(state);
       const runs = await readRuns(state);
       const metadata = await readRepositoryMetadata(state);
+      for (const entry of await getLegacyRepositoryStates(state)) {
+        await removeDeadActiveRuns(entry.state, { processInspector: inspector });
+      }
+      const legacyNamespaces = await getLegacyRepositoryStates(state);
       const history = await readHistoryEntries(state);
       const statusRuns = [];
       for (const run of runs) {
@@ -1517,6 +1622,15 @@ export async function getOrchestrationStatus(cwd, options = {}) {
         status: "completed",
         repository: state.repository,
         repository_key: state.key,
+        legacy_namespaces: legacyNamespaces.map((entry) => ({
+          repository: entry.state.repository,
+          repository_key: entry.state.key,
+          lock_id: entry.lock?.lock_id ?? null,
+          generation: entry.metadata?.current_generation ?? null,
+          active_run_ids: entry.runs.filter((run) => run.state === "active").map((run) => run.run_id),
+          pending_assignment_ids: entry.pending,
+          blocked: entry.blocked,
+        })),
         generation: {
           current: metadata?.current_generation ?? null,
           lock: lock?.version === ORCHESTRATION_STATE_VERSION ? lock.generation : null,

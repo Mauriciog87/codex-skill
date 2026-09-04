@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { access, mkdtemp, mkdir, readFile, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { access, chmod, mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { createAssignment } from "../.agents/skills/sol-luna-orchestration/scripts/control-plane.mjs";
-import { getRepositoryState } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
+import { createAction, createAssignment, dispatchAssignmentAction, readAssignment } from "../.agents/skills/sol-luna-orchestration/scripts/control-plane.mjs";
+import { executeControlCommand } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-control.mjs";
+import { acquireUltraLock, getOrchestrationStatus, getRepositoryKey, getRepositoryState } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
 import {
   GitWorkspaceError,
   archiveAssignmentWorktree,
@@ -21,6 +24,7 @@ import {
   pushCommittedCandidate,
   readWorkspaceStatus,
   runGit,
+  runProcess,
   runRequiredChecks,
 } from "../.agents/skills/sol-luna-orchestration/scripts/git-workspace.mjs";
 
@@ -105,6 +109,261 @@ test("porcelain v2 parser retains both sides of renames", () => {
     { kind: "rename", xy: "R.", path: "src/new.txt", original_path: "src/old.txt" },
     { kind: "untracked", xy: "??", path: "src/untracked.txt", original_path: null },
   ]);
+});
+
+test("linked worktrees share their main repository coordination namespace", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    const record = await createWriterAssignment(fixture);
+    const workspace = await createAssignmentWorktree(record, fixture.options);
+    const main = await getRepositoryState(fixture.repository, fixture.options);
+    const linked = await getRepositoryState(workspace.path, fixture.options);
+    assert.equal(linked.key, main.key);
+    assert.equal(linked.repository, main.repository);
+    assert.equal(linked.lockPath, main.lockPath);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("legacy worktree assignments can be archived and cleaned through their exact identifiers", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    let record = await createWriterAssignment(fixture);
+    const workspace = await createAssignmentWorktree(record, fixture.options);
+    const main = await getRepositoryState(fixture.repository, fixture.options);
+    const linked = join(fixture.root, "legacy-checkout");
+    await runGit(["worktree", "add", "--detach", linked, record.base_revision], { cwd: fixture.repository });
+    const repository = await realpath(linked);
+    const key = getRepositoryKey(repository);
+    const legacyDirectory = join(dirname(main.stateDirectory), key);
+    const legacyWorktrees = join(dirname(main.worktreesDirectory), key.slice(0, 16));
+    const path = join(legacyWorktrees, `work-${record.assignment_id.replaceAll("-", "").slice(0, 16)}-1`);
+    await mkdir(join(legacyDirectory, "assignments"), { recursive: true });
+    await mkdir(legacyWorktrees, { recursive: true });
+    await runGit(["worktree", "move", workspace.path, path], { cwd: fixture.repository });
+    await writeFile(join(legacyWorktrees, "repository.json"), JSON.stringify({ schema_version: 1, repository, repository_key: key }));
+    await writeFile(join(legacyDirectory, "repository-state.json"), JSON.stringify({ version: 2, repository, repository_key: key, current_generation: 7, history_sequence: 0, updated_at: new Date().toISOString() }));
+    const assignmentDirectory = join(legacyDirectory, "assignments", record.assignment_id);
+    await rename(join(main.assignmentsDirectory, record.assignment_id), assignmentDirectory);
+    record = { ...record, repository, repository_key: key, state: "failed", workspace: { ...workspace, path } };
+    await writeFile(join(assignmentDirectory, "record.json"), JSON.stringify(record));
+    const before = await getOrchestrationStatus(fixture.repository, fixture.options);
+    assert.ok(before.legacy_namespaces.some((entry) => entry.pending_assignment_ids.includes(record.assignment_id)));
+    const command = (name, revision, extra = []) => runProcess(process.execPath, [
+      join(import.meta.dirname, "../.agents/skills/sol-luna-orchestration/scripts/orchestration-control.mjs"),
+      name, "--cwd", fixture.repository, "--assignment-id", record.assignment_id,
+      "--revision", String(revision), "--authority", "root", ...extra,
+    ], { ...fixture.options, cwd: fixture.repository, allowFailure: true });
+    const abandoned = await command("abandon", record.state_revision, ["--reason", "Resolve legacy assignment"]);
+    assert.equal(abandoned.exitCode, 0, abandoned.stdout.toString() + abandoned.stderr.toString());
+    record = await readAssignment(fixture.repository, record.assignment_id, fixture.options);
+    assert.equal(record.state, "abandoned");
+    assert.ok(record.workspace.archive_path.startsWith(legacyWorktrees));
+    const cleaned = await command("cleanup", record.state_revision);
+    assert.equal(cleaned.exitCode, 0, cleaned.stdout.toString() + cleaned.stderr.toString());
+    assert.equal((await readAssignment(fixture.repository, record.assignment_id, fixture.options)).workspace.cleaned, true);
+    assert.ok((await getOrchestrationStatus(fixture.repository, fixture.options)).legacy_namespaces.every((entry) => !entry.blocked));
+    await access(join(assignmentDirectory, "record.json"));
+    await runGit(["worktree", "remove", linked], { cwd: fixture.repository });
+    assert.equal((await readAssignment(fixture.repository, record.assignment_id, fixture.options)).state, "abandoned");
+    const next = await acquireUltraLock({ cwd: fixture.repository, reason: "After legacy recovery", sandboxMode: "read-only", ...fixture.options });
+    assert.equal(next.generation, 8);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("large candidate patches integrate every byte instead of a truncated suffix", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    let record = await createWriterAssignment(fixture);
+    const workspace = await createAssignmentWorktree(record, fixture.options);
+    record = { ...record, workspace };
+    const large = "candidate line\n".repeat(30_000);
+    await writeFile(join(workspace.path, "src", "value.txt"), large);
+    await writeFile(join(workspace.path, "src", "z-small.txt"), "small\n");
+    const created = await createCandidate(record, workspace.path, { ...fixture.options, reportedChangedFiles: ["src/value.txt", "src/z-small.txt"], checkResults: [] });
+    record = { ...record, candidate: created.candidate };
+    await integrateCandidate(record, fixture.repository, fixture.options);
+    const actual = await readFile(join(fixture.repository, "src", "value.txt"));
+    assert.equal(actual.length, Buffer.byteLength(large));
+    assert.equal(createHash("sha256").update(actual).digest("hex"), createHash("sha256").update(large).digest("hex"));
+    assert.equal(await readFile(join(fixture.repository, "src", "z-small.txt"), "utf8"), "small\n");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("legacy publication-only delivery can complete without creating another commit", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    const record = await prepareIntegratedCandidate(fixture, { mode: "commit", commit_message: "Publish once", remote: null, branch: null });
+    const delivered = await commitIntegratedCandidate(record, fixture.repository, fixture.options);
+    await runGit(["update-ref", "refs/heads/master", record.integration.target_revision_before], { cwd: fixture.repository });
+    await runGit(["reset", record.integration.target_revision_before, "--", ...record.candidate.changed_paths], { cwd: fixture.repository });
+    const retried = await commitIntegratedCandidate(record, fixture.repository, fixture.options);
+    assert.equal(retried.commit_revision, delivered.commit_revision);
+    assert.equal((await runGit(["rev-parse", "HEAD"], { cwd: fixture.repository })).stdoutText.trim(), delivered.commit_revision);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("Git output overflow rejects only after the child has closed", async () => {
+  let closed = false;
+  const promise = runGit(["diff"], { maxOutputBytes: 1024, spawnImplementation: () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { end() {} };
+    child.kill = () => queueMicrotask(() => { closed = true; child.emit("close", 1, "SIGTERM"); });
+    queueMicrotask(() => child.stdout.emit("data", Buffer.alloc(1025)));
+    return child;
+  } });
+  await assert.rejects(promise, (error) => error.code === "process-output-limit");
+  assert.equal(closed, true);
+});
+
+test("Git data keeps the complete boundary-sized output while diagnostics stay bounded", async () => {
+  const spawnImplementation = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { end() {} };
+    child.kill = () => {};
+    queueMicrotask(() => {
+      child.stdout.emit("data", Buffer.alloc(200_000, 65));
+      child.stderr.emit("data", Buffer.alloc(200_000, 66));
+      child.emit("close", 0, null);
+    });
+    return child;
+  };
+  const data = await runGit(["diff"], { maxOutputBytes: 200_000, spawnImplementation });
+  assert.equal(data.stdout.length, 200_000);
+  assert.equal(data.stderr.length, 131_072);
+  const diagnostics = await runProcess("check", [], { spawnImplementation });
+  assert.equal(diagnostics.stdout.length, 131_072);
+});
+
+test("failed ref transactions leave both branch and publication unchanged", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    const record = await prepareIntegratedCandidate(fixture, { mode: "commit", commit_message: "Atomic delivery", remote: null, branch: null });
+    const publication = `refs/codex-orchestration/deliveries/${record.assignment_id}/${record.attempt}`;
+    await assert.rejects(commitIntegratedCandidate(record, fixture.repository, {
+      ...fixture.options,
+      spawnImplementation: (command, args, options) => {
+        const child = spawn(command, args, options);
+        if (args.includes("update-ref") && args.includes("--stdin")) {
+          const end = child.stdin.end.bind(child.stdin);
+          child.stdin.end = (input) => end(String(input).replace(` ${record.integration.target_revision_before}\n`, ` ${"f".repeat(40)}\n`));
+        }
+        return child;
+      },
+    }), (error) => error.code === "publication-branch-diverged");
+    assert.equal((await runGit(["rev-parse", "HEAD"], { cwd: fixture.repository })).stdoutText.trim(), record.integration.target_revision_before);
+    assert.equal((await runGit(["rev-parse", "--verify", publication], { cwd: fixture.repository, allowFailure: true })).exitCode !== 0, true);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("publication retry preserves new staging and reconstructs a missing publication ref", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    const record = await prepareIntegratedCandidate(fixture, { mode: "commit", commit_message: "Preserve staging", remote: null, branch: null });
+    const delivered = await commitIntegratedCandidate(record, fixture.repository, fixture.options);
+    await writeFile(join(fixture.repository, "src", "value.txt"), "new staged work\n");
+    await runGit(["add", "src/value.txt"], { cwd: fixture.repository });
+    await assert.rejects(commitIntegratedCandidate(record, fixture.repository, fixture.options), (error) => error.code === "delivery-index-dirty");
+    assert.equal((await runGit(["show", ":src/value.txt"], { cwd: fixture.repository })).stdoutText, "new staged work\n");
+    await writeFile(join(fixture.repository, "src", "value.txt"), "candidate\n");
+    await runGit(["add", "src/value.txt"], { cwd: fixture.repository });
+    await runGit(["update-ref", "-d", delivered.publication_ref, delivered.commit_revision], { cwd: fixture.repository });
+    const repeated = await commitIntegratedCandidate(record, fixture.repository, fixture.options);
+    assert.equal(repeated.commit_revision, delivered.commit_revision);
+    assert.equal((await runGit(["rev-parse", delivered.publication_ref], { cwd: fixture.repository })).stdoutText.trim(), delivered.commit_revision);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("invalid CLI integration and cleanup leave Git and the controlled workspace untouched", async () => {
+  const fixture = await createRepositoryFixture();
+  const previous = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = fixture.options.environment.CODEX_HOME;
+  try {
+    let record = await createWriterAssignment(fixture);
+    const workspace = await createAssignmentWorktree(record, fixture.options);
+    record = (await dispatchAssignmentAction(fixture.repository, createAction({ op: "start_assignment", authority: "root", record, payload: { workspace } }), fixture.options)).record;
+    await assert.rejects(executeControlCommand({ command: "cleanup", cwd: fixture.repository, assignmentId: record.assignment_id, revision: record.state_revision, authority: "root" }), /cannot|state/i);
+    await access(workspace.path);
+    assert.equal((await readAssignment(fixture.repository, record.assignment_id, fixture.options)).state, "running");
+    await writeFile(join(workspace.path, "src", "value.txt"), "unapproved\n");
+    const created = await createCandidate(record, workspace.path, { ...fixture.options, reportedChangedFiles: ["src/value.txt"], checkResults: [] });
+    record = (await dispatchAssignmentAction(fixture.repository, createAction({ op: "publish_result", authority: "executor", record, payload: {
+      result: { status: "completed", summary: "Candidate", changed_files: ["src/value.txt"], checks: [], blockers: [], warnings: [] }, candidate: created.candidate, operator_requests: [],
+    } }), fixture.options)).record;
+    await assert.rejects(executeControlCommand({ command: "integrate", cwd: fixture.repository, assignmentId: record.assignment_id, revision: record.state_revision, authority: "root" }), /cannot run/);
+    assert.equal(await readFile(join(fixture.repository, "src", "value.txt"), "utf8"), "base\n");
+    assert.equal((await runGit(["status", "--porcelain"], { cwd: fixture.repository })).stdoutText, "");
+    assert.equal((await readAssignment(fixture.repository, record.assignment_id, fixture.options)).state, "result_ready");
+  } finally {
+    if (previous === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previous;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("candidate verification covers binary additions, renames, deletion and executable mode", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    let record = await createWriterAssignment(fixture);
+    const workspace = await createAssignmentWorktree(record, fixture.options);
+    record = { ...record, workspace };
+    await rename(join(workspace.path, "src", "value.txt"), join(workspace.path, "src", "moved.txt"));
+    const binary = Buffer.from([0, 255, 128, 13, 10, 0, 1]);
+    await writeFile(join(workspace.path, "src", "binary.dat"), binary);
+    if (process.platform !== "win32") await chmod(join(workspace.path, "src", "moved.txt"), 0o755);
+    const created = await createCandidate(record, workspace.path, { ...fixture.options, reportedChangedFiles: ["src/value.txt", "src/moved.txt", "src/binary.dat"], checkResults: [] });
+    record = { ...record, candidate: created.candidate };
+    await integrateCandidate(record, fixture.repository, fixture.options);
+    assert.deepEqual(await readFile(join(fixture.repository, "src", "binary.dat")), binary);
+    assert.equal(await readFile(join(fixture.repository, "src", "moved.txt"), "utf8"), "base\n");
+    await assert.rejects(access(join(fixture.repository, "src", "value.txt")), { code: "ENOENT" });
+    assert.equal((await integrateCandidate(record, fixture.repository, fixture.options)).idempotent, true);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("a partially applied candidate is rejected even when Git reports success", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    let record = await createWriterAssignment(fixture);
+    const workspace = await createAssignmentWorktree(record, fixture.options);
+    record = { ...record, workspace };
+    await writeFile(join(workspace.path, "src", "value.txt"), "candidate\n");
+    await writeFile(join(workspace.path, "src", "z-small.txt"), "small\n");
+    const created = await createCandidate(record, workspace.path, { ...fixture.options, reportedChangedFiles: ["src/value.txt", "src/z-small.txt"], checkResults: [] });
+    record = { ...record, candidate: created.candidate };
+    await assert.rejects(integrateCandidate(record, fixture.repository, {
+      ...fixture.options,
+      spawnImplementation: (command, args, options) => {
+        const child = spawn(command, args, options);
+        if (args.includes("apply") && !args.includes("--check")) {
+          const end = child.stdin.end.bind(child.stdin);
+          child.stdin.end = (input) => end(input.subarray(input.indexOf("diff --git a/src/z-small.txt")));
+        }
+        return child;
+      },
+    }), (error) => error.code === "candidate-workspace-mismatch");
+    assert.equal(await readFile(join(fixture.repository, "src", "value.txt"), "utf8"), "base\n");
+    await assert.rejects(integrateCandidate(record, fixture.repository, fixture.options), (error) => error.code === "integration-dirty-path");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
 });
 
 test("Git enables long paths per Windows command without changing other platforms", () => {

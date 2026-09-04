@@ -7,6 +7,7 @@ import {
   dispatchAssignmentAction,
   getControlPlaneStatus,
   readAssignment,
+  validateEffectRequest,
 } from "./control-plane.mjs";
 import { getExecutorProfile } from "./executor-profiles.mjs";
 import {
@@ -276,7 +277,6 @@ async function archiveRecord(record, authority) {
   ) {
     return record;
   }
-  const archivePath = await archiveAssignmentWorktree(record);
   return (
     await dispatchAssignmentAction(
       record.repository,
@@ -284,17 +284,13 @@ async function archiveRecord(record, authority) {
         op: "archive_workspace",
         authority,
         record,
-        payload: { archive_path: archivePath },
       }),
+      { beforeTransition: async (current) => ({ archive_path: await archiveAssignmentWorktree(current) }) },
     )
   ).record;
 }
 
 async function cleanupRecord(record, authority) {
-  const cleanup = await cleanupAssignmentWorktree(record);
-  if (!cleanup.cleaned) {
-    return record;
-  }
   return (
     await dispatchAssignmentAction(
       record.repository,
@@ -302,8 +298,12 @@ async function cleanupRecord(record, authority) {
         op: "cleanup_workspace",
         authority,
         record,
-        payload: { cleaned_path: cleanup.path },
       }),
+      { beforeTransition: async (current) => {
+        const cleanup = await cleanupAssignmentWorktree(current);
+        if (!cleanup.cleaned) throw new ControlCliError("Workspace was not cleaned.");
+        return { cleaned_path: cleanup.path };
+      } },
     )
   ).record;
 }
@@ -585,8 +585,9 @@ export async function executeControlCommand(options) {
   if (options.command === "retry") {
     let record = await readAssignment(options.cwd, options.assignmentId);
     assertExpectedRevision(record, options.revision);
-    record = await archiveRecord(record, options.authority);
     const repository = await inspectGitRepository(record.repository);
+    validateEffectRequest(record, createAction({ op: "retry_assignment", authority: options.authority, record, payload: { base_revision: repository.head } }));
+    record = await archiveRecord(record, options.authority);
     return (
       await dispatchAssignmentAction(
         record.repository,
@@ -602,6 +603,7 @@ export async function executeControlCommand(options) {
   if (options.command === "abandon") {
     let record = await readAssignment(options.cwd, options.assignmentId);
     assertExpectedRevision(record, options.revision);
+    validateEffectRequest(record, createAction({ op: "abandon_assignment", authority: options.authority, record, payload: { reason: options.reason } }));
     record = await archiveRecord(record, options.authority);
     return (
       await dispatchAssignmentAction(

@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -264,6 +264,8 @@ export async function verifyPlatform(options = {}, dependencies = {}) {
       codexHome,
       platform: platformCode,
     };
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(join(codexHome, "config.toml"), '"model" = "gpt-5.6-sol"\ndeveloper_instructions = """\n[agents]\nmax_threads = 99\n"""\n', "utf8");
     const first = await installer(installOptions);
     const second = await installer(installOptions);
     const canonicalSkill = join(

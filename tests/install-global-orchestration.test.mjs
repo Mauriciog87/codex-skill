@@ -25,11 +25,71 @@ import {
   installGlobalOrchestration,
   updateGlobalConfig,
   updateGlobalInstructions,
+  validateConfigUpdate,
 } from "../scripts/install-global-orchestration.mjs";
 
 const NEW_DISPLAY_NAME = "Sol-Luna Orchestration";
 const LEGACY_DISPLAY_NAME = "Sol-Sol Orchestration";
 const TERRA_LEGACY_DISPLAY_NAME = "Sol-Terra Orchestration";
+
+test("TOML editing preserves multiline strings and hook-looking text with quoted table names", () => {
+  const literal = `developer_instructions = '''\n[agents]\nmax_threads = 99\n${MANAGED_HOOKS_START}\n${MANAGED_HOOKS_END}\n'''\n`;
+  const original = `${literal}["agents"]\n'max_threads' = 2 # user note\n`;
+  const first = updateGlobalConfig(original, { hookScriptPath: join(tmpdir(), "gate.mjs") });
+  assert.ok(first.content.includes(literal));
+  assert.match(first.content, /max_threads = 4 # user note/);
+  assert.equal(updateGlobalConfig(first.content, { hookScriptPath: join(tmpdir(), "gate.mjs") }).changed, false);
+  for (const invalid of ['model="first"\n"model"="second"\n', 'agents = { max_threads = 2 }\n', 'agents.max_threads = 2\n', 'developer_instructions = """\nunfinished']) {
+    assert.throws(() => updateGlobalConfig(invalid), /duplicate|ambiguous|incomplete/);
+  }
+});
+
+test("config validation cleans its temporary HOME after parser rejection", async () => {
+  let temporaryHome;
+  let calls = 0;
+  await assert.rejects(validateConfigUpdate('model = "existing"\n', 'model = "proposed"\n', async ({ cwd, environment }) => {
+    calls += 1;
+    temporaryHome = cwd;
+    assert.equal(environment.HOME, join(cwd, "home"));
+    assert.equal(environment.CODEX_HOME, join(cwd, "home", ".codex"));
+    assert.equal(await readFile(join(environment.CODEX_HOME, "config.toml"), "utf8"), 'model = "existing"\n');
+    throw new Error("Native TOML parser rejected config");
+  }), /Native TOML parser/);
+  assert.equal(calls, 1);
+  await assert.rejects(lstat(temporaryHome), { code: "ENOENT" });
+});
+
+test("installer parser failures and effective-setting mismatches leave no partial installation", async (context) => {
+  for (const mode of ["parser", "effective"]) {
+    const fixture = await createFixture(context, `config-${mode}-failure-`);
+    const originalConfig = await readFile(fixture.configPath, "utf8");
+    const originalInstructions = await readFile(fixture.agentsPath, "utf8");
+    const originalHooks = await readFile(fixture.hooksPath);
+    await assert.rejects(installGlobalOrchestration({
+      repositoryRoot: fixture.repositoryRoot, homeDirectory: fixture.homeDirectory, codexHome: fixture.codexHome,
+      configReader: async () => { if (mode === "parser") throw new Error("Parser unavailable"); return {}; },
+    }), /Parser unavailable|did not confirm/);
+    assert.equal(await readFile(fixture.configPath, "utf8"), originalConfig);
+    assert.equal(await readFile(fixture.agentsPath, "utf8"), originalInstructions);
+    assert.deepEqual(await readFile(fixture.hooksPath), originalHooks);
+    await assert.rejects(lstat(join(fixture.homeDirectory, ".agents", "skills", SKILL_NAME)), { code: "ENOENT" });
+    await assert.rejects(lstat(fixture.deliveryConfigPath), { code: "ENOENT" });
+  }
+});
+
+test("quoted managed keys are updated without adding a duplicate definition", () => {
+  const updated = updateGlobalConfig('"model" = "gpt-5.6-sol"\n');
+  assert.equal(updated.content.split(/\r?\n/).filter((line) => /^(?:"model"|model)\s*=/.test(line)).length, 1);
+  assert.equal(updateGlobalConfig(updated.content).changed, false);
+});
+
+test("table-like lines inside multiline instructions remain literal text", () => {
+  const instructions = 'developer_instructions = """\n[agents]\nmax_threads = 99\n"""\n';
+  const updated = updateGlobalConfig(instructions);
+  assert.ok(updated.content.includes(instructions));
+  assert.match(updated.content.slice(updated.content.indexOf('"""\n') + 4), /"""\n[\s\S]*max_threads = 4/);
+  assert.equal(updateGlobalConfig(updated.content).changed, false);
+});
 
 test("skill link selection is explicit for every supported platform", () => {
   assert.equal(getSkillLinkType("win32"), "junction");
