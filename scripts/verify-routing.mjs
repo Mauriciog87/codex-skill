@@ -31,6 +31,7 @@ import {
 } from "../.agents/skills/sol-luna-orchestration/scripts/git-workspace.mjs";
 import {
   MINIMUM_CODEX_VERSION,
+  readCodexConfig,
   runAppServerTurn,
 } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
 import { EXECUTOR_PROFILES } from "../.agents/skills/sol-luna-orchestration/scripts/executor-profiles.mjs";
@@ -63,9 +64,11 @@ import {
   writeJsonOutput,
 } from "./platform-runtime.mjs";
 
-export const ORCHESTRATOR_MODEL = "gpt-5.6-sol";
-export const ORCHESTRATOR_REASONING_EFFORT = "xhigh";
-export const ORCHESTRATOR_SERVICE_TIER = "standard";
+import { ROOT_CONFIG_VALUES, ROOT_POLICY } from "../.agents/skills/sol-luna-orchestration/scripts/model-policy.mjs";
+
+export const ORCHESTRATOR_MODEL = ROOT_POLICY.model;
+export const ORCHESTRATOR_REASONING_EFFORT = ROOT_POLICY.reasoningEffort;
+export const ORCHESTRATOR_SERVICE_TIER = ROOT_POLICY.serviceTier;
 
 const execFileAsync = promisify(execFile);
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
@@ -160,16 +163,13 @@ async function verifySkillDiscovery(repositoryRoot) {
     throw new Error("The global skill link does not target the repository skill.");
   }
 
-  const projectConfig = await readFile(join(repositoryRoot, ".codex", "config.toml"), "utf8");
-  if (updateGlobalConfig(projectConfig).changed) {
-    throw new Error("The repository Codex configuration does not enforce Sol xhigh with low verbosity.");
-  }
+  verifyRootConfiguration(await readCodexConfig({ cwd: repositoryRoot }), "Repository");
   const globalConfigPath = join(codexHome, "config.toml");
   const globalConfig = await readFile(globalConfigPath, "utf8");
   const globalHookScript = join(globalSkill, "scripts", "orchestration-gate.mjs");
   if (updateGlobalConfig(globalConfig, { hookScriptPath: globalHookScript }).changed) {
     throw new Error(
-      "The global Codex configuration does not enforce Sol xhigh, low verbosity, and hooks.",
+      "The global Codex configuration does not enforce Astra high, low verbosity, and hooks.",
     );
   }
   const deliveryConfiguration = await readDeliveryConfiguration({ codexHome });
@@ -178,7 +178,7 @@ async function verifySkillDiscovery(repositoryRoot) {
   }
   const globalInstructions = await activeGlobalInstructions(codexHome);
   if (updateGlobalInstructions(globalInstructions.content).changed) {
-    throw new Error("The active global instructions do not contain the managed Sol-Luna block.");
+    throw new Error("The active global instructions do not contain the managed Astra-Luna block.");
   }
 
   const legacyPaths = [
@@ -365,25 +365,43 @@ function validateRootProbePayload(value) {
     || payload.warnings.length !== 0
     || payload.operator_requests.length !== 0
   ) {
-    throw new Error("The Sol routing probe returned an unexpected structured result.");
+    throw new Error("The Astra routing probe returned an unexpected structured result.");
   }
   return payload;
 }
 
-async function runGlobalRootProbe(sessionRoots, outputContract) {
+export function verifyRootConfiguration(effectiveConfig, scope = "Global") {
+  const configuration = {};
+  for (const [key, expected] of Object.entries(ROOT_CONFIG_VALUES)) {
+    const actual = effectiveConfig?.[key];
+    if (actual !== expected) {
+      throw new Error(`${scope} root configuration did not confirm ${key}: expected ${expected}, observed ${actual ?? "missing"}.`);
+    }
+    configuration[key] = actual;
+  }
+  return configuration;
+}
+
+export async function runGlobalRootProbe(sessionRoots, outputContract, {
+  configReader = readCodexConfig,
+  appServerRunner = runAppServerTurn,
+  routingVerifier = verifySessionRouting,
+} = {}) {
   const temporaryRepository = await mkdtemp(join(tmpdir(), "sol-luna-global-probe-"));
   try {
     await execFileAsync("git", ["init", "--quiet"], {
       cwd: temporaryRepository,
       windowsHide: true,
     });
+    const effectiveConfig = await configReader({ cwd: temporaryRepository });
+    const configuration = verifyRootConfiguration(effectiveConfig);
     const developerInstructions = [
       "CODEX_ORCHESTRATION_PROBE=orchestrator",
-      "This session exists only to record global default routing metadata.",
+      "This session exists only to verify negotiated root routing after the global defaults were checked separately.",
       "Do not invoke skills, delegate, inspect files, modify files, or run tools.",
       "Answer the prompt directly and stop.",
     ].join("\n");
-    const rootProcess = await runAppServerTurn({
+    const rootProcess = await appServerRunner({
       command: "codex",
       cwd: temporaryRepository,
       model: ORCHESTRATOR_MODEL,
@@ -393,18 +411,18 @@ async function runGlobalRootProbe(sessionRoots, outputContract) {
       fastMode: false,
       sandboxMode: "read-only",
       developerInstructions,
-      briefing: "Return status completed, summary Sol routing probe completed, and empty changed_files, checks, blockers, warnings, and operator_requests arrays.",
+      briefing: "Return status completed, summary Astra routing probe completed, and empty changed_files, checks, blockers, warnings, and operator_requests arrays.",
       outputSchema: outputContract.schema,
       timeoutMs: 300_000,
     });
     if (rootProcess.threadId === null) {
-      throw new Error("The Sol routing probe did not return a thread id.");
+      throw new Error("The Astra routing probe did not return a thread id.");
     }
     if (rootProcess.turnStatus !== "completed" || rootProcess.blockedReason !== null) {
-      throw new Error("The Sol routing probe did not complete through App Server.");
+      throw new Error("The Astra routing probe did not complete through App Server.");
     }
     const payload = validateRootProbePayload(JSON.parse(rootProcess.finalResponse));
-    const routing = await verifySessionRouting(
+    const routing = await routingVerifier(
       rootProcess.threadId,
       ORCHESTRATOR_MODEL,
       ORCHESTRATOR_REASONING_EFFORT,
@@ -412,6 +430,7 @@ async function runGlobalRootProbe(sessionRoots, outputContract) {
     );
     return {
       threadId: rootProcess.threadId,
+      configuration,
       routing: { ...routing, serviceTier: rootProcess.serviceTier },
       payload,
     };
@@ -570,7 +589,7 @@ async function createWriteProbeRepository() {
     "git",
     [
       "-c",
-      "user.name=Sol-Sol Probe",
+      "user.name=Orchestration Probe",
       "-c",
         "user.email=sol-luna-probe@example.invalid",
       "commit",
@@ -703,6 +722,7 @@ async function runWriteProfileProbe(repository, sessionRoots, profileName) {
         allowSymlinks: false,
         allowSubmodules: false,
         candidateId: null,
+        deliveryMode: "manual",
         resultFormat: "v2",
       },
       invokeLegacy: invokeExecutor,
@@ -763,7 +783,7 @@ async function runReviewProbe(repository, sessionRoots) {
   });
   verifyExecutorResultSchema(executor.result);
   if (executor.exitCode !== 0) {
-    throw new Error(`The Sol review probe failed: ${executor.result.summary}`);
+    throw new Error(`The review probe failed: ${executor.result.summary}`);
   }
   verifyProfileRouting(executor.result, "review");
   const afterStatus = await gitStatus(repository);
@@ -773,7 +793,7 @@ async function runReviewProbe(repository, sessionRoots) {
     executor.result.checks.length === 0 ||
     afterStatus !== beforeStatus
   ) {
-    throw new Error("The Sol review probe did not prove bounded read-only review behavior.");
+    throw new Error("The review probe did not prove bounded read-only review behavior.");
   }
   return executor.result;
 }
@@ -782,7 +802,7 @@ async function runPlaywrightProbe(repositoryRoot, sessionRoots) {
   const server = createServer((_request, response) => {
     response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     response.end(
-      "<!doctype html><html><body><h1>Sol-Luna Playwright probe</h1><button id=action onclick=\"document.querySelector('#status').textContent='verified'\">Run check</button><p id=status>pending</p></body></html>",
+      "<!doctype html><html><body><h1>Astra-Luna Playwright probe</h1><button id=action onclick=\"document.querySelector('#status').textContent='verified'\">Run check</button><p id=status>pending</p></body></html>",
     );
   });
   server.listen(0, "127.0.0.1");
@@ -794,7 +814,7 @@ async function runPlaywrightProbe(repositoryRoot, sessionRoots) {
     const executor = await invokeExecutor({
       briefing: [
         `Use the Playwright MCP to open ${url}`,
-        "Verify the h1 text is Sol-Luna Playwright probe, click #action, verify #status becomes verified, and take one screenshot.",
+        "Verify the h1 text is Astra-Luna Playwright probe, click #action, verify #status becomes verified, and take one screenshot.",
         "Do not modify repository files. Return completed, no changed files, at least two concise evidence checks, and no blockers or warnings.",
       ].join("\n"),
       options: {
@@ -864,7 +884,7 @@ async function runLockedExecutorProbe(sessionRoots) {
     if (
       executor.exitCode !== 2 ||
       executor.result.routing_verified !== false ||
-      !executor.result.summary.includes("exclusive Sol Ultra takeover")
+      !executor.result.summary.includes("exclusive Ultra takeover")
     ) {
       throw new Error("A normal executor was not rejected by the active Ultra lock.");
     }
@@ -883,7 +903,7 @@ async function runUltraReadOnlyProbe(repositoryRoot, sessionRoots) {
   const execution = await invokeUltra({
     briefing: [
       "Complete this routing probe without delegating or modifying files.",
-      "Return status completed, summary Sol Ultra read-only probe completed, no changed files, checks containing exactly ultra_read_only:passed, and no blockers or warnings.",
+      "Return status completed, summary Ultra read-only probe completed, no changed files, checks containing exactly ultra_read_only:passed, and no blockers or warnings.",
     ].join("\n"),
     options: {
       cwd: repositoryRoot,
@@ -896,7 +916,7 @@ async function runUltraReadOnlyProbe(repositoryRoot, sessionRoots) {
   });
   verifyUltraResultSchema(execution.result);
   if (execution.exitCode !== 0) {
-    throw new Error(`The Sol Ultra read-only probe failed: ${execution.result.summary}`);
+    throw new Error(`The Ultra read-only probe failed: ${execution.result.summary}`);
   }
   verifyUltraRouting(execution.result, "read-only");
   if (
@@ -904,7 +924,7 @@ async function runUltraReadOnlyProbe(repositoryRoot, sessionRoots) {
     JSON.stringify(execution.result.checks) !== JSON.stringify(["ultra_read_only:passed"]) ||
     execution.result.executors.length !== 0
   ) {
-    throw new Error("The Sol Ultra read-only probe returned an unexpected result.");
+    throw new Error("The Ultra read-only probe returned an unexpected result.");
   }
   return execution.result;
 }
@@ -919,7 +939,7 @@ async function runUltraWriteProbe(sessionRoots) {
       "git",
       [
         "-c",
-        "user.name=Sol-Ultra Probe",
+        "user.name=Ultra Probe",
         "-c",
         "user.email=sol-ultra-probe@example.invalid",
         "commit",
@@ -932,10 +952,10 @@ async function runUltraWriteProbe(sessionRoots) {
     const execution = await invokeUltra({
       briefing: [
         "Delegate exactly one task through the verified implement profile and do not edit files yourself.",
-        "Launch it through the durable version 2 control plane with workspace-write and --write-root ultra-probe.txt.",
+        "Launch it through the durable version 2 control plane with workspace-write, --write-root ultra-probe.txt, and --delivery manual. Do not commit or push.",
         "Assign only ultra-probe.txt in this temporary repository. The implement executor must create it with exactly verified Ultra implement profile followed by one newline and run git diff --check.",
         "After it publishes a candidate, refresh the exact assignment revision before each control action, then claim, approve as root, integrate, acknowledge, and clean its isolated worktree.",
-        "After the verified executor succeeds, return status completed, summary Sol Ultra implement delegation probe completed, changed_files containing exactly ultra-probe.txt, checks containing exactly ultra_implement_delegation:passed, and no blockers or warnings.",
+        "After the verified executor succeeds, return status completed, summary Ultra implement delegation probe completed, changed_files containing exactly ultra-probe.txt, checks containing exactly ultra_implement_delegation:passed, and no blockers or warnings.",
       ].join("\n"),
       options: {
         cwd: repository,
@@ -948,7 +968,7 @@ async function runUltraWriteProbe(sessionRoots) {
     });
     verifyUltraResultSchema(execution.result);
     if (execution.exitCode !== 0) {
-      throw new Error(`The Sol Ultra workspace-write probe failed: ${execution.result.summary}`);
+      throw new Error(`The Ultra workspace-write probe failed: ${execution.result.summary}`);
     }
     verifyUltraRouting(execution.result, "workspace-write");
     const content = (await readFile(join(repository, "ultra-probe.txt"), "utf8")).replace(
@@ -964,7 +984,7 @@ async function runUltraWriteProbe(sessionRoots) {
       execution.result.executors[0].profile !== "implement" ||
       execution.result.executors[0].routing_verified !== true
     ) {
-      throw new Error("The Sol Ultra workspace-write probe did not verify delegated execution.");
+      throw new Error("The Ultra workspace-write probe did not verify delegated execution.");
     }
     return execution.result;
   } finally {
@@ -997,21 +1017,21 @@ async function runTimeoutRecoveryProbe() {
       },
     );
     if (processResult.exitCode !== 2) {
-      throw new Error("The Sol Ultra timeout probe did not exit with code 2.");
+      throw new Error("The Ultra timeout probe did not exit with code 2.");
     }
     const launcherResult = JSON.parse(processResult.stdout.split(/\r?\n/).at(-1));
     if (!launcherResult.summary.includes("timed out")) {
-      throw new Error(`The Sol Ultra timeout probe failed unexpectedly: ${launcherResult.summary}`);
+      throw new Error(`The Ultra timeout probe failed unexpectedly: ${launcherResult.summary}`);
     }
     const status = await getOrchestrationStatus(repository);
     if (status.lock?.state !== "recovery-required") {
-      throw new Error("The Sol Ultra timeout probe did not require recovery.");
+      throw new Error("The Ultra timeout probe did not require recovery.");
     }
     if (
       launcherResult.lock_id !== status.lock.lock_id ||
       launcherResult.generation !== status.lock.generation
     ) {
-      throw new Error("The Sol Ultra timeout result did not preserve its fenced lock generation.");
+      throw new Error("The Ultra timeout result did not preserve its fenced lock generation.");
     }
     const { stdout } = await execFileAsync(
       process.execPath,
@@ -1027,10 +1047,10 @@ async function runTimeoutRecoveryProbe() {
     );
     const recovery = JSON.parse(stdout);
     if (recovery.status !== "recovered") {
-      throw new Error("The Sol Ultra timeout lock was not recovered through the gate.");
+      throw new Error("The Ultra timeout lock was not recovered through the gate.");
     }
     if ((await getOrchestrationStatus(repository)).lock !== null) {
-      throw new Error("The recovered Sol Ultra lock still exists.");
+      throw new Error("The recovered Ultra lock still exists.");
     }
     return { status: "recovered", lock_id: status.lock.lock_id };
   } finally {
@@ -1154,7 +1174,7 @@ async function runCapacityProbe() {
       saturated.capacity.repository.sol !== EXECUTOR_CAPACITY_LIMITS.sol ||
       saturated.capacity.machine.total !== EXECUTOR_CAPACITY_LIMITS.total
     ) {
-      throw new Error("Executor capacity did not reach the configured Luna, Sol, and total limits.");
+      throw new Error("Executor capacity did not reach the configured Luna, Astra, and total limits.");
     }
     return {
       luna_limit: EXECUTOR_CAPACITY_LIMITS.luna,
@@ -1213,6 +1233,7 @@ export async function verifyRouting(repositoryRoot = REPOSITORY_ROOT) {
     codex_version: codexVersion,
     root: {
       thread_id: rootProbe.threadId,
+      configuration: rootProbe.configuration,
       model: rootProbe.routing.model,
       reasoning_effort: rootProbe.routing.reasoningEffort,
       service_tier: rootProbe.routing.serviceTier,

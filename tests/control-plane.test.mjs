@@ -186,7 +186,7 @@ test("workspace removal fails before effects while an associated executor is liv
   try {
     let record = await createAssignment({ cwd: fixture.repository, request: request(), briefing: "Wait for executor shutdown.", ...fixture.options });
     record = await transition(fixture, record, "start_assignment", "root", { workspace: { path: join(fixture.root, "worktree") } });
-    await beginExecutorRun({ cwd: fixture.repository, profile: "implement", model: "gpt-5.6-sol", ...fixture.options, environment: { ...fixture.options.environment, CODEX_ORCHESTRATION_ASSIGNMENT_ID: record.assignment_id } });
+    await beginExecutorRun({ cwd: fixture.repository, profile: "implement", model: "gpt-6-astra", ...fixture.options, environment: { ...fixture.options.environment, CODEX_ORCHESTRATION_ASSIGNMENT_ID: record.assignment_id } });
     record = await transition(fixture, record, "mark_recovery_required", "root", { reason: "Interrupted run" });
     const state = await getRepositoryState(fixture.repository, fixture.options);
     const runPath = join(state.runsDirectory, (await readdir(state.runsDirectory))[0]);

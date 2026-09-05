@@ -13,6 +13,7 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { resolveRepositoryIdentity } from "./repository-identity.mjs";
+import { ADVANCED_MODEL, ADVANCED_EXECUTOR_POOL, ULTRA_POLICY } from "./model-policy.mjs";
 import {
   ProcessIdentityError,
   createProcessIdentity,
@@ -25,11 +26,10 @@ export const ORCHESTRATION_LOCK_ENV = "CODEX_ORCHESTRATION_LOCK_ID";
 export const ORCHESTRATION_GENERATION_ENV = "CODEX_ORCHESTRATION_GENERATION";
 export const ORCHESTRATION_ROLE_ENV = "CODEX_ORCHESTRATION_ROLE";
 export const ULTRA_ORCHESTRATOR_ROLE = "ultra-orchestrator";
-export const ULTRA_MODEL = "gpt-5.6-sol";
-export const ULTRA_REASONING_EFFORT = "ultra";
-export const ULTRA_SERVICE_TIER = "standard";
-export const ULTRA_CONFIGURED_SERVICE_TIER = "default";
-export const SOL_MODEL_VERBOSITY = "low";
+export const ULTRA_MODEL = ULTRA_POLICY.model;
+export const ULTRA_REASONING_EFFORT = ULTRA_POLICY.reasoningEffort;
+export const ULTRA_SERVICE_TIER = ULTRA_POLICY.serviceTier;
+export const ULTRA_CONFIGURED_SERVICE_TIER = ULTRA_POLICY.configuredServiceTier;
 export const ORCHESTRATION_STATE_VERSION = 2;
 export const HISTORY_RETENTION_LIMIT = 1_000;
 
@@ -788,8 +788,8 @@ function requireExecutorPool(model) {
   if (model === "gpt-5.6-luna") {
     return "luna";
   }
-  if (model === "gpt-5.6-sol") {
-    return "sol";
+  if (model === ADVANCED_MODEL) {
+    return ADVANCED_EXECUTOR_POOL;
   }
   throw new OrchestrationStateError(`Unsupported executor model for capacity routing: ${model}.`);
 }
@@ -1072,7 +1072,7 @@ export async function beginExecutorRun({
           const detail = inheritedLockId === lock.lock_id && inheritedGeneration !== lock.generation
             ? " The inherited generation does not match."
             : "";
-          throw new OrchestrationStateError(`Repository is locked by an exclusive Sol Ultra takeover in state ${lock.state}.${detail}`, {
+          throw new OrchestrationStateError(`Repository is locked by an exclusive Ultra takeover in state ${lock.state}.${detail}`, {
             lockId: lock.lock_id,
             generation: lock.generation,
           });

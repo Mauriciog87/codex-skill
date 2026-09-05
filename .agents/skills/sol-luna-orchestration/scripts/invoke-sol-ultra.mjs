@@ -2,6 +2,7 @@ import { stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getExecutorProfile } from "./executor-profiles.mjs";
+import { MODEL_VERBOSITY } from "./model-policy.mjs";
 import { assertEpochAssignmentsComplete } from "./control-plane.mjs";
 import {
   RoutingVerificationError,
@@ -23,7 +24,6 @@ import {
   ORCHESTRATION_GENERATION_ENV,
   ORCHESTRATION_LOCK_ENV,
   ORCHESTRATION_ROLE_ENV,
-  SOL_MODEL_VERBOSITY,
   ULTRA_MODEL,
   ULTRA_CONFIGURED_SERVICE_TIER,
   ULTRA_ORCHESTRATOR_ROLE,
@@ -130,7 +130,7 @@ export function parseUltraArguments(argv, baseDirectory = process.cwd()) {
       parsed.reason = value.trim();
     } else if (option === "--sandbox") {
       if (value === "danger-full-access") {
-        throw new UltraInvocationError("danger-full-access is prohibited for Sol Ultra takeover.");
+        throw new UltraInvocationError("danger-full-access is prohibited for Ultra takeover.");
       }
       if (!["read-only", "workspace-write"].includes(value)) {
         throw new UltraInvocationError("--sandbox must be read-only or workspace-write.");
@@ -160,11 +160,11 @@ export function createUltraDeveloperInstructions(lockId, generation) {
     `CODEX_ORCHESTRATION_ROLE=${ULTRA_ORCHESTRATOR_ROLE}`,
     `CODEX_ORCHESTRATION_LOCK_ID=${lockId}`,
     `CODEX_ORCHESTRATION_GENERATION=${generation}`,
-    "Act as the exclusive GPT-5.6 Sol Ultra root orchestrator for the supplied briefing.",
+    `Act as the exclusive ${ULTRA_MODEL} Ultra root orchestrator for the supplied briefing.`,
     "Own planning, bounded delegation, integration, verification, and the terminal result while the repository lock is active.",
     "Do not use native spawn_agent or any native multi-agent tool and do not start another Ultra takeover.",
     `Delegate only through node ${JSON.stringify(EXECUTOR_LAUNCHER_PATH)} --profile explore|implement-lite|playwright|implement|review with a bounded briefing on stdin.`,
-    "Use only useful independent executor scopes, respect the verified Luna and Sol capacity pools, and never overlap write roots.",
+    "Use only useful independent executor scopes, respect the verified Luna and advanced capacity pools, and never overlap write roots.",
     "Use read-only executors by default. Every implement-lite or implement assignment requires workspace-write plus at least one explicit --write-root and runs in a controller-created isolated worktree.",
     `Use node ${JSON.stringify(resolve(SCRIPT_DIRECTORY, "orchestration-control.mjs"))} to claim, review, approve, integrate, complete explicit delivery, acknowledge, archive, retry, abandon, and clean durable assignments with exact state revisions.`,
     "New writer assignments follow the configured automatic-delivery default. An explicit user boundary against commits or pushes takes precedence, so pass --delivery manual for that assignment. Explicit commit or push overrides still require the exact message and destination. The controller never force-pushes.",
@@ -180,7 +180,7 @@ export function buildUltraAppServerArguments() {
   return buildAppServerArguments({
     fastMode: false,
     configuredServiceTier: ULTRA_CONFIGURED_SERVICE_TIER,
-    modelVerbosity: SOL_MODEL_VERBOSITY,
+    modelVerbosity: MODEL_VERBOSITY,
   });
 }
 
@@ -371,7 +371,7 @@ export async function invokeUltra({
       });
     }
     if (threadId === null) {
-      throw new UltraInvocationError("App Server did not return a thread id for Sol Ultra takeover.");
+      throw new UltraInvocationError("App Server did not return a thread id for Ultra takeover.");
     }
     if (
       actualModel !== ULTRA_MODEL ||

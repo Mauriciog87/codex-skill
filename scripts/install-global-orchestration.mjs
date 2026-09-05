@@ -20,9 +20,9 @@ import { readCodexConfig } from "../.agents/skills/sol-luna-orchestration/script
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  SOL_MODEL_VERBOSITY,
   getCodexHome,
 } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
+import { ROOT_CONFIG_VALUES } from "../.agents/skills/sol-luna-orchestration/scripts/model-policy.mjs";
 import {
   DEFAULT_DELIVERY_CONFIGURATION_CONTENT,
   getDeliveryConfigurationPath,
@@ -41,7 +41,7 @@ export const MANAGED_BLOCK_END = "<!-- sol-luna-orchestration:end -->";
 export const MANAGED_HOOKS_START = "# sol-luna-orchestration:hooks:start";
 export const MANAGED_HOOKS_END = "# sol-luna-orchestration:hooks:end";
 
-const SKILL_DISPLAY_NAME = "Sol-Luna Orchestration";
+const SKILL_DISPLAY_NAME = "Astra-Luna Orchestration";
 const LEGACY_SKILL_DISPLAY_NAME = "Sol-Sol Orchestration";
 const TERRA_LEGACY_SKILL_DISPLAY_NAME = "Sol-Terra Orchestration";
 const LEGACY_MANAGED_BLOCK_START = "<!-- sol-sol-orchestration:start -->";
@@ -222,7 +222,7 @@ function managedHooksLines(hookScriptPath) {
     `command = ${serializedCommand}`,
     `command_windows = ${serializedCommand}`,
     "timeout = 10",
-    'statusMessage = "Checking exclusive Sol-Luna Ultra state"',
+    'statusMessage = "Checking exclusive Astra-Luna Ultra state"',
     "",
     "[[hooks.PreToolUse]]",
     'matcher = "^(Bash|Shell|shell|local_shell|shell_command|exec_command|unified_exec|apply_patch|Edit|Write|mcp__.*)$"',
@@ -232,7 +232,7 @@ function managedHooksLines(hookScriptPath) {
     `command = ${serializedCommand}`,
     `command_windows = ${serializedCommand}`,
     "timeout = 10",
-    'statusMessage = "Enforcing exclusive Sol-Luna Ultra state"',
+    'statusMessage = "Enforcing exclusive Astra-Luna Ultra state"',
     MANAGED_HOOKS_END,
   ];
 }
@@ -261,10 +261,10 @@ function updateManagedHooks(lines, hookScriptPath) {
     }
   }
   if (starts.length !== ends.length || starts.length > 1) {
-    throw new Error("Global config contains malformed Sol-Luna hook markers.");
+    throw new Error("Global config contains malformed Astra-Luna hook markers.");
   }
   if (starts.length === 1 && starts[0] >= ends[0]) {
-    throw new Error("Global config contains malformed Sol-Luna hook markers.");
+    throw new Error("Global config contains malformed Astra-Luna hook markers.");
   }
   const block = managedHooksLines(hookScriptPath);
   if (starts.length === 1) {
@@ -283,13 +283,7 @@ function updateManagedHooks(lines, hookScriptPath) {
 export function updateGlobalConfig(content, { hookScriptPath = null } = {}) {
   const original = content ?? "";
   const shape = textShape(content);
-  setTopLevelValues(shape.lines, {
-    model: "gpt-5.6-sol",
-    model_reasoning_effort: "xhigh",
-    model_verbosity: SOL_MODEL_VERBOSITY,
-    service_tier: "default",
-    plan_mode_reasoning_effort: "xhigh",
-  });
+  setTopLevelValues(shape.lines, ROOT_CONFIG_VALUES);
   setAgentsValues(shape.lines, { max_depth: 1, max_threads: 4 });
   setFeaturesValues(shape.lines, { fast_mode: false });
   setPlaywrightMcpValues(shape.lines);
@@ -305,15 +299,15 @@ export function updateGlobalConfig(content, { hookScriptPath = null } = {}) {
 function managedBlockLines() {
   return [
     MANAGED_BLOCK_START,
-    "# Global Sol-Luna orchestration",
+    "# Global Astra-Luna orchestration",
     "",
-    "For every new substantive root task, explicitly invoke `$sol-luna-orchestration` before planning, delegating, or editing. The root uses Sol/xhigh/Standard. Verified executors use the profile registry; Luna has capacity 10, Sol has capacity 4, and Playwright has a global sublimit of 2. Capacity is not a fan-out target.",
+    "For every new substantive root task, explicitly invoke `$sol-luna-orchestration` before planning, delegating, or editing. The root uses Astra/high/Standard. Verified executors use the profile registry; Luna has capacity 10, Astra has capacity 4, and Playwright has a global sublimit of 2. Capacity is not a fan-out target.",
     "",
     "Rebases, merges, cherry-picks, reverts, and conflict resolution stay with the root. Loading the skill does not make delegation mandatory. Check the current checkout, working tree, linked worktrees, upstream, and refs; fetch the latest remote refs; then run the Git operation and work from the conflicts it actually reports. Do not ask `explore` to scan commits and guess what might conflict. After Git stops on a real conflict, `explore` may answer one focused question about those files, once. The root still makes the edit. If that run stalls or fails, do not repeat the same request. Stop and ask the operator when the checkout is dirty, another Git operation is in progress, or the target branch is checked out in another worktree. This does not change who may push or force-push.",
     "",
-    "Writer profiles keep `workspace-write` sandboxing and run only in controller-created isolated worktrees with explicit write roots. Results become immutable candidates; root or Ultra owns review, approval, integration, delivery, acknowledgement, and cleanup. New writer assignments use automatic delivery by default: the controller commits only the validated candidate and pushes only to the matching configured upstream branch without force. Set `automatic_delivery` to `false` in the Sol-Luna configuration file to opt out, or use an explicit `--delivery` mode for one assignment. A delivery failure stops in `delivery_blocked` until an explicit retry. Never fall back to a writable shared checkout.",
+    "Writer profiles keep `workspace-write` sandboxing and run only in controller-created isolated worktrees with explicit write roots. Results become immutable candidates; root or Ultra owns review, approval, integration, delivery, acknowledgement, and cleanup. New writer assignments use automatic delivery by default: the controller commits only the validated candidate and pushes only to the matching configured upstream branch without force. Set `automatic_delivery` to `false` in the Astra-Luna configuration file to opt out, or use an explicit `--delivery` mode for one assignment. A delivery failure stops in `delivery_blocked` until an explicit retry. Never fall back to a writable shared checkout.",
     "",
-    "A human-confirmed Sol Ultra takeover owns its repository exclusively while its lock is active. Other root sessions must pause, and only executors carrying the matching `CODEX_ORCHESTRATION_LOCK_ID` and `CODEX_ORCHESTRATION_GENERATION` may run. Recovery fails closed while a registered process is live or unknown. Never remove lock state manually; inspect history or recover it through the orchestration gate.",
+    "A human-confirmed Ultra takeover owns its repository exclusively while its lock is active. Other root sessions must pause, and only executors carrying the matching `CODEX_ORCHESTRATION_LOCK_ID` and `CODEX_ORCHESTRATION_GENERATION` may run. Recovery fails closed while a registered process is live or unknown. Never remove lock state manually; inspect history or recover it through the orchestration gate.",
     MANAGED_BLOCK_END,
   ];
 }
@@ -341,10 +335,10 @@ export function updateGlobalInstructions(content) {
     }
   }
   if (starts.length !== ends.length || starts.length > 1) {
-    throw new Error("Global instructions contain malformed Sol-Luna managed markers.");
+    throw new Error("Global instructions contain malformed Astra-Luna managed markers.");
   }
   if (starts.length === 1 && starts[0] >= ends[0]) {
-    throw new Error("Global instructions contain malformed Sol-Luna managed markers.");
+    throw new Error("Global instructions contain malformed Astra-Luna managed markers.");
   }
 
   const unmanagedLines = [...shape.lines];
@@ -451,7 +445,7 @@ export async function validateConfigUpdate(original, proposed, configReader = re
       if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("Codex config/read returned no configuration.");
       if (verifyManaged) {
         const expected = {
-          model: "gpt-5.6-sol", model_reasoning_effort: "xhigh", model_verbosity: "low", service_tier: "default", plan_mode_reasoning_effort: "xhigh",
+          ...ROOT_CONFIG_VALUES,
           "agents.max_depth": 1, "agents.max_threads": 4, "features.fast_mode": false, "features.hooks": true,
           "mcp_servers.playwright.enabled": true, "mcp_servers.playwright.command": PLAYWRIGHT_MCP_COMMAND, "mcp_servers.playwright.args": PLAYWRIGHT_MCP_ARGUMENTS,
         };

@@ -151,7 +151,7 @@ export async function evaluateHook(
   try {
     lock = await readLock(input.cwd, { environment });
   } catch (error) {
-    const reason = `Sol-Luna Ultra orchestration state is invalid and requires manual recovery: ${error.message}`;
+    const reason = `Astra-Luna Ultra orchestration state is invalid and requires manual recovery: ${error.message}`;
     return input.hook_event_name === "PreToolUse"
       ? blockedPreToolUse(reason)
       : sessionContext(reason);
@@ -179,16 +179,16 @@ export async function evaluateHook(
     return sessionContext(
       ownsLock
         ? legacy
-          ? `This session owns legacy-unfenced Sol Ultra takeover ${lock.lock_id} for ${lock.repository}. Drain it without starting new executors.`
-          : `This session owns exclusive Sol Ultra takeover ${lock.lock_id} generation ${lock.generation} for ${lock.repository}.`
-        : `Repository ${lock.repository} is paused by exclusive Sol Ultra takeover ${lock.lock_id}${legacy ? " legacy-unfenced" : ` generation ${lock.generation}`} in state ${lock.state}. Do not plan, delegate, edit, or run tools until the lock is released.`,
+          ? `This session owns legacy-unfenced Ultra takeover ${lock.lock_id} for ${lock.repository}. Drain it without starting new executors.`
+          : `This session owns exclusive Ultra takeover ${lock.lock_id} generation ${lock.generation} for ${lock.repository}.`
+        : `Repository ${lock.repository} is paused by exclusive Ultra takeover ${lock.lock_id}${legacy ? " legacy-unfenced" : ` generation ${lock.generation}`} in state ${lock.state}. Do not plan, delegate, edit, or run tools until the lock is released.`,
     );
   }
   if (ownsLock) {
     return null;
   }
   return blockedPreToolUse(
-    `Repository is blocked by exclusive Sol Ultra takeover ${lock.lock_id}${legacy ? " legacy-unfenced" : ` generation ${lock.generation}`} in state ${lock.state}.`,
+    `Repository is blocked by exclusive Ultra takeover ${lock.lock_id}${legacy ? " legacy-unfenced" : ` generation ${lock.generation}`} in state ${lock.state}.`,
   );
 }
 

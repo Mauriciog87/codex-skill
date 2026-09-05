@@ -1,4 +1,6 @@
-# Sol-Luna orchestration
+# Astra-Luna orchestration
+
+Technical identifiers retain `sol-luna-orchestration` and the historical advanced pool key `sol` for state compatibility. New advanced runs use only Astra; historical Sol records remain inspectable. Do not rename state or enable a Sol fallback.
 
 The root Codex session is the orchestrator. Invoke `$sol-luna-orchestration` at the start of every substantive task, before planning, delegating, or editing. A session with `CODEX_ORCHESTRATION_ROLE=executor` in its developer instructions is an executor; it must not invoke the skill or apply the root workflow. A session marked `CODEX_ORCHESTRATION_ROLE=ultra-orchestrator` already owns an authorized exclusive takeover and must not acquire another one.
 
@@ -6,13 +8,13 @@ The root Codex session is the orchestrator. Invoke `$sol-luna-orchestration` at 
 
 | Role | Model | Effort | Tier | Sandbox | Workspace |
 |---|---|---|---|---|---|
-| Root and planner | `gpt-5.6-sol` | `xhigh` | Standard | Current session | Main checkout |
+| Root and planner | `gpt-6-astra` | `high` | Standard | Current session | Main checkout |
 | `explore` | `gpt-5.6-luna` | `max` | Fast | `read-only` | Shared checkout |
 | `implement-lite` | `gpt-5.6-luna` | `max` | Fast | Explicit `workspace-write` | Isolated worktree |
 | `playwright` | `gpt-5.6-luna` | `max` | Standard | `read-only` for repository files | Shared checkout |
-| `implement` | `gpt-5.6-sol` | `high` | Standard | Explicit `workspace-write` | Isolated worktree |
-| `review` | `gpt-5.6-sol` | `high` | Standard | `read-only` | Exact candidate worktree when reviewing a candidate |
-| Exceptional takeover | `gpt-5.6-sol` | `ultra` | Standard | Human-confirmed repository lock | Main checkout |
+| `implement` | `gpt-6-astra` | `medium` | Standard | Explicit `workspace-write` | Isolated worktree |
+| `review` | `gpt-6-astra` | `high` | Standard | `read-only` | Exact candidate worktree when reviewing a candidate |
+| Exceptional takeover | `gpt-6-astra` | `ultra` | Standard | Human-confirmed repository lock | Main checkout |
 
 Every role uses `model_verbosity = "low"`. Fast profiles force `features.fast_mode = true`; Standard roles force it to `false`. Verbosity controls response length independently from reasoning effort.
 
@@ -45,7 +47,7 @@ The local dashboard is projection-only, bound to loopback, protected by a one-ti
 ## Concurrency
 
 - Luna profiles share a limit of 10 executors per repository and 10 across the PC.
-- Sol profiles share a limit of 4 executors per repository and 4 across the PC.
+- Astra profiles share a limit of 4 executors per repository and 4 across the PC.
 - The machine-wide aggregate limit is 14.
 - Playwright consumes Luna capacity and has a separate machine-wide limit of 2.
 - Root and Ultra are excluded; executors started by Ultra are included.
@@ -56,7 +58,7 @@ The launchers acquire atomic repository and machine leases and fail immediately 
 
 ## Exclusive Ultra takeover
 
-Use Ultra only for a named decision that root Sol/xhigh cannot resolve responsibly. Activation requires a nonempty `--reason` and `--confirm-exclusive-takeover`. The canonical launcher is:
+Use Ultra only for a named decision that root Astra/high cannot resolve responsibly. Activation requires a nonempty `--reason` and `--confirm-exclusive-takeover`. The canonical launcher is:
 
 ```text
 node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs

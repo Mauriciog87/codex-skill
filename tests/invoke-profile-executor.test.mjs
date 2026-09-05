@@ -80,7 +80,7 @@ async function writeRoutingMetadata(
   sessionsRoot,
   threadId,
   effort,
-  model = "gpt-5.6-sol",
+  model = "gpt-6-astra",
 ) {
   await mkdir(sessionsRoot, { recursive: true });
   await writeFile(
@@ -147,8 +147,8 @@ test("executor profiles define the fixed model, effort, tier, and sandbox matrix
       explore: { reasoningEffort: "max", model: "gpt-5.6-luna", serviceTier: "fast", sandboxMode: "read-only", fastMode: true },
       "implement-lite": { reasoningEffort: "max", model: "gpt-5.6-luna", serviceTier: "fast", sandboxMode: "workspace-write", fastMode: true },
       playwright: { reasoningEffort: "max", model: "gpt-5.6-luna", serviceTier: "standard", sandboxMode: "read-only", fastMode: false },
-      implement: { reasoningEffort: "high", model: "gpt-5.6-sol", serviceTier: "standard", sandboxMode: "workspace-write", fastMode: false },
-      review: { reasoningEffort: "high", model: "gpt-5.6-sol", serviceTier: "standard", sandboxMode: "read-only", fastMode: false },
+      implement: { reasoningEffort: "medium", model: "gpt-6-astra", serviceTier: "standard", sandboxMode: "workspace-write", fastMode: false },
+      review: { reasoningEffort: "high", model: "gpt-6-astra", serviceTier: "standard", sandboxMode: "read-only", fastMode: false },
     },
   );
   assert.equal(getExecutorProfile("__proto__"), null);
@@ -282,7 +282,7 @@ test("developer instructions identify the selected bounded profile", () => {
     assert.match(instructions, /Do not invoke the sol-luna-orchestration skill/);
   }
   assert.match(createExecutorDeveloperInstructions("explore"), /path:line evidence/);
-  assert.match(createExecutorDeveloperInstructions("implement-lite"), /recommend the Sol implement profile/);
+  assert.match(createExecutorDeveloperInstructions("implement-lite"), /recommend the implement profile/);
   assert.match(createExecutorDeveloperInstructions("playwright"), /browser_run_code_unsafe/);
   assert.match(createExecutorDeveloperInstructions("implement"), /Do not self-approve/);
   assert.match(createExecutorDeveloperInstructions("review"), /REQUEST_CHANGES/);
@@ -471,7 +471,7 @@ test("verifySessionRouting accepts profile efforts and reports mismatches", asyn
 
   await writeRoutingMetadata(sessionsRoot, "invalid-model", "medium", "gpt-5.5");
   await assert.rejects(
-    verifySessionRouting("invalid-model", "gpt-5.6-sol", "medium", {
+    verifySessionRouting("invalid-model", "gpt-6-astra", "medium", {
       sessionRoots: [sessionsRoot],
       attempts: 1,
     }),
@@ -479,14 +479,14 @@ test("verifySessionRouting accepts profile efforts and reports mismatches", asyn
   );
   await writeRoutingMetadata(sessionsRoot, "invalid-effort", "xhigh");
   await assert.rejects(
-    verifySessionRouting("invalid-effort", "gpt-5.6-sol", "medium", {
+    verifySessionRouting("invalid-effort", "gpt-6-astra", "medium", {
       sessionRoots: [sessionsRoot],
       attempts: 1,
     }),
     RoutingVerificationError,
   );
   await assert.rejects(
-    verifySessionRouting("missing", "gpt-5.6-sol", "medium", {
+    verifySessionRouting("missing", "gpt-6-astra", "medium", {
       sessionRoots: [sessionsRoot],
       attempts: 1,
     }),
@@ -822,6 +822,27 @@ test("invokeExecutor returns actual metadata and exit code 2 for routing mismatc
   assert.equal(execution.result.routing_verified, false);
 });
 
+test("Astra profiles reject historical Sol rollout metadata and preserve observed values", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "astra-routing-mismatch-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const sessionsRoot = join(root, "sessions");
+  for (const profile of ["implement", "review"]) {
+    const threadId = `historical-sol-${profile}`;
+    await writeRoutingMetadata(sessionsRoot, threadId, "high", "gpt-5.6-sol");
+    const execution = await invokeExecutor({
+      briefing: "Verify the bounded test route.",
+      options: profileOptions(root, profile),
+      coordinationOptions: { homeDirectory: root },
+      sessionRoots: [sessionsRoot],
+      appServerRunner: createAppServerRunner(threadId, { status: "completed", summary: "APPROVE test", changed_files: [], checks: [], blockers: [], warnings: [] }),
+    });
+    assert.equal(execution.exitCode, 2);
+    assert.equal(execution.result.model, "gpt-5.6-sol");
+    assert.equal(execution.result.reasoning_effort, "high");
+    assert.equal(execution.result.routing_verified, false);
+  }
+});
+
 test("verifyPlaywrightMcp requires an enabled stdio server", async () => {
   const valid = await verifyPlaywrightMcp({
     processRunner: async () => ({
@@ -972,7 +993,7 @@ test("invokeExecutor returns stable exit code 2 while Ultra owns the repository"
     assert.equal(execution.exitCode, 2);
     assert.equal(execution.result.status, "failed");
     assert.equal(execution.result.routing_verified, false);
-    assert.match(execution.result.summary, /exclusive Sol Ultra takeover/);
+    assert.match(execution.result.summary, /exclusive Ultra takeover/);
   } finally {
     await releaseUltraLock({
       cwd: temporaryRoot,

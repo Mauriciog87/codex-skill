@@ -28,7 +28,7 @@ import {
   validateConfigUpdate,
 } from "../scripts/install-global-orchestration.mjs";
 
-const NEW_DISPLAY_NAME = "Sol-Luna Orchestration";
+const NEW_DISPLAY_NAME = "Astra-Luna Orchestration";
 const LEGACY_DISPLAY_NAME = "Sol-Sol Orchestration";
 const TERRA_LEGACY_DISPLAY_NAME = "Sol-Terra Orchestration";
 
@@ -75,6 +75,23 @@ test("installer parser failures and effective-setting mismatches leave no partia
     await assert.rejects(lstat(join(fixture.homeDirectory, ".agents", "skills", SKILL_NAME)), { code: "ENOENT" });
     await assert.rejects(lstat(fixture.deliveryConfigPath), { code: "ENOENT" });
   }
+});
+
+test("reinstalling replaces the Sol defaults and managed block without duplicating or restoring them", () => {
+  const original = 'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "xhigh"\nplan_mode_reasoning_effort = "xhigh"\n';
+  const first = updateGlobalConfig(original);
+  assert.match(first.content, /^model = "gpt-6-astra"$/m);
+  assert.match(first.content, /^model_reasoning_effort = "high"$/m);
+  assert.match(first.content, /^plan_mode_reasoning_effort = "high"$/m);
+  assert.equal(updateGlobalConfig(first.content).content, first.content);
+  const oldBlock = `Before\n${MANAGED_BLOCK_START}\n# Global Sol-Luna orchestration\nThe root uses Sol/xhigh/Standard.\n${MANAGED_BLOCK_END}\nAfter\n`;
+  const updated = updateGlobalInstructions(oldBlock).content;
+  assert.ok(updated.startsWith("Before\n"));
+  assert.ok(updated.endsWith("After\n"));
+  assert.match(updated, /Astra\/high\/Standard/);
+  assert.doesNotMatch(updated, /Sol\/xhigh/);
+  assert.equal(updated.split(MANAGED_BLOCK_START).length, 2);
+  assert.equal(updateGlobalInstructions(updated).content, updated);
 });
 
 test("quoted managed keys are updated without adding a duplicate definition", () => {
@@ -191,11 +208,11 @@ test("updateGlobalConfig preserves unrelated values and is idempotent", () => {
   ].join("\r\n");
   const first = updateGlobalConfig(original);
   assert.equal(first.changed, true);
-  assert.match(first.content, /^model = "gpt-5\.6-sol"\r$/m);
-  assert.match(first.content, /^model_reasoning_effort = "xhigh"\r$/m);
+  assert.match(first.content, /^model = "gpt-6-astra"\r$/m);
+  assert.match(first.content, /^model_reasoning_effort = "high"\r$/m);
   assert.match(first.content, /^model_verbosity = "low"\r$/m);
   assert.match(first.content, /^service_tier = "default"\r$/m);
-  assert.match(first.content, /^plan_mode_reasoning_effort = "xhigh"\r$/m);
+  assert.match(first.content, /^plan_mode_reasoning_effort = "high"\r$/m);
   assert.match(first.content, /^\[agents\]\r$/m);
   assert.match(first.content, /^max_depth = 1\r$/m);
   assert.match(first.content, /^max_threads = 4\r$/m);
@@ -239,7 +256,7 @@ test("updateGlobalConfig manages hooks without replacing unrelated hook sources"
   assert.equal(updateGlobalConfig(first.content, { hookScriptPath }).changed, false);
   assert.throws(
     () => updateGlobalConfig(`${MANAGED_HOOKS_START}\n`, { hookScriptPath }),
-    /malformed Sol-Luna hook markers/,
+    /malformed Astra-Luna hook markers/,
   );
 });
 
@@ -293,7 +310,7 @@ test("installGlobalOrchestration is idempotent and removes a validated legacy co
   assert.equal(await realpath(first.global_skill), await realpath(fixture.canonicalSkill));
   await assert.rejects(lstat(legacySkill), { code: "ENOENT" });
   await assert.rejects(lstat(terraLegacySkill), { code: "ENOENT" });
-  assert.match(await readFile(fixture.configPath, "utf8"), /^model = "gpt-5\.6-sol"$/m);
+  assert.match(await readFile(fixture.configPath, "utf8"), /^model = "gpt-6-astra"$/m);
   assert.match(await readFile(fixture.configPath, "utf8"), /^model_verbosity = "low"$/m);
   assert.match(await readFile(fixture.configPath, "utf8"), /^codex_hooks = true$/m);
   assert.match(await readFile(fixture.configPath, "utf8"), /^\[\[hooks\.PreToolUse\]\]$/m);
@@ -361,7 +378,7 @@ test("installGlobalOrchestration rejects damaged hook markers without partial ch
       homeDirectory: fixture.homeDirectory,
       codexHome: fixture.codexHome,
     }),
-    /malformed Sol-Luna hook markers/,
+    /malformed Astra-Luna hook markers/,
   );
   await assert.rejects(
     lstat(join(fixture.homeDirectory, ".agents", "skills", SKILL_NAME)),

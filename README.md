@@ -1,6 +1,8 @@
-# Verified Sol-Luna orchestration for Codex
+# Verified Astra-Luna orchestration for Codex
 
-This repository adds a dependency-free orchestration layer to Codex. GPT-5.6 Sol owns planning and integration, while verified Sol and Luna profiles handle bounded assignments. Assignments survive interruptions, and writer tasks run in isolated Git worktrees. Before accepting a candidate, the controller verifies the effective model, reasoning effort, service tier, and every configured gate. It can then commit or push that exact candidate.
+This repository adds a dependency-free orchestration layer to Codex. GPT-6 Astra owns planning and integration, while verified Astra and Luna profiles handle bounded assignments. Assignments survive interruptions, and writer tasks run in isolated Git worktrees. Before accepting a candidate, the controller verifies the effective model, reasoning effort, service tier, and every configured gate. It can then commit or push that exact candidate.
+
+The architecture is Astra-Luna. The skill identifier `sol-luna-orchestration`, existing commands (including `invoke-sol-ultra.mjs`), managed markers, and state namespaces keep their historical names for compatibility. There is no Sol execution fallback.
 
 The launchers talk to the [experimental Codex App Server](https://developers.openai.com/codex/app-server) over local stdio JSON-RPC instead of using native subagent routing. App Server applies and reports each route explicitly, while native multi-agent execution stays disabled. There is no legacy fallback. An incompatible protocol fails closed with exit code `2`.
 
@@ -8,15 +10,17 @@ The launchers talk to the [experimental Codex App Server](https://developers.ope
 
 | Role | Model | Effort | Tier | Sandbox | Workspace | Best use |
 |---|---|---|---|---|---|---|
-| Root | Sol | xhigh | Standard | Current session | Main checkout | Planning, delegation, integration, final validation |
+| Root | Astra | high | Standard | Current session | Main checkout | Planning, delegation, integration, final validation |
 | `explore` | Luna | max | Fast | Read-only | Shared checkout | Repository discovery, documentation, contract tracing |
 | `implement-lite` | Luna | max | Fast | Workspace write | Isolated worktree | Small, low-risk, tightly bounded edits |
 | `playwright` | Luna | max | Standard | Read-only repository | Shared checkout | Browser inspection and authorized test interaction |
-| `implement` | Sol | high | Standard | Workspace write | Isolated worktree | Changes that need stronger engineering judgment |
-| `review` | Sol | high | Standard | Read-only | Exact candidate worktree when requested | Independent plan and code review |
-| Ultra | Sol | ultra | Standard | Explicit takeover sandbox | Main checkout | Exceptional architecture, security, or concurrency decisions |
+| `implement` | Astra | medium | Standard | Workspace write | Isolated worktree | Changes that need stronger engineering judgment |
+| `review` | Astra | high | Standard | Read-only | Exact candidate worktree when requested | Independent plan and code review |
+| Ultra | Astra | ultra | Standard | Explicit takeover sandbox | Main checkout | Exceptional architecture, security, or concurrency decisions |
 
 Every role uses `model_verbosity = "low"`. Fast profiles force `features.fast_mode = true`, while Standard roles force it to `false`. Reasoning effort and output verbosity are independent settings.
+
+The advanced model is `gpt-6-astra`; the economical model remains `gpt-5.6-luna`. `model-policy.mjs` defines the advanced model and root/takeover defaults, and `executor-profiles.mjs` fixes each executor route. Review stays at high effort for independent critique; implementation uses medium. Root retains planning and acceptance authority. Ultra is available only when the installed runtime advertises that effort and the operator explicitly authorizes a takeover.
 
 Once `turn/start` succeeds, `explore` gets 120 seconds to report `item/*` progress for the active thread. Each matching event restarts the clock. The existing 900-second timeout still caps the whole run, and the other profiles use only that total timeout.
 
@@ -40,7 +44,7 @@ The installer is idempotent and performs a complete preflight before changing an
 
 - links the canonical skill to `$HOME/.agents/skills/sol-luna-orchestration`;
 - uses a junction on Windows and a directory symlink on macOS or Linux;
-- configures the global root as Sol/xhigh/Standard with low verbosity;
+- configures the global root as Astra/high/Standard with low verbosity;
 - installs and pins the `playwright` MCP to `npx --yes @playwright/mcp@0.0.80`;
 - preserves unrelated Codex configuration and instructions;
 - installs the Ultra SessionStart and PreToolUse hooks without changing an existing `hooks.json`;
@@ -48,6 +52,14 @@ The installer is idempotent and performs a complete preflight before changing an
 - refuses unrelated destinations, malformed managed markers, and ambiguous TOML.
 
 Repository-specific Codex instructions still take precedence over the global defaults.
+
+### Migration and rollback
+
+Before updating an installation, pause other sessions using the global skill and finish existing assignments. Do not migrate with active executors, unresolved locks, or unfinished assignments. The global link reads this checkout directly, so edits become visible before the installer runs.
+
+The annotated tag `pre-astra-migration-2026-09-04` preserves the pre-migration code. Back up the installer-managed `config.toml`, active global instructions, and `sol-luna-orchestration/config.json` outside the repository under `$CODEX_HOME/checkpoints/pre-astra-migration-2026-09-04`, recording missing files and the skill link target. Do not include authentication files or credentials.
+
+To roll back, first preserve any uncommitted migration diff and pause consuming sessions. With operator authorization, restore the checkpoint code and the backed-up global defaults and managed instruction block, preserving unrelated settings changed since the backup. If the checkout is already committed, revert the migration commit instead of rewriting published history. The code tag does not restore global configuration. Never restore, rewind, or delete durable state, history, locks, or generation counters; resolve pending work through the existing gate and control commands before changing versions.
 
 ## Platform support
 
@@ -216,9 +228,11 @@ Exit codes are stable:
 Capacity is enforced with atomic leases at repository and machine scope:
 
 - Luna: 10 active executors per repository and 10 across the PC;
-- Sol: 4 active executors per repository and 4 across the PC;
+- Astra: 4 active executors per repository and 4 across the PC;
 - total machine capacity: 14 executors;
 - Playwright: 2 across the PC, counted inside the Luna pool.
+
+The serialized advanced pool is still named `sol` in status and durable records. New Astra executors use its four slots; historical Sol records continue to count against the same capacity. This compatibility key does not allow new Sol execution or change stored generations and history.
 
 The root and Ultra process do not consume executor slots. Executors started by Ultra do. Reaching an executor pool limit fails immediately. Durable assignments may remain explicitly queued until `reconcile` can start them; the launcher does not create a second hidden queue.
 
@@ -281,3 +295,5 @@ npm run verify:live
 The unit suite covers the control plane from routing through delivery. It tests JSON-RPC ordering and failures, profile routing, durable state transitions, action replay, resource leases, worktree isolation, immutable candidates, automatic-delivery precedence, manual integration, candidate-only commits, push delivery, delivery retry, required checks and artifacts, independent review, and operator gates. It also exercises dashboard security, deterministic fault simulation, tiers and terminal colors, capacity races, Ultra fencing, process identity, fail-closed recovery, history retention, version 1 migration, Playwright evidence, installer rollback, and platform-specific paths.
 
 `verify:platform` is the authentication-free compatibility gate and includes a live fingerprint check for the current process. It also verifies the exact App Server response contracts used for approvals, permission grants, user input, and MCP elicitation. `verify:live -- --schema-only` runs one root turn against the production output schema. `verify:live -- --playwright-only` runs one isolated localhost Playwright interaction without invoking the other profiles. The full live verification checks the root and every profile against protocol and rollout evidence, uses temporary repositories for write tests, and confirms that read-only checks leave this repository unchanged. Add `--output <path-outside-the-repository>` when an evidence artifact is required.
+
+The root probe first reads effective global settings through `config/read` in a temporary repository with no local configuration and no model or effort overrides. Only after those defaults match does it negotiate a separate root turn. Writer probes explicitly use manual delivery, including Ultra's delegated writer; publication tests use only temporary local remotes. Evidence from an earlier Sol run does not certify Astra. Platforms not rerun remain pending, and successful acceptance proves compatibility, not a particular cost saving.

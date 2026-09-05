@@ -5,7 +5,7 @@ const scenario = JSON.parse(process.env.MOCK_APP_SERVER_SCENARIO ?? "{}");
 const capturePath = process.env.MOCK_APP_SERVER_CAPTURE;
 const threadId = scenario.threadId ?? "mock-thread";
 const turnId = scenario.turnId ?? "mock-turn";
-const model = scenario.model ?? "gpt-5.6-sol";
+const model = scenario.model ?? "gpt-6-astra";
 const effort = scenario.effort ?? "high";
 const serviceTier = scenario.serviceTier ?? "default";
 const payload = scenario.payload ?? {
@@ -202,7 +202,7 @@ async function handle(message) {
     return;
   }
   if (message.method === "config/read") {
-    result(message.id, { config: scenario.config ?? { model: "gpt-5.6-sol" } });
+    result(message.id, { config: scenario.config ?? { model: "gpt-6-astra" } });
     return;
   }
   if (message.method === "thread/start") {

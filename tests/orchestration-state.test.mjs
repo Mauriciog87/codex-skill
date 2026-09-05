@@ -42,7 +42,7 @@ function completedExecution(
   effort,
   model = ["explore", "implement-lite", "playwright"].includes(profile)
     ? "gpt-5.6-luna"
-    : "gpt-5.6-sol",
+    : "gpt-6-astra",
   serviceTier = ["explore", "implement-lite"].includes(profile) ? "fast" : "standard",
 ) {
   return {
@@ -87,7 +87,7 @@ async function addLinkedWorktree(fixture) {
 test("linked writers exclude main takeover and inherit the same Ultra generation", async (context) => {
   const fixture = await createFixture(context, "common-repository-lock-");
   const linked = await addLinkedWorktree(fixture);
-  const lease = await beginExecutorRun({ cwd: linked, profile: "implement", model: "gpt-5.6-sol", homeDirectory: fixture.homeDirectory });
+  const lease = await beginExecutorRun({ cwd: linked, profile: "implement", model: "gpt-6-astra", homeDirectory: fixture.homeDirectory });
   await assert.rejects(acquireUltraLock({ cwd: fixture.repository, reason: "Must wait", sandboxMode: "read-only", homeDirectory: fixture.homeDirectory }), /executor run.*active/);
   await finishExecutorRun(lease, completedExecution("implement", "high"));
   const lock = await acquireUltraLock({ cwd: fixture.repository, reason: "Exclusive", sandboxMode: "read-only", homeDirectory: fixture.homeDirectory });
@@ -96,7 +96,7 @@ test("linked writers exclude main takeover and inherit the same Ultra generation
   const blockedHook = await evaluateHook(hook, { environment });
   assert.equal(blockedHook.hookSpecificOutput.permissionDecision, "deny");
   assert.equal(await evaluateHook(hook, { environment: { ...environment, ...epochEnvironment(lock) } }), null);
-  const ownedLease = await beginExecutorRun({ cwd: linked, profile: "implement", model: "gpt-5.6-sol", homeDirectory: fixture.homeDirectory, environment: epochEnvironment(lock) });
+  const ownedLease = await beginExecutorRun({ cwd: linked, profile: "implement", model: "gpt-6-astra", homeDirectory: fixture.homeDirectory, environment: epochEnvironment(lock) });
   assert.equal(ownedLease.repository_key, lock.repository_key);
   assert.equal(ownedLease.generation, lock.generation);
   await finishExecutorRun(ownedLease, completedExecution("implement", "high"));
@@ -119,7 +119,7 @@ test("legacy worktree locks remain recoverable and retain their generation after
   const status = await getOrchestrationStatus(fixture.repository, options);
   assert.equal(status.legacy_namespaces[0].lock_id, lock.lock_id);
   assert.equal(status.legacy_namespaces[0].blocked, true);
-  await assert.rejects(beginExecutorRun({ cwd: fixture.repository, profile: "review", model: "gpt-5.6-sol", ...options }), /pending legacy state/);
+  await assert.rejects(beginExecutorRun({ cwd: fixture.repository, profile: "review", model: "gpt-6-astra", ...options }), /pending legacy state/);
   await assert.rejects(recoverUltraLock({ cwd: fixture.repository, lockId: lock.lock_id, ...options, processInspector: async () => ({ status: "unknown" }) }), /unknown/);
   await recoverUltraLock({ cwd: fixture.repository, lockId: lock.lock_id, ...options, processInspector: async () => ({ status: "dead" }) });
   await runGit(["worktree", "remove", linked], { cwd: fixture.repository });
@@ -197,15 +197,15 @@ test("executor leases block Ultra and Ultra admits only the matching lock id", a
     beginExecutorRun({
       cwd: fixture.repository,
       profile: "review",
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       homeDirectory: fixture.homeDirectory,
     }),
-    /locked by an exclusive Sol Ultra takeover/,
+    /locked by an exclusive Ultra takeover/,
   );
   const inheritedLease = await beginExecutorRun({
     cwd: fixture.repository,
     profile: "review",
-    model: "gpt-5.6-sol",
+    model: "gpt-6-astra",
     environment: epochEnvironment(lock),
     homeDirectory: fixture.homeDirectory,
   });
@@ -223,7 +223,7 @@ test("executor leases block Ultra and Ultra admits only the matching lock id", a
         profile: "review",
         status: "completed",
         thread_id: "review-thread",
-        model: "gpt-5.6-sol",
+        model: "gpt-6-astra",
         reasoning_effort: "high",
         service_tier: "standard",
         routing_verified: true,
@@ -425,7 +425,7 @@ test("executors require both the Ultra lock id and its generation", async (conte
     beginExecutorRun({
       cwd: fixture.repository,
       profile: "review",
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       environment: { [ORCHESTRATION_LOCK_ENV]: lock.lock_id },
       homeDirectory: fixture.homeDirectory,
     }),
@@ -435,7 +435,7 @@ test("executors require both the Ultra lock id and its generation", async (conte
     beginExecutorRun({
       cwd: fixture.repository,
       profile: "review",
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       environment: {
         [ORCHESTRATION_LOCK_ENV]: lock.lock_id,
         [ORCHESTRATION_GENERATION_ENV]: String(lock.generation + 1),
@@ -463,14 +463,14 @@ test("stale executor completion and abandonment cannot mutate a newer epoch", as
   const completedLease = await beginExecutorRun({
     cwd: fixture.repository,
     profile: "review",
-    model: "gpt-5.6-sol",
+    model: "gpt-6-astra",
     environment: epochEnvironment(first),
     homeDirectory: fixture.homeDirectory,
   });
   const abandonedLease = await beginExecutorRun({
     cwd: fixture.repository,
     profile: "review",
-    model: "gpt-5.6-sol",
+    model: "gpt-6-astra",
     environment: epochEnvironment(first),
     homeDirectory: fixture.homeDirectory,
   });
@@ -634,7 +634,7 @@ test("executor App Server identities are recorded in status and recovery", async
   const lease = await beginExecutorRun({
     cwd: fixture.repository,
     profile: "review",
-    model: "gpt-5.6-sol",
+    model: "gpt-6-astra",
     environment: epochEnvironment(lock),
     homeDirectory: fixture.homeDirectory,
   });
@@ -687,7 +687,7 @@ test("executor process registration preserves fail-closed repository evidence", 
   const lease = await beginExecutorRun({
     cwd: fixture.repository,
     profile: "review",
-    model: "gpt-5.6-sol",
+    model: "gpt-6-astra",
     environment: epochEnvironment(lock),
     homeDirectory: fixture.homeDirectory,
   });
@@ -848,7 +848,7 @@ test("legacy v1 locks block v2 acquisition and require explicit recovery confirm
     role: "ultra-orchestrator",
     pid: 2_147_483_647,
     thread_id: null,
-    model: "gpt-5.6-sol",
+    model: "gpt-6-astra",
     reasoning_effort: "ultra",
     service_tier: "standard",
     sandbox_mode: "read-only",
@@ -952,7 +952,52 @@ test("CODEX_HOME takes precedence over the supplied home directory", () => {
   );
 });
 
-test("Luna and Sol capacity acquisition is atomic and releases in finally paths", async (context) => {
+test("historical Sol leases and new Astra leases share the unchanged advanced pool", async (context) => {
+  const fixture = await createFixture(context, "astra-history-capacity-");
+  const options = { cwd: fixture.repository, profile: "review", model: "gpt-6-astra", homeDirectory: fixture.homeDirectory };
+  const historical = await beginExecutorRun(options);
+  const stored = JSON.parse(await readFile(historical.path, "utf8"));
+  stored.model = "gpt-5.6-sol";
+  for (const path of [historical.path, historical.globalPath]) await writeFile(path, JSON.stringify(stored));
+  const original = await readFile(historical.path);
+  const leases = [];
+  for (let index = 0; index < 3; index += 1) leases.push(await beginExecutorRun(options));
+  const status = await getOrchestrationStatus(fixture.repository, { homeDirectory: fixture.homeDirectory });
+  assert.equal(status.capacity.repository.sol, 4);
+  assert.equal(status.capacity.machine.sol, 4);
+  assert.equal(leases.every((lease) => lease.pool === "sol" && lease.model === "gpt-6-astra"), true);
+  await assert.rejects(beginExecutorRun(options), /sol executor capacity is full \(4\/4\)/);
+  for (const model of ["gpt-5.6-sol", "unknown-model"]) {
+    await assert.rejects(beginExecutorRun({ ...options, model }), /Unsupported executor model/);
+  }
+  assert.deepEqual(await readFile(historical.path), original);
+  for (const lease of leases) await finishExecutorRun(lease, completedExecution("review", "high"));
+  await finishExecutorRun({ ...historical, model: stored.model }, completedExecution("review", "high", stored.model));
+  assert.equal((await getOrchestrationStatus(fixture.repository, { homeDirectory: fixture.homeDirectory })).capacity.machine.total, 0);
+});
+
+test("historical Sol locks keep their model, history, and monotonic generation", async (context) => {
+  const fixture = await createFixture(context, "astra-history-lock-");
+  const options = { cwd: fixture.repository, homeDirectory: fixture.homeDirectory, reason: "Historical checkpoint", sandboxMode: "read-only" };
+  const first = await acquireUltraLock(options);
+  assert.equal(first.model, "gpt-6-astra");
+  const state = await getRepositoryState(fixture.repository, options);
+  const stored = JSON.parse(await readFile(state.lockPath, "utf8"));
+  stored.model = "gpt-5.6-sol";
+  await writeFile(state.lockPath, JSON.stringify(stored));
+  const historyBefore = await readOrchestrationHistory(fixture.repository, options);
+  assert.equal((await readUltraLock(fixture.repository, options)).model, "gpt-5.6-sol");
+  const hook = await evaluateHook({ cwd: fixture.repository, hook_event_name: "SessionStart" }, { environment: {}, readLock: async () => stored });
+  assert.doesNotMatch(JSON.stringify(hook), /Astra/);
+  assert.deepEqual(await readOrchestrationHistory(fixture.repository, options), historyBefore);
+  await releaseUltraLock({ ...options, lockId: first.lock_id, generation: first.generation });
+  const second = await acquireUltraLock(options);
+  assert.equal(second.model, "gpt-6-astra");
+  assert.equal(second.generation, first.generation + 1);
+  await releaseUltraLock({ ...options, lockId: second.lock_id, generation: second.generation });
+});
+
+test("Luna and Astra capacity acquisition is atomic and releases in finally paths", async (context) => {
   const fixture = await createFixture(context, "sol-luna-capacity-");
   const lunaAttempts = await Promise.allSettled(
     Array.from({ length: EXECUTOR_CAPACITY_LIMITS.luna + 1 }, (_, index) =>
@@ -983,7 +1028,7 @@ test("Luna and Sol capacity acquisition is atomic and releases in finally paths"
       await beginExecutorRun({
         cwd: fixture.repository,
         profile: "review",
-        model: "gpt-5.6-sol",
+        model: "gpt-6-astra",
         runId: `sol-${index}`,
         homeDirectory: fixture.homeDirectory,
       }),
@@ -993,7 +1038,7 @@ test("Luna and Sol capacity acquisition is atomic and releases in finally paths"
     beginExecutorRun({
       cwd: fixture.repository,
       profile: "review",
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       homeDirectory: fixture.homeDirectory,
     }),
     /sol executor capacity is full \(4\/4\)/,
@@ -1098,7 +1143,7 @@ test("dead leases are pruned and corrupt capacity state fails closed", async (co
     beginExecutorRun({
       cwd: fixture.repository,
       profile: "review",
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       homeDirectory: fixture.homeDirectory,
     }),
     /invalid JSON/,

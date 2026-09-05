@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { MODEL_VERBOSITY } from "../.agents/skills/sol-luna-orchestration/scripts/model-policy.mjs";
 import { runGit } from "../.agents/skills/sol-luna-orchestration/scripts/git-workspace.mjs";
 import {
   DEFAULT_ULTRA_SANDBOX_MODE,
@@ -17,7 +18,6 @@ import {
 import {
   ORCHESTRATION_GENERATION_ENV,
   ORCHESTRATION_LOCK_ENV,
-  SOL_MODEL_VERBOSITY,
   beginExecutorRun,
   finishExecutorRun,
   readOrchestrationHistory,
@@ -36,7 +36,7 @@ async function createFixture(context) {
   return { root, repository, sessionsRoot, homeDirectory };
 }
 
-async function writeRoutingMetadata(sessionsRoot, threadId, effort, model = "gpt-5.6-sol") {
+async function writeRoutingMetadata(sessionsRoot, threadId, effort, model = "gpt-6-astra") {
   await mkdir(sessionsRoot, { recursive: true });
   await writeFile(
     join(sessionsRoot, `rollout-${threadId}.jsonl`),
@@ -142,7 +142,7 @@ test("Ultra arguments allow only explicit workspace write", () => {
   assert.match(parsed.cwd, /repository$/);
 });
 
-test("Ultra command and instructions pin the exclusive Sol runtime", () => {
+test("Ultra command and instructions pin the exclusive Astra runtime", () => {
   const instructions = createUltraDeveloperInstructions("lock-123", 7);
   assert.match(instructions, /^CODEX_ORCHESTRATION_ROLE=ultra-orchestrator$/m);
   assert.match(instructions, /^CODEX_ORCHESTRATION_LOCK_ID=lock-123$/m);
@@ -152,7 +152,7 @@ test("Ultra command and instructions pin the exclusive Sol runtime", () => {
   assert.match(instructions, /implement-lite\|playwright/);
   assert.match(instructions, /Always include operator_requests/);
   const args = buildUltraAppServerArguments();
-  assert.ok(args.includes(`model_verbosity=${JSON.stringify(SOL_MODEL_VERBOSITY)}`));
+  assert.ok(args.includes(`model_verbosity=${JSON.stringify(MODEL_VERBOSITY)}`));
   assert.ok(args.includes('service_tier="default"'));
   assert.ok(args.includes("features.fast_mode=false"));
   assert.ok(args.includes("features.multi_agent=false"));
@@ -224,7 +224,7 @@ test("verified Ultra completion releases its repository lock", async (context) =
   });
   assert.equal(execution.exitCode, 0);
   assert.equal(execution.result.status, "completed");
-  assert.equal(execution.result.model, "gpt-5.6-sol");
+  assert.equal(execution.result.model, "gpt-6-astra");
   assert.equal(execution.result.reasoning_effort, "ultra");
   assert.equal(execution.result.service_tier, "standard");
   assert.equal(execution.result.routing_verified, true);
@@ -298,7 +298,7 @@ test("Ultra reconstructs verified executors from registered leases", async (cont
       const lease = await beginExecutorRun({
         cwd: fixture.repository,
         profile: "implement",
-        model: "gpt-5.6-sol",
+        model: "gpt-6-astra",
         environment: runnerOptions.environment,
         homeDirectory: fixture.homeDirectory,
       });
@@ -316,8 +316,8 @@ test("Ultra reconstructs verified executors from registered leases", async (cont
           status: "completed",
           profile: "implement",
           thread_id: "implement-thread",
-          model: "gpt-5.6-sol",
-          reasoning_effort: "high",
+          model: "gpt-6-astra",
+          reasoning_effort: "medium",
           service_tier: "standard",
           routing_verified: true,
         },
@@ -331,8 +331,8 @@ test("Ultra reconstructs verified executors from registered leases", async (cont
       profile: "implement",
       status: "completed",
       thread_id: "implement-thread",
-      model: "gpt-5.6-sol",
-      reasoning_effort: "high",
+      model: "gpt-6-astra",
+      reasoning_effort: "medium",
       service_tier: "standard",
       routing_verified: true,
     },
@@ -345,7 +345,7 @@ test("timeout and routing mismatch require manual recovery", async (context) => 
     briefing: "Wait for the bounded result.",
     options: ultraOptions(timeoutFixture.repository),
     appServerRunner: async () => {
-      throw new AppServerTimeoutError("Sol Ultra takeover timed out after 10 seconds.", {
+      throw new AppServerTimeoutError("Ultra takeover timed out after 10 seconds.", {
         threadId: "timed-out",
       });
     },

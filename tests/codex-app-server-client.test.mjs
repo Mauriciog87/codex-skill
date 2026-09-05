@@ -41,7 +41,7 @@ function runMock(scenario = {}, overrides = {}) {
     command: overrides.command ?? "codex",
     cwd: resolve("."),
     environment: overrides.environment ?? process.env,
-    model: overrides.model ?? scenario.model ?? "gpt-5.6-sol",
+    model: overrides.model ?? scenario.model ?? "gpt-6-astra",
     reasoningEffort: overrides.reasoningEffort ?? scenario.effort ?? "high",
     serviceTier,
     configuredServiceTier: serviceTier === "fast" ? "fast" : "default",
@@ -120,7 +120,7 @@ test("config preflight uses only initialize and config/read without model overri
   const temporary = await mkdtemp(join(tmpdir(), "config-rpc-test-"));
   context.after(() => rm(temporary, { recursive: true, force: true }));
   const capturePath = join(temporary, "rpc.jsonl");
-  const config = { model: "gpt-5.6-sol", agents: { max_threads: 4 } };
+  const config = { model: "gpt-6-astra", agents: { max_threads: 4 } };
   const result = await readCodexConfig({
     cwd: temporary,
     commandResolver: async (_, { environment }) => ({ executable: "logical-codex", environment }),
@@ -268,7 +268,7 @@ test("handshake correlates responses and accepts settings notification before re
     { capturePath },
   );
   assert.equal(result.threadId, "mock-thread");
-  assert.equal(result.model, "gpt-5.6-sol");
+  assert.equal(result.model, "gpt-6-astra");
   assert.equal(result.reasoningEffort, "high");
   assert.equal(result.serviceTier, "standard");
   assert.equal(result.turnStatus, "completed");
@@ -286,7 +286,7 @@ test("handshake correlates responses and accepts settings notification before re
   const update = messages.find((message) => message.method === "thread/settings/update");
   assert.deepEqual(update.params, {
     threadId: "mock-thread",
-    model: "gpt-5.6-sol",
+    model: "gpt-6-astra",
     effort: "high",
     serviceTier: null,
   });
@@ -301,9 +301,9 @@ test("the full root, profile, and Ultra routing matrix is accepted", async () =>
   for (const route of [
     ["gpt-5.6-luna", "max", "fast", "priority"],
     ["gpt-5.6-luna", "max", "standard", "default"],
-    ["gpt-5.6-sol", "high", "standard", "default"],
-    ["gpt-5.6-sol", "xhigh", "standard", "default"],
-    ["gpt-5.6-sol", "ultra", "standard", "default"],
+    ["gpt-6-astra", "high", "standard", "default"],
+    ["gpt-6-astra", "medium", "standard", "default"],
+    ["gpt-6-astra", "ultra", "standard", "default"],
   ]) {
     const [model, effort, publicTier, protocolTier] = route;
     const result = await runMock(
@@ -319,7 +319,7 @@ test("the full root, profile, and Ultra routing matrix is accepted", async () =>
 test("model/list rejects missing models, efforts, and priority support", async () => {
   await assert.rejects(
     runMock({ models: [] }),
-    (error) => error instanceof AppServerRoutingError && /does not advertise gpt-5.6-sol/.test(error.message),
+    (error) => error instanceof AppServerRoutingError && /does not advertise gpt-6-astra/.test(error.message),
   );
   await assert.rejects(
     runMock({ efforts: [{ reasoningEffort: "medium" }] }),
@@ -335,6 +335,16 @@ test("model/list rejects missing models, efforts, and priority support", async (
 });
 
 test("thread and settings contradictions preserve observed routing", async () => {
+  for (const mismatch of [{ threadModel: "gpt-5.6-sol" }, { settingsModel: "gpt-5.6-sol" }]) {
+    await assert.rejects(
+      runMock(mismatch),
+      (error) => error instanceof AppServerRoutingError && error.actualModel === "gpt-5.6-sol",
+    );
+  }
+  await assert.rejects(
+    runMock({ effort: "ultra", efforts: [{ reasoningEffort: "high" }] }),
+    (error) => error instanceof AppServerRoutingError && /ultra effort/.test(error.message),
+  );
   await assert.rejects(
     runMock({ threadModel: "gpt-5.5" }),
     (error) => error instanceof AppServerRoutingError && error.actualModel === "gpt-5.5",

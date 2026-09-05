@@ -31,7 +31,7 @@ test("executor messages identify the complete verified route", () => {
       sandbox_mode: "read-only",
       routing_verified: true,
     }),
-    "Sol-Luna orchestrator: Executor routing verified for explore: gpt-5.6-luna at max reasoning on fast tier in read-only mode (routing_verified=true). Status: completed.",
+    "Astra-Luna orchestrator: Executor routing verified for explore: gpt-5.6-luna at max reasoning on fast tier in read-only mode (routing_verified=true). Status: completed.",
   );
 });
 
@@ -39,27 +39,27 @@ test("unverified executor messages do not claim route metadata", () => {
   const message = executorResultMessage({
     status: "failed",
     profile: "implement",
-    model: "gpt-5.6-sol",
+    model: "gpt-6-astra",
     reasoning_effort: "high",
     service_tier: "standard",
     routing_verified: false,
   });
   assert.equal(
     message,
-    "Sol-Luna orchestrator: Executor routing was not verified for implement. Status: failed.",
+    "Astra-Luna orchestrator: Executor routing was not verified for implement. Status: failed.",
   );
-  assert.doesNotMatch(message, /gpt-5\.6-sol|high reasoning|standard tier/);
+  assert.doesNotMatch(message, /gpt-6-astra|high reasoning|standard tier/);
 });
 
 test("Ultra messages identify takeover mode and recovery state", () => {
   assert.equal(
     ultraLaunchMessage({
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       reasoningEffort: "ultra",
       serviceTier: "standard",
       sandboxMode: "read-only",
     }),
-    "◆ ULTRA · GPT-5.6-SOL · ULTRA · STANDARD · READ-ONLY",
+    "◆ ULTRA · GPT-6-ASTRA · ULTRA · STANDARD · READ-ONLY",
   );
   assert.equal(
     ultraResultMessage({
@@ -67,7 +67,7 @@ test("Ultra messages identify takeover mode and recovery state", () => {
       routing_verified: false,
       warnings: ["Ultra lock is recovery-required."],
     }),
-    "Sol-Luna orchestrator: Ultra routing was not verified. Status: failed. The repository lock requires recovery.",
+    "Astra-Luna orchestrator: Ultra routing was not verified. Status: failed. The repository lock requires recovery.",
   );
 });
 

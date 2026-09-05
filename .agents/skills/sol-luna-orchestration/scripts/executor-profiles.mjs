@@ -1,4 +1,5 @@
-export const MODEL_VERBOSITY = "low";
+import { ADVANCED_MODEL, ADVANCED_EXECUTOR_POOL } from "./model-policy.mjs";
+export { MODEL_VERBOSITY } from "./model-policy.mjs";
 
 const PROFILE_DEFINITIONS = {
   explore: {
@@ -38,7 +39,7 @@ const PROFILE_DEFINITIONS = {
       "Implement only the small, explicit, low-risk change assigned in the briefing and preserve unrelated changes.",
       "Read the relevant local contract before editing, follow existing patterns, and avoid architecture or security decisions.",
       "Add or update focused tests when behavior changes and run the relevant validation.",
-      "Return blocked and recommend the Sol implement profile if the task expands, becomes ambiguous, or requires cross-cutting judgment.",
+      "Return blocked and recommend the implement profile if the task expands, becomes ambiguous, or requires cross-cutting judgment.",
       "Do not self-approve, commit, push, or expand the assigned scope.",
       "Return completed only when the implementation and requested checks succeed, and report every changed file.",
     ],
@@ -67,13 +68,13 @@ const PROFILE_DEFINITIONS = {
     ],
   },
   implement: {
-    model: "gpt-5.6-sol",
-    reasoningEffort: "high",
+    model: ADVANCED_MODEL,
+    reasoningEffort: "medium",
     serviceTier: "standard",
     configuredServiceTier: "default",
     fastMode: false,
     sandboxMode: "workspace-write",
-    concurrencyPool: "sol",
+    concurrencyPool: ADVANCED_EXECUTOR_POOL,
     workspaceStrategy: "isolated-worktree",
     capabilities: ["workspace-read", "workspace-write", "operator-request"],
     colorCode: 33,
@@ -86,13 +87,13 @@ const PROFILE_DEFINITIONS = {
     ],
   },
   review: {
-    model: "gpt-5.6-sol",
+    model: ADVANCED_MODEL,
     reasoningEffort: "high",
     serviceTier: "standard",
     configuredServiceTier: "default",
     fastMode: false,
     sandboxMode: "read-only",
-    concurrencyPool: "sol",
+    concurrencyPool: ADVANCED_EXECUTOR_POOL,
     workspaceStrategy: "candidate-worktree",
     capabilities: ["workspace-read", "review"],
     colorCode: 35,

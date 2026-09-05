@@ -69,13 +69,13 @@ function dashboardHtml(csrfToken, nonce) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="csrf-token" content="${csrfToken}">
-<title>Sol-Luna control plane</title>
+<title>Astra-Luna control plane</title>
 <style nonce="${nonce}">
 :root{color-scheme:dark;font-family:Inter,system-ui,sans-serif;background:#0c111b;color:#e8edf6}body{margin:0;padding:24px}main{max-width:1180px;margin:auto}h1{font-size:24px;margin:0 0 8px}.muted{color:#94a3b8}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin:20px 0}.card,table{background:#151d2b;border:1px solid #293548;border-radius:12px}.card{padding:16px}.number{font-size:28px;font-weight:700}table{width:100%;border-collapse:collapse;overflow:hidden}th,td{text-align:left;padding:10px;border-bottom:1px solid #293548;font-size:13px}th{color:#9fb0c8}button{background:#4f7cff;color:white;border:0;border-radius:7px;padding:7px 10px;cursor:pointer}button.secondary{background:#30405a}.badge{display:inline-block;padding:3px 7px;border-radius:999px;background:#273650}.attention{color:#ffca6a}.error{color:#ff8080;white-space:pre-wrap}code{font-family:ui-monospace,monospace}</style>
 </head>
 <body>
 <main>
-<h1>Sol-Luna control plane</h1>
+<h1>Astra-Luna control plane</h1>
 <div class="muted" id="repository"></div>
 <div class="cards" id="cards"></div>
 <div id="error" class="error"></div>

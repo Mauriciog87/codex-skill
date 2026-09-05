@@ -1,4 +1,4 @@
-const PREFIX = "Sol-Luna orchestrator";
+const PREFIX = "Astra-Luna orchestrator";
 const RESET = "\u001b[0m";
 
 function upper(value) {

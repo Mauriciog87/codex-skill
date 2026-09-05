@@ -1,6 +1,7 @@
 import { spawn as spawnChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { resolveCodexInvocation } from "./codex-command.mjs";
+import { MODEL_VERBOSITY } from "./model-policy.mjs";
 
 const MAX_CAPTURE_LENGTH = 32_768;
 const MAX_OPERATOR_QUESTIONS = 3;
@@ -151,7 +152,7 @@ export function normalizeAppServerServiceTier(value) {
 export function buildAppServerArguments({
   fastMode,
   configuredServiceTier,
-  modelVerbosity = "low",
+  modelVerbosity = MODEL_VERBOSITY,
   configurationOverrides = [],
 }) {
   const overrideArguments = configurationOverrides.flatMap((value) => ["-c", value]);

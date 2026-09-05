@@ -1,15 +1,17 @@
 ---
 name: sol-luna-orchestration
-description: Coordinate substantive software work with GPT-5.6 Sol at the root and verified Sol and Luna executor profiles. Covers durable assignments, isolated writer worktrees, candidate review, validated delivery, and human-confirmed Sol Ultra takeovers. Invoke it before planning, delegating, coordinating, or validating independent work.
+description: Coordinate substantive software work with GPT-6 Astra at the root and verified Astra and Luna executor profiles. Covers durable assignments, isolated writer worktrees, candidate review, validated delivery, and human-confirmed Ultra takeovers. Invoke it before planning, delegating, coordinating, or validating independent work.
 ---
 
-# Sol-Luna Orchestration
+# Astra-Luna Orchestration
+
+The technical skill name, launchers, managed markers, and state namespaces retain their historical identifiers. The advanced capacity key `sol` counts Astra runs and historical Sol records in the same four-slot pool; it does not enable new Sol execution. `scripts/model-policy.mjs` defines root and takeover defaults, while the profile registry defines executor routes.
 
 Use this workflow once, before the first substantive request in a root task. Do not run it inside a session whose developer instructions contain `CODEX_ORCHESTRATION_ROLE=executor`. A session marked `CODEX_ORCHESTRATION_ROLE=ultra-orchestrator` already owns the takeover workflow and must not acquire another lock.
 
 ## Workflow
 
-1. Confirm that the root uses `gpt-5.6-sol`, `xhigh` reasoning, the Standard service tier, and `model_verbosity = "low"`.
+1. Confirm that the root uses `gpt-6-astra`, `high` reasoning, the Standard service tier, and `model_verbosity = "low"`.
 2. Define the outcome, acceptance criteria, risks, ownership boundaries, and final verification.
 3. Keep planning, integration, tightly coupled work, and sensitive decisions in the root.
 4. Delegate only independent scopes when parallelism or lower context cost materially helps. Capacity is not a fan-out target.
@@ -34,10 +36,12 @@ Stop and ask the operator when the checkout is dirty, another Git operation is a
 | `explore` | `gpt-5.6-luna` | `max` | Fast | `read-only` | Shared checkout | Broad discovery and contract tracing |
 | `implement-lite` | `gpt-5.6-luna` | `max` | Fast | `workspace-write` | Isolated worktree | Small, explicit, low-risk edits |
 | `playwright` | `gpt-5.6-luna` | `max` | Standard | `read-only` | Shared checkout | Browser inspection and authorized test interaction through Playwright MCP |
-| `implement` | `gpt-5.6-sol` | `high` | Standard | `workspace-write` | Isolated worktree | Bounded implementation requiring stronger judgment |
-| `review` | `gpt-5.6-sol` | `high` | Standard | `read-only` | Exact candidate worktree when `--candidate-id` is used | Independent plan or Git-change review |
+| `implement` | `gpt-6-astra` | `medium` | Standard | `workspace-write` | Isolated worktree | Bounded implementation requiring stronger judgment |
+| `review` | `gpt-6-astra` | `high` | Standard | `read-only` | Exact candidate worktree when `--candidate-id` is used | Independent plan or Git-change review |
 
 All roles use low output verbosity. Fast profiles force `features.fast_mode = true`; Standard roles force it to `false`. Model, effort, tier, and sandbox are fixed by the profile and cannot be overridden by the caller.
+
+Root and planner use Astra/high. Implementation uses Astra/medium; independent review retains Astra/high and does not acquire root planning or approval authority. Escalation returns to the root rather than silently increasing effort or starting another session. Ultra requires explicit human authorization and runtime-advertised Astra/ultra support.
 
 Once `turn/start` succeeds, `explore` gets 120 seconds to report `item/*` progress for the active thread. Each matching event restarts the clock. The existing 900-second timeout still caps the whole run, and the other profiles use only that total timeout.
 
@@ -55,6 +59,8 @@ npm run verify:live
 `verify:platform` is the required authentication-free gate on Windows, Linux, and macOS. It verifies Codex CLI compatibility, strict configuration, generated App Server schemas, the current process fingerprint, an idempotent isolated global installation, the native link type and canonical target, temporary cleanup, and unchanged Git state.
 
 `verify:live` is a manual authenticated gate. It verifies root, every executor profile, Playwright, Ultra, locks, recovery, isolation, capacity, and unchanged repository state. Mark a platform as live verified only after its self-hosted `codex-live` artifact succeeds. A sandbox failure keeps the platform pending and never justifies a bypass or weaker sandbox.
+
+Root acceptance reads effective global defaults through `config/read` without model or effort overrides in a temporary repository before negotiating a turn. All writer probes explicitly use manual delivery. Keep evidence outside the repository and preserve its implementation diff. Pause consumers and finish existing assignments before installing a model migration; never convert pending work or restore old durable state to roll back defaults.
 
 ## Launcher
 
@@ -128,7 +134,7 @@ The simulator is pure and deterministic: it mutates neither Git nor durable stat
 ## Capacity
 
 - Luna profiles share a hard limit of 10 active executors per repository and 10 across the PC.
-- Sol profiles share a hard limit of 4 active executors per repository and 4 across the PC.
+- Astra profiles share a hard limit of 4 active executors per repository and 4 across the PC.
 - The machine-wide aggregate limit is 14 executors.
 - Playwright has an additional machine-wide limit of 2 and consumes Luna capacity.
 - Root and Ultra processes do not consume executor slots. Executors delegated by Ultra do.
@@ -159,7 +165,7 @@ Full interaction is allowed only on localhost and explicitly named development o
 
 ## Exclusive Ultra takeover
 
-Use Sol `ultra` on Standard only when a named architecture, security, concurrency, distributed-invariant, or contradictory-contract decision cannot be resolved responsibly by root Sol/xhigh. The human must provide a reason and `--confirm-exclusive-takeover`.
+Use Astra `ultra` on Standard only when a named architecture, security, concurrency, distributed-invariant, or contradictory-contract decision cannot be resolved responsibly by root Astra/high. The human must provide a reason and `--confirm-exclusive-takeover`.
 
 ```text
 briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs --cwd <repository> --reason <reason> --confirm-exclusive-takeover --sandbox read-only

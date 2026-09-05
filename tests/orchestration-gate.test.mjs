@@ -82,7 +82,7 @@ test("SessionStart reports ownership and pauses unrelated sessions", async () =>
       readLock: async () => lock,
     },
   );
-  assert.match(owner.hookSpecificOutput.additionalContext, /owns exclusive Sol Ultra takeover/);
+  assert.match(owner.hookSpecificOutput.additionalContext, /owns exclusive Ultra takeover/);
   const unrelated = await evaluateHook(
     { cwd: "C:\\repository", hook_event_name: "SessionStart" },
     { environment: {}, readLock: async () => lock },

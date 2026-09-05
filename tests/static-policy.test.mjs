@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import test from "node:test";
 import { EXECUTOR_PROFILES } from "../.agents/skills/sol-luna-orchestration/scripts/executor-profiles.mjs";
-import { SOL_MODEL_VERBOSITY } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
+import { ADVANCED_MODEL, ADVANCED_EXECUTOR_POOL, MODEL_VERBOSITY, ROOT_CONFIG_VALUES, ROOT_POLICY, ULTRA_POLICY } from "../.agents/skills/sol-luna-orchestration/scripts/model-policy.mjs";
 
 const execFileAsync = promisify(execFile);
 const migrationFiles = new Set([
@@ -15,7 +15,18 @@ const migrationFiles = new Set([
   "tests/static-policy.test.mjs",
 ]);
 
-test("tracked operational files contain only the Sol-Luna architecture", async () => {
+test("the common policy fixes Astra roles without renaming durable capacity", () => {
+  assert.equal(ADVANCED_MODEL, "gpt-6-astra");
+  assert.equal(ADVANCED_EXECUTOR_POOL, "sol");
+  assert.deepEqual(ROOT_POLICY, { model: "gpt-6-astra", reasoningEffort: "high", serviceTier: "standard", configuredServiceTier: "default", fastMode: false });
+  assert.deepEqual(ULTRA_POLICY, { ...ROOT_POLICY, reasoningEffort: "ultra" });
+  assert.deepEqual(ROOT_CONFIG_VALUES, { model: "gpt-6-astra", model_reasoning_effort: "high", model_verbosity: "low", service_tier: "default", plan_mode_reasoning_effort: "high" });
+  assert.equal(Object.isFrozen(ROOT_POLICY), true);
+  assert.equal(Object.isFrozen(ULTRA_POLICY), true);
+  assert.equal(Object.isFrozen(ROOT_CONFIG_VALUES), true);
+});
+
+test("tracked operational files contain only the Astra-Luna architecture", async () => {
   const { stdout } = await execFileAsync("git", ["ls-files", "-co", "--exclude-standard"], {
     windowsHide: true,
   });
@@ -30,6 +41,9 @@ test("tracked operational files contain only the Sol-Luna architecture", async (
       continue;
     }
     const content = await readFile(path, "utf8");
+    if (!path.startsWith("tests/") && path !== "scripts/verify-platform.mjs") {
+      assert.doesNotMatch(content, /gpt-5\.6-sol|SOL_MODEL_VERBOSITY/, `Operational Sol routing in ${path}`);
+    }
     assert.doesNotMatch(
       content,
       /gpt-5\.6-terra|invoke-terra|SOL_TERRA|sol-terra-orchestration|invoke-sol-executor|sol-sol-orchestration/,
@@ -65,11 +79,11 @@ test("package scripts and skill policy expose the supported interfaces", async (
   );
   assert.match(metadata, /^\s*allow_implicit_invocation: false$/m);
   const config = await readFile(".codex/config.toml", "utf8");
-  assert.match(config, /^model = "gpt-5\.6-sol"$/m);
-  assert.match(config, /^model_reasoning_effort = "xhigh"$/m);
-  assert.match(config, new RegExp(`^model_verbosity = "${SOL_MODEL_VERBOSITY}"$`, "m"));
+  assert.match(config, /^model = "gpt-6-astra"$/m);
+  assert.match(config, /^model_reasoning_effort = "high"$/m);
+  assert.match(config, new RegExp(`^model_verbosity = "${MODEL_VERBOSITY}"$`, "m"));
   assert.match(config, /^service_tier = "default"$/m);
-  assert.match(config, /^plan_mode_reasoning_effort = "xhigh"$/m);
+  assert.match(config, /^plan_mode_reasoning_effort = "high"$/m);
   assert.match(config, /^max_threads = 4$/m);
 });
 
@@ -93,8 +107,8 @@ test("profile registry and operational guidance stay aligned", async () => {
       explore: ["gpt-5.6-luna", "max", "fast", "read-only", "shared-read-only", ["workspace-read", "operator-request"], 120_000],
       "implement-lite": ["gpt-5.6-luna", "max", "fast", "workspace-write", "isolated-worktree", ["workspace-read", "workspace-write", "operator-request"], null],
       playwright: ["gpt-5.6-luna", "max", "standard", "read-only", "shared-read-only", ["workspace-read", "browser", "operator-request"], null],
-      implement: ["gpt-5.6-sol", "high", "standard", "workspace-write", "isolated-worktree", ["workspace-read", "workspace-write", "operator-request"], null],
-      review: ["gpt-5.6-sol", "high", "standard", "read-only", "candidate-worktree", ["workspace-read", "review"], null],
+      implement: ["gpt-6-astra", "medium", "standard", "workspace-write", "isolated-worktree", ["workspace-read", "workspace-write", "operator-request"], null],
+      review: ["gpt-6-astra", "high", "standard", "read-only", "candidate-worktree", ["workspace-read", "review"], null],
     },
   );
   assert.match(
