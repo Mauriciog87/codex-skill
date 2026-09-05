@@ -3,7 +3,7 @@ name: sol-luna-orchestration
 description: Coordinate substantive software work with GPT-6 Astra at the root and verified Astra and Luna executor profiles. Covers durable assignments, isolated writer worktrees, candidate review, validated delivery, and human-confirmed Ultra takeovers. Invoke it before planning, delegating, coordinating, or validating independent work.
 ---
 
-# Astra-Luna Orchestration
+# Astra-Luna orchestration
 
 The technical skill name, launchers, managed markers, and state namespaces retain their historical identifiers. The advanced capacity key `sol` counts Astra runs and historical Sol records in the same four-slot pool; it does not enable new Sol execution. `scripts/model-policy.mjs` defines root and takeover defaults, while the profile registry defines executor routes.
 
@@ -43,7 +43,7 @@ All roles use low output verbosity. Fast profiles force `features.fast_mode = tr
 
 Root and planner use Astra/high. Implementation uses Astra/medium; independent review retains Astra/high and does not acquire root planning or approval authority. Escalation returns to the root rather than silently increasing effort or starting another session. Ultra requires explicit human authorization and runtime-advertised Astra/ultra support.
 
-Once `turn/start` succeeds, `explore` gets 120 seconds to report `item/*` progress for the active thread. Each matching event restarts the clock. The existing 900-second timeout still caps the whole run, and the other profiles use only that total timeout.
+Once `turn/start` succeeds, `explore` gets 120 seconds to report `item/*` progress for the active thread. Matching events reset this idle timer without extending the overall timeout. All profiles default to a 900-second overall timeout, configurable through `--timeout-seconds`; only `explore` has the additional idle timer.
 
 The launcher requires Codex CLI 0.147.0 or a later compatible version and uses the experimental Codex App Server over local stdio JSON-RPC. It deliberately has no fallback to the legacy execution path. App Server protocol `priority` maps to public `fast`, and protocol `default` maps to public `standard`.
 
@@ -64,21 +64,19 @@ Root acceptance reads effective global defaults through `config/read` without mo
 
 ## Launcher
 
-The canonical interface is:
+The canonical interface reads the briefing from stdin. Replace the placeholders with the chosen profile, repository, sandbox, and assignment options:
 
 ```text
-briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile <profile> --cwd <repository> --sandbox <mode> --timeout-seconds 900 [assignment contract]
+node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile <profile> --cwd <repository> --sandbox <mode> --timeout-seconds 900 [assignment options]
 ```
 
-Examples:
+For example, this read-only briefing works in PowerShell and Bash from the repository checkout:
 
 ```text
-briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile explore --cwd <repository> --sandbox read-only
-briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile implement-lite --cwd <repository> --sandbox workspace-write --write-root <path>
-briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile playwright --cwd <repository> --sandbox read-only
-briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile implement --cwd <repository> --sandbox workspace-write --write-root <path>
-briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile review --cwd <repository> --sandbox read-only
+echo "Find where executor profiles are defined. Report paths without changing files." | node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs --profile explore --cwd . --sandbox read-only
 ```
+
+Use the profile table above to select the route. Writers must explicitly pass `--sandbox workspace-write` and at least one `--write-root`; read-only profiles must not request workspace write.
 
 `npm run executor` remains a convenience entry point. Use the direct command for exact option forwarding and exit codes. Code `0` means completed with verified routing, `1` means blocked or failed, and `2` means invocation, capacity, timeout, configuration, contract, MCP, or routing verification failed.
 
@@ -96,7 +94,7 @@ Read [the assignment schema](references/assignment-request.schema.json) when con
 
 Assignment records and sanitized action events live outside the repository under Codex state. Every mutation carries an action id, expected state revision, and authority. Replays with the same action are idempotent; stale revisions, reused action ids with changed content, stale Ultra generations, and overlapping writer leases fail closed.
 
-Writer worktrees complement the sandbox; they do not replace it. The executor can write only inside its isolated worktree. The controller verifies the declared paths, symlink and submodule capabilities, required checks, and artifact boundaries before creating an immutable candidate commit. The executor never stages or commits, and only root or Ultra may integrate the candidate.
+Writer worktrees complement the sandbox; they do not replace it. Keep repository edits within the assigned paths in the isolated worktree. The controller checks those paths, symlink and submodule capabilities, required checks, and artifact boundaries before creating an immutable candidate commit. The executor never stages or commits, and only root or Ultra may integrate the candidate.
 
 Manual delivery leaves the integration unstaged. Commit delivery uses a temporary index containing only the candidate paths and preserves unrelated staged and working changes. Push delivery uses the remote and branch stored in the assignment, requires the delivery parent to exist remotely, verifies ancestry, and performs a normal noninteractive push without force. It never publishes unrelated local parent commits. There is no fallback to a shared writable checkout.
 
@@ -118,7 +116,7 @@ npm run control -- retry-delivery --cwd <repository> --assignment-id <id> --revi
 npm run control -- ack --cwd <repository> --assignment-id <id> --revision <n>
 ```
 
-Mutations require the exact current revision. `reconcile` mechanically performs any pending commit, push, acknowledgement, and cleanup steps. A Git delivery failure records only a sanitized error, enters `delivery_blocked`, and waits for an explicit `retry-delivery`. It does not retry a failing push in a loop.
+Mutations require the exact current revision. `reconcile` resumes pending commit, push, acknowledgment, and cleanup steps under the stored delivery policy. A Git delivery failure records a sanitized error and enters `delivery_blocked`. It waits for an explicit `retry-delivery` rather than retrying the failing push in a loop.
 
 Independent review runs `review` against `--candidate-id <id>` and publishes a verdict bound to that candidate revision. Operator questions, approvals, and delivery retries remain explicit dashboard or CLI actions. The controller never invents an answer.
 
@@ -157,7 +155,9 @@ node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs status
 
 `review` returns `APPROVE` or `COMMENT` with completed status, or `REQUEST_CHANGES` with blocked status and at least one blocker. It never changes files.
 
-`playwright` requires the enabled stdio MCP configuration `npx --yes @playwright/mcp@0.0.80`. The global installer pins or repairs that configuration. The launcher applies `mcp_servers.playwright.default_tools_approval_mode="approve"` only to that App Server process, adds `browser_run_code_unsafe` to its MCP deny-list, sets the MCP process working directory to a unique temporary directory, and extends the MCP arguments with the official `--isolated` and `--output-dir` options for the same location. It verifies that a Playwright MCP tool was used and removes the temporary artifacts.
+`playwright` requires the enabled stdio MCP configuration `npx --yes @playwright/mcp@0.0.80`. The global installer pins or repairs that configuration.
+
+For each run, the launcher applies `mcp_servers.playwright.default_tools_approval_mode="approve"` only to its App Server process and adds `browser_run_code_unsafe` to the MCP deny-list. It starts the MCP in a unique temporary directory and passes `--isolated` and `--output-dir` for that location. A successful run must include evidence of an actual Playwright MCP tool call. The launcher removes the temporary artifacts afterward.
 
 Executor turns use App Server approval policy `never`. Command and file approvals, permission grants, and MCP elicitations fail closed with protocol-valid responses. Non-blocking user-input requests receive an empty answer. Blocking, non-sensitive questions become durable operator requests whose acknowledged answers are carried into a retry; sensitive answers are never persisted.
 
@@ -168,10 +168,10 @@ Full interaction is allowed only on localhost and explicitly named development o
 Use Astra `ultra` on Standard only when a named architecture, security, concurrency, distributed-invariant, or contradictory-contract decision cannot be resolved responsibly by root Astra/high. The human must provide a reason and `--confirm-exclusive-takeover`.
 
 ```text
-briefing | node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs --cwd <repository> --reason <reason> --confirm-exclusive-takeover --sandbox read-only
+node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs --cwd <repository> --reason <reason> --confirm-exclusive-takeover --sandbox read-only
 ```
 
-Workspace writing requires an explicit `--sandbox workspace-write`. Ultra temporarily replaces the root, disables native multi-agent execution, and delegates only through verified profiles. Its executors inherit the exact `CODEX_ORCHESTRATION_LOCK_ID` and monotonic `CODEX_ORCHESTRATION_GENERATION`. They consume the normal capacity pools and never overlap write roots.
+Send the authorized briefing through stdin. Workspace writing requires an explicit `--sandbox workspace-write`. Ultra temporarily replaces the root, disables native multi-agent execution, and delegates only through verified profiles. Its executors inherit the exact `CODEX_ORCHESTRATION_LOCK_ID` and monotonic `CODEX_ORCHESTRATION_GENERATION`. They consume the normal capacity pools and never overlap write roots.
 
 New Ultra-owned writer assignments inherit the operator-controlled automatic-delivery setting. An explicit user boundary against commits or pushes takes precedence and requires `--delivery manual`. Durable executor output uses the v2 envelope; the Ultra result includes its integer `generation`.
 

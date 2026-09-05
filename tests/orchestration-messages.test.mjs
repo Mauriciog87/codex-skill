@@ -31,7 +31,7 @@ test("executor messages identify the complete verified route", () => {
       sandbox_mode: "read-only",
       routing_verified: true,
     }),
-    "Astra-Luna orchestrator: Executor routing verified for explore: gpt-5.6-luna at max reasoning on fast tier in read-only mode (routing_verified=true). Status: completed.",
+    "Astra-Luna orchestrator: explore task completed. Routing: verified (gpt-5.6-luna, max reasoning, fast tier, read-only).",
   );
 });
 
@@ -46,7 +46,7 @@ test("unverified executor messages do not claim route metadata", () => {
   });
   assert.equal(
     message,
-    "Astra-Luna orchestrator: Executor routing was not verified for implement. Status: failed.",
+    "Astra-Luna orchestrator: implement task failed. Routing: not verified. See blockers and warnings in the JSON result.",
   );
   assert.doesNotMatch(message, /gpt-6-astra|high reasoning|standard tier/);
 });
@@ -67,8 +67,31 @@ test("Ultra messages identify takeover mode and recovery state", () => {
       routing_verified: false,
       warnings: ["Ultra lock is recovery-required."],
     }),
-    "Astra-Luna orchestrator: Ultra routing was not verified. Status: failed. The repository lock requires recovery.",
+    "Astra-Luna orchestrator: Ultra task failed. Routing: not verified. See blockers and warnings in the JSON result. The repository lock requires recovery. Inspect it with the orchestration gate status command before attempting recovery.",
   );
+});
+
+test("verified routing does not imply that the task completed", () => {
+  for (const status of ["blocked", "failed"]) {
+    const result = {
+      status,
+      profile: "implement",
+      model: "gpt-6-astra",
+      reasoning_effort: "medium",
+      service_tier: "standard",
+      sandbox_mode: "workspace-write",
+      routing_verified: true,
+    };
+    const executorMessage = executorResultMessage(result);
+    const ultraMessage = ultraResultMessage({ ...result, reasoning_effort: "ultra" });
+    for (const message of [executorMessage, ultraMessage]) {
+      assert.match(message, new RegExp(`task ${status}\\.`));
+      assert.match(message, /Routing: verified/);
+      assert.doesNotMatch(message, /completed|not verified/);
+    }
+    assert.match(executorMessage, /gpt-6-astra, medium reasoning/);
+    assert.match(ultraMessage, /gpt-6-astra, ultra reasoning/);
+  }
 });
 
 test("status colors respect TTY, NO_COLOR, TERM, and FORCE_COLOR", () => {

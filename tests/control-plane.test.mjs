@@ -109,6 +109,25 @@ test("path contracts normalize separators and compare concrete roots", () => {
   }
 });
 
+test("check timeout errors name the field and its allowed range", () => {
+  for (const timeout of [0, 86_401, 1.5, "900"]) {
+    assert.throws(
+      () => validateAssignmentRequest(request({
+        required_checks: [{ id: "tests", argv: ["node", "--test"], timeout_seconds: timeout }],
+      })),
+      (error) => error instanceof ControlPlaneError
+        && error.code === "invalid-contract"
+        && error.message === "required_checks[0].timeout_seconds must be an integer between 1 and 86400.",
+    );
+  }
+  for (const timeout of [1, 900, 86_400]) {
+    const validated = validateAssignmentRequest(request({
+      required_checks: [{ id: "tests", argv: ["node", "--test"], timeout_seconds: timeout }],
+    }));
+    assert.equal(validated.required_checks[0].timeout_seconds, timeout);
+  }
+});
+
 test("invalid integration is rejected before its effect or journal preparation", async () => {
   const fixture = await createFixture();
   try {
@@ -289,7 +308,7 @@ test("persisted assignments without delivery remain backward-compatible manual w
   }
 });
 
-test("root lifecycle requires claim, candidate approval, integration, and acknowledgement", async () => {
+test("root lifecycle requires claim, candidate approval, integration, and acknowledgment", async () => {
   const fixture = await createFixture();
   try {
     let record = await createAssignment({
@@ -632,7 +651,7 @@ test("resource leases block overlapping writers and planner selects disjoint wor
   }
 });
 
-test("operator requests require answer acknowledgement before retry", async () => {
+test("operator requests require answer acknowledgment before retry", async () => {
   const fixture = await createFixture();
   try {
     let record = await createAssignment({

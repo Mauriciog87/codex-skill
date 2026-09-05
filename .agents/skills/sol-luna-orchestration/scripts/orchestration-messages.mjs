@@ -6,7 +6,7 @@ function upper(value) {
 }
 
 function describeRoute({ model, reasoningEffort, serviceTier, sandboxMode }) {
-  return `${model} at ${reasoningEffort} reasoning on ${serviceTier} tier in ${sandboxMode} mode`;
+  return `${model}, ${reasoningEffort} reasoning, ${serviceTier} tier, ${sandboxMode}`;
 }
 
 export function executorLaunchMessage({
@@ -21,15 +21,15 @@ export function executorLaunchMessage({
 
 export function executorResultMessage(result) {
   if (result.routing_verified === true) {
-    return `${PREFIX}: Executor routing verified for ${result.profile}: ${describeRoute({
+    return `${PREFIX}: ${result.profile} task ${result.status}. Routing: verified (${describeRoute({
       model: result.model,
       reasoningEffort: result.reasoning_effort,
       serviceTier: result.service_tier,
       sandboxMode: result.sandbox_mode,
-    })} (routing_verified=true). Status: ${result.status}.`;
+    })}).`;
   }
 
-  return `${PREFIX}: Executor routing was not verified for ${result.profile ?? "the requested profile"}. Status: ${result.status}.`;
+  return `${PREFIX}: ${result.profile ?? "Executor"} task ${result.status}. Routing: not verified. See blockers and warnings in the JSON result.`;
 }
 
 export function ultraLaunchMessage({ model, reasoningEffort, serviceTier, sandboxMode }) {
@@ -38,18 +38,18 @@ export function ultraLaunchMessage({ model, reasoningEffort, serviceTier, sandbo
 
 export function ultraResultMessage(result) {
   if (result.routing_verified === true) {
-    return `${PREFIX}: Ultra routing verified: ${describeRoute({
+    return `${PREFIX}: Ultra task ${result.status}. Routing: verified (${describeRoute({
       model: result.model,
       reasoningEffort: result.reasoning_effort,
       serviceTier: result.service_tier,
       sandboxMode: result.sandbox_mode,
-    })} (routing_verified=true). Status: ${result.status}.`;
+    })}).`;
   }
 
   const recovery = result.warnings?.some((warning) => warning.includes("recovery-required"))
-    ? " The repository lock requires recovery."
+    ? " The repository lock requires recovery. Inspect it with the orchestration gate status command before attempting recovery."
     : "";
-  return `${PREFIX}: Ultra routing was not verified. Status: ${result.status}.${recovery}`;
+  return `${PREFIX}: Ultra task ${result.status}. Routing: not verified. See blockers and warnings in the JSON result.${recovery}`;
 }
 
 export function shouldUseColor(

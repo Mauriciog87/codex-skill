@@ -40,7 +40,7 @@ Automatic delivery commits only the integrated candidate and pushes only when th
 
 Only root or Ultra may claim, approve, integrate, acknowledge, archive, or retry a writer assignment. Independent `review` runs against the exact candidate revision. Operator questions and approvals must remain explicit.
 
-Use `orchestration-control.mjs status|next|reconcile` to inspect and resume residual work. Its revision-fenced mutation commands handle claim, review, approval, integration, delivery, acknowledgement, answers, retries, abandonment, archival, and cleanup. A failed automatic delivery enters `delivery_blocked` and waits for an explicit retry; the controller does not keep retrying on its own.
+Use `orchestration-control.mjs status|next|reconcile` to inspect and resume remaining work. Every mutation must use the current state revision, whether it claims a result, records an answer, integrates a candidate, or completes delivery and acknowledgment. The same requirement applies to retries, abandonment, archival, and cleanup. A failed automatic delivery enters `delivery_blocked` and waits for an explicit retry; the controller does not retry on its own.
 
 The local dashboard is projection-only, bound to loopback, protected by a one-time authentication token, and guarded against CSRF. It allows only operator answers, approvals, and delivery retries. The deterministic simulator changes neither Git nor durable state.
 
@@ -112,7 +112,7 @@ Stop and ask the operator when the checkout is dirty, another Git operation is a
 
 `explore` returns no changed files and escalates architectural, security, concurrency, distributed-invariant, or contradictory-contract decisions. `implement-lite` escalates expanded or cross-cutting work to `implement`. Neither implementation profile self-approves. `review` returns `APPROVE` or `COMMENT` with completed status, or `REQUEST_CHANGES` with blocked status and at least one blocker.
 
-Once `turn/start` succeeds, `explore` gets 120 seconds to report `item/*` progress for the active thread. Each matching event restarts the clock. The 900-second timeout still caps the whole run, and the other profiles use only that total timeout.
+Once `turn/start` succeeds, `explore` gets 120 seconds to report `item/*` progress for the active thread. Matching events reset its idle timer, not the overall timeout. The overall timeout defaults to 900 seconds; `--timeout-seconds` can change it. Other profiles use only the overall timeout.
 
 `playwright` keeps repository files unchanged, uses the configured Playwright MCP in an isolated temporary environment, and never calls `browser_run_code_unsafe`. Full interaction is limited to localhost and named dev/test targets. External state changes require explicit destination-specific authorization, and purchases, deletion, publishing, messaging, account/security changes, or production mutation are prohibited.
 

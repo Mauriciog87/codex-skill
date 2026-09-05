@@ -204,7 +204,7 @@ function validateCheck(value, index) {
   }
   const timeoutSeconds = value.timeout_seconds ?? 900;
   if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 86_400) {
-    throw new ControlPlaneError(`required_checks[${index}].timeout_seconds is invalid.`, "invalid-contract");
+    throw new ControlPlaneError(`required_checks[${index}].timeout_seconds must be an integer between 1 and 86400.`, "invalid-contract");
   }
   return {
     id,
