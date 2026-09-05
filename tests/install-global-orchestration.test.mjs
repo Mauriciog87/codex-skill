@@ -77,7 +77,7 @@ test("installer parser failures and effective-setting mismatches leave no partia
   }
 });
 
-test("reinstalling replaces the Sol defaults and managed block without duplicating or restoring them", () => {
+test("reinstalling updates model defaults without restoring old global instructions", () => {
   const original = 'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "xhigh"\nplan_mode_reasoning_effort = "xhigh"\n';
   const first = updateGlobalConfig(original);
   assert.match(first.content, /^model = "gpt-6-astra"$/m);
@@ -86,11 +86,7 @@ test("reinstalling replaces the Sol defaults and managed block without duplicati
   assert.equal(updateGlobalConfig(first.content).content, first.content);
   const oldBlock = `Before\n${MANAGED_BLOCK_START}\n# Global Sol-Luna orchestration\nThe root uses Sol/xhigh/Standard.\n${MANAGED_BLOCK_END}\nAfter\n`;
   const updated = updateGlobalInstructions(oldBlock).content;
-  assert.ok(updated.startsWith("Before\n"));
-  assert.ok(updated.endsWith("After\n"));
-  assert.match(updated, /Astra\/high\/Standard/);
-  assert.doesNotMatch(updated, /Sol\/xhigh/);
-  assert.equal(updated.split(MANAGED_BLOCK_START).length, 2);
+  assert.equal(updated, "Before\nAfter\n");
   assert.equal(updateGlobalInstructions(updated).content, updated);
 });
 
@@ -219,19 +215,16 @@ test("updateGlobalConfig preserves unrelated values and is idempotent", () => {
   assert.match(first.content, /^codex_hooks = true\r$/m);
   assert.match(first.content, /^fast_mode = false\r$/m);
   assert.match(first.content, /^\[mcp_servers\.playwright\]\r$/m);
-  assert.match(first.content, /^enabled = true\r$/m);
-  assert.match(first.content, /^command = "npx"\r$/m);
-  assert.match(first.content, /^args = \["--yes","@playwright\/mcp@0\.0\.80"\]\r$/m);
+  assert.match(first.content, /^enabled = false\r$/m);
+  assert.match(first.content, /^command = "custom"\r$/m);
+  assert.match(first.content, /^args = \["@playwright\/mcp@latest"\]\r$/m);
   assert.match(first.content, /^startup_timeout_sec = 30\r$/m);
   assert.equal(updateGlobalConfig(first.content).changed, false);
   assert.throws(
     () => updateGlobalConfig('model = "one"\nmodel = "two"\n'),
     /duplicate top-level model/,
   );
-  assert.throws(
-    () => updateGlobalConfig('mcp_servers.playwright.command = "npx"\n'),
-    /ambiguous Playwright MCP definition/,
-  );
+  assert.ok(updateGlobalConfig('mcp_servers.playwright.command = "npx"\n').content.includes('mcp_servers.playwright.command = "npx"'));
 });
 
 test("updateGlobalConfig manages hooks without replacing unrelated hook sources", () => {
@@ -260,28 +253,64 @@ test("updateGlobalConfig manages hooks without replacing unrelated hook sources"
   );
 });
 
-test("updateGlobalInstructions manages one exact block and rejects conflicts", () => {
-  const first = updateGlobalInstructions("# Existing\n");
-  assert.equal(first.changed, true);
-  assert.match(first.content, new RegExp(MANAGED_BLOCK_START));
-  assert.match(first.content, new RegExp(MANAGED_BLOCK_END));
-  assert.match(first.content, /\$sol-luna-orchestration/);
-  assert.match(first.content, /Rebases, merges, cherry-picks, reverts/);
-  assert.match(first.content, /Do not ask `explore` to scan commits/);
-  assert.equal(updateGlobalInstructions(first.content).changed, false);
-  assert.throws(
-    () => updateGlobalInstructions(`${MANAGED_BLOCK_START}\nmissing end\n`),
-    /malformed/,
-  );
-  assert.throws(
-    () => updateGlobalInstructions("Use $sol-terra-orchestration globally.\n"),
-    /unmanaged legacy orchestration/,
-  );
-  const migrated = updateGlobalInstructions(
-    "<!-- sol-sol-orchestration:start -->\nold block\n<!-- sol-sol-orchestration:end -->\n",
-  );
-  assert.match(migrated.content, new RegExp(MANAGED_BLOCK_START));
-  assert.doesNotMatch(migrated.content, /<!-- sol-sol-orchestration:start -->/);
+test("global instructions without a managed block stay exactly as written", () => {
+  for (const content of [
+    undefined,
+    null,
+    "",
+    "\uFEFF",
+    "# Existing",
+    "\uFEFF# Existing\r\n\r\nKeep this.  \n\n",
+    "Use $sol-terra-orchestration or $sol-sol-orchestration when requested.\n",
+    "Keep SOL_TERRA_ROLE in technical examples.\n",
+  ]) {
+    assert.deepEqual(updateGlobalInstructions(content), {
+      content: content ?? "",
+      changed: false,
+    });
+  }
+});
+
+for (const name of [SKILL_NAME, LEGACY_SKILL_NAME, TERRA_LEGACY_SKILL_NAME]) {
+  test(`only the marked ${name} instructions are removed`, () => {
+    const prefix = "\uFEFF# My preferences\r\n\r\nKeep accents: español.  \n";
+    const suffix = "\r\nKeep this too.  \r\n\n";
+    const block = `  <!-- ${name}:start -->\r\nOld instructions.\n\t<!-- ${name}:end -->\r\n`;
+    const result = updateGlobalInstructions(prefix + block + suffix);
+    assert.deepEqual(result, { content: prefix + suffix, changed: true });
+    assert.deepEqual(updateGlobalInstructions(result.content), {
+      content: prefix + suffix,
+      changed: false,
+    });
+  });
+}
+
+test("removing a managed block preserves the BOM and surrounding line endings", () => {
+  const block = `${MANAGED_BLOCK_START}\r\nOld instructions.\n${MANAGED_BLOCK_END}`;
+  for (const [content, expected] of [
+    [block, ""],
+    [`\uFEFF${block}`, "\uFEFF"],
+    [`\uFEFF${block}\r\nAfter`, "\uFEFFAfter"],
+    [`Before\r\n${block}`, "Before\r\n"],
+    [`Before\n\n${block}\n\nAfter\r`, "Before\n\n\nAfter\r"],
+  ]) {
+    assert.deepEqual(updateGlobalInstructions(content), { content: expected, changed: true });
+  }
+});
+
+test("incomplete, reversed, duplicate, nested, and mismatched markers are rejected", () => {
+  const block = `${MANAGED_BLOCK_START}\nold\n${MANAGED_BLOCK_END}\n`;
+  for (const content of [
+    `${MANAGED_BLOCK_START}\nmissing end\n`,
+    `${MANAGED_BLOCK_END}\n`,
+    `${MANAGED_BLOCK_END}\n${MANAGED_BLOCK_START}\n`,
+    block + block,
+    `${MANAGED_BLOCK_START}\n${block}${MANAGED_BLOCK_END}\n`,
+    `${MANAGED_BLOCK_START}\nold\n<!-- sol-sol-orchestration:end -->\n`,
+    "<!-- sol-terra-orchestration:start -->\nmissing end\n",
+  ]) {
+    assert.throws(() => updateGlobalInstructions(content), /malformed/);
+  }
 });
 
 test("installGlobalOrchestration is idempotent and removes a validated legacy copy", async (context) => {
@@ -305,7 +334,7 @@ test("installGlobalOrchestration is idempotent and removes a validated legacy co
   assert.equal(first.already_linked, false);
   assert.equal(first.configuration_changed, true);
   assert.equal(first.delivery_configuration_changed, true);
-  assert.equal(first.instructions_changed, true);
+  assert.equal(first.instructions_changed, false);
   assert.deepEqual(first.legacy_removed, [legacySkill, terraLegacySkill]);
   assert.equal(await realpath(first.global_skill), await realpath(fixture.canonicalSkill));
   await assert.rejects(lstat(legacySkill), { code: "ENOENT" });
@@ -314,13 +343,12 @@ test("installGlobalOrchestration is idempotent and removes a validated legacy co
   assert.match(await readFile(fixture.configPath, "utf8"), /^model_verbosity = "low"$/m);
   assert.match(await readFile(fixture.configPath, "utf8"), /^codex_hooks = true$/m);
   assert.match(await readFile(fixture.configPath, "utf8"), /^\[\[hooks\.PreToolUse\]\]$/m);
-  assert.match(await readFile(fixture.configPath, "utf8"), /^\[mcp_servers\.playwright\]$/m);
-  assert.match(await readFile(fixture.configPath, "utf8"), /^args = \["--yes","@playwright\/mcp@0\.0\.80"\]$/m);
+  assert.doesNotMatch(await readFile(fixture.configPath, "utf8"), /mcp_servers\.playwright/);
   assert.equal(
     await readFile(fixture.deliveryConfigPath, "utf8"),
     '{\n  "automatic_delivery": true\n}\n',
   );
-  assert.match(await readFile(fixture.agentsPath, "utf8"), /Preserve this text/);
+  assert.equal(await readFile(fixture.agentsPath, "utf8"), "# Existing global guidance\n\nPreserve this text.\n");
   assert.equal(
     await readFile(fixture.hooksPath, "utf8"),
     '{\r\n  "context-mode": true\r\n}\r\n',
@@ -389,11 +417,78 @@ test("installGlobalOrchestration rejects damaged hook markers without partial ch
   assert.equal(await readFile(fixture.hooksPath, "utf8"), originalHooks);
 });
 
-test("installGlobalOrchestration updates a nonempty AGENTS.override.md", async (context) => {
+for (const [name, content] of [
+  ["missing", null],
+  ["empty", ""],
+  ["custom", "\uFEFF# My instructions\r\nUse skills when needed.  \n"],
+]) {
+  test(`installing twice leaves ${name} global instructions alone`, async (context) => {
+    const fixture = await createFixture(context, `instructions-${name}-`);
+    if (content === null) {
+      await rm(fixture.agentsPath);
+    } else {
+      await writeFile(fixture.agentsPath, content);
+    }
+    for (let run = 0; run < 2; run += 1) {
+      const result = await installGlobalOrchestration({
+        repositoryRoot: fixture.repositoryRoot,
+        homeDirectory: fixture.homeDirectory,
+        codexHome: fixture.codexHome,
+      });
+      assert.equal(result.instructions_changed, false);
+      if (content === null) {
+        await assert.rejects(lstat(fixture.agentsPath), { code: "ENOENT" });
+      } else {
+        assert.deepEqual(await readFile(fixture.agentsPath), Buffer.from(content));
+      }
+    }
+  });
+}
+
+test("malformed instruction markers stop installation before any files change", async (context) => {
+  const fixture = await createFixture(context, "instructions-malformed-");
+  const originalConfig = await readFile(fixture.configPath);
+  const originalHooks = await readFile(fixture.hooksPath);
+  const content = `${MANAGED_BLOCK_START}\nMissing closing marker.\n`;
+  await writeFile(fixture.agentsPath, content);
+  await assert.rejects(installGlobalOrchestration({
+    repositoryRoot: fixture.repositoryRoot,
+    homeDirectory: fixture.homeDirectory,
+    codexHome: fixture.codexHome,
+    configReader: async () => { throw new Error("Config validation should not run."); },
+  }), /malformed orchestration markers/);
+  assert.deepEqual(await readFile(fixture.configPath), originalConfig);
+  assert.deepEqual(await readFile(fixture.hooksPath), originalHooks);
+  assert.equal(await readFile(fixture.agentsPath, "utf8"), content);
+  await assert.rejects(lstat(join(fixture.homeDirectory, ".agents", "skills", SKILL_NAME)), { code: "ENOENT" });
+  await assert.rejects(lstat(fixture.deliveryConfigPath), { code: "ENOENT" });
+});
+
+for (const override of ["", "  \n", "# Custom override\r\n"]) {
+  test(`an ${override.trim() ? "active" : "empty"} override keeps instruction selection unchanged (${JSON.stringify(override)})`, async (context) => {
+    const fixture = await createFixture(context, "instructions-selection-");
+    const overridePath = join(fixture.codexHome, "AGENTS.override.md");
+    const original = `# Global preferences\n${MANAGED_BLOCK_START}\nOld instructions.\n${MANAGED_BLOCK_END}\n`;
+    await writeFile(fixture.agentsPath, original);
+    await writeFile(overridePath, override);
+    const activeOverride = Boolean(override.trim());
+    const result = await installGlobalOrchestration({
+      repositoryRoot: fixture.repositoryRoot,
+      homeDirectory: fixture.homeDirectory,
+      codexHome: fixture.codexHome,
+    });
+    assert.equal(result.global_instructions, activeOverride ? overridePath : fixture.agentsPath);
+    assert.equal(result.instructions_changed, !activeOverride);
+    assert.equal(await readFile(overridePath, "utf8"), override);
+    assert.equal(await readFile(fixture.agentsPath, "utf8"), activeOverride ? original : "# Global preferences\n");
+  });
+}
+
+test("the installer removes old instructions from the active override only", async (context) => {
   const fixture = await createFixture(context, "sol-sol-install-override-");
   const overridePath = join(fixture.codexHome, "AGENTS.override.md");
   const originalAgents = await readFile(fixture.agentsPath, "utf8");
-  await writeFile(overridePath, "# Active override\n");
+  await writeFile(overridePath, `# Active override\n${MANAGED_BLOCK_START}\nOld instructions.\n${MANAGED_BLOCK_END}\n`);
 
   const result = await installGlobalOrchestration({
     repositoryRoot: fixture.repositoryRoot,
@@ -401,7 +496,16 @@ test("installGlobalOrchestration updates a nonempty AGENTS.override.md", async (
     codexHome: fixture.codexHome,
   });
   assert.equal(result.global_instructions, overridePath);
-  assert.match(await readFile(overridePath, "utf8"), /\$sol-luna-orchestration/);
+  assert.equal(result.instructions_changed, true);
+  assert.equal(await readFile(overridePath, "utf8"), "# Active override\n");
+  assert.equal(await readFile(fixture.agentsPath, "utf8"), originalAgents);
+  const second = await installGlobalOrchestration({
+    repositoryRoot: fixture.repositoryRoot,
+    homeDirectory: fixture.homeDirectory,
+    codexHome: fixture.codexHome,
+  });
+  assert.equal(second.instructions_changed, false);
+  assert.equal(await readFile(overridePath, "utf8"), "# Active override\n");
   assert.equal(await readFile(fixture.agentsPath, "utf8"), originalAgents);
 });
 

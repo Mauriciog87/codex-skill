@@ -134,9 +134,10 @@ test("profile registry and operational guidance stay aligned", async () => {
   );
   assert.match(playwrightConfiguration, /--isolated/);
   assert.match(playwrightConfiguration, /--output-dir/);
-  assert.match(playwrightConfiguration, /default_tools_approval_mode=\"approve\"/);
+  assert.match(playwrightConfiguration, /default_tools_approval_mode: "approve"/);
   assert.match(playwrightConfiguration, /browser_run_code_unsafe/);
-  assert.match(playwrightConfiguration, /mcp_servers\.playwright\.cwd/);
+  assert.match(playwrightConfiguration, /sol_luna_playwright/);
+  assert.match(playwrightConfiguration, /mcp_servers\.playwright\.enabled=false/);
 
   const appServerClient = await readFile(
     ".agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs",
@@ -283,8 +284,8 @@ test("profile registry and operational guidance stay aligned", async () => {
   }
 
   const installer = await readFile("scripts/install-global-orchestration.mjs", "utf8");
-  assert.match(installer, /Rebases, merges, cherry-picks, reverts/);
-  assert.match(installer, /Do not ask `explore` to scan commits/);
+  assert.doesNotMatch(installer, /function managedBlockLines/);
+  assert.doesNotMatch(installer, /setPlaywrightMcpValues/);
 });
 
 test("cross-platform workflows keep offline and live verification separated", async () => {

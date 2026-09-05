@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { once } from "node:events";
-import { lstat, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, readdir, readlink, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -40,6 +40,7 @@ import {
 } from "../.agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs";
 import {
   acquireUltraLock,
+  abandonExecutorRun,
   beginExecutorRun,
   EXECUTOR_CAPACITY_LIMITS,
   finishExecutorRun,
@@ -65,6 +66,7 @@ import {
 } from "./platform-runtime.mjs";
 
 import { ROOT_CONFIG_VALUES, ROOT_POLICY } from "../.agents/skills/sol-luna-orchestration/scripts/model-policy.mjs";
+import { PLAYWRIGHT_MCP_SERVER_NAME, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_RUNTIME_VERSION, createPlaywrightMcpRuntime, removePlaywrightMcpRuntime, validatePlaywrightMcpRuntimeConfiguration } from "../.agents/skills/sol-luna-orchestration/scripts/playwright-mcp-configuration.mjs";
 
 export const ORCHESTRATOR_MODEL = ROOT_POLICY.model;
 export const ORCHESTRATOR_REASONING_EFFORT = ROOT_POLICY.reasoningEffort;
@@ -138,7 +140,7 @@ async function activeGlobalInstructions(codexHome) {
     return { path: overridePath, content: overrideContent };
   }
   const agentsPath = join(codexHome, "AGENTS.md");
-  return { path: agentsPath, content: await readFile(agentsPath, "utf8") };
+  return { path: agentsPath, content: await readOptional(agentsPath) };
 }
 
 async function verifySkillDiscovery(repositoryRoot) {
@@ -178,7 +180,7 @@ async function verifySkillDiscovery(repositoryRoot) {
   }
   const globalInstructions = await activeGlobalInstructions(codexHome);
   if (updateGlobalInstructions(globalInstructions.content).changed) {
-    throw new Error("The active global instructions do not contain the managed Astra-Luna block.");
+    throw new Error("The active global instructions still contain an old orchestration block; rerun the installer to remove it.");
   }
 
   const legacyPaths = [
@@ -482,6 +484,8 @@ export async function verifyAppServerSchema({
       "item/permissions/requestApproval",
       "item/tool/requestUserInput",
       "mcpServer/elicitation/request",
+      "mcpServerStatus/list",
+      "mcpServer/startupStatus/updated",
       "experimentalApi",
       "serviceTier",
       "outputSchema",
@@ -514,6 +518,11 @@ export async function verifyAppServerSchema({
       PermissionsRequestApprovalResponse: ["permissions"],
       ToolRequestUserInputResponse: ["answers"],
       McpServerElicitationRequestResponse: ["action"],
+      ListMcpServerStatusParams: ["threadId", "detail", "cursor", "limit"],
+      ListMcpServerStatusResponse: ["data", "nextCursor"],
+      McpServerStatus: ["name", "serverInfo", "tools"],
+      McpServerInfo: ["name", "version"],
+      McpServerStatusUpdatedNotification: ["threadId", "name", "status"],
     })) {
       const definition = findDefinition(definitionName);
       if (definition === undefined) {
@@ -535,10 +544,28 @@ export async function verifyAppServerSchema({
     if (appToolApproval === undefined || !JSON.stringify(appToolApproval).includes('"approve"')) {
       throw new Error("Generated App Server AppToolApproval does not expose approve.");
     }
-    return { cli_minimum: MINIMUM_CODEX_VERSION, generated_files: files.length };
+    await verifyPlaywrightConfigurationParser({ environment });
+    return { cli_minimum: MINIMUM_CODEX_VERSION, generated_files: files.length, private_mcp_config: true };
   } finally {
     await rm(outputDirectory, { recursive: true, force: true });
   }
+}
+
+export async function verifyPlaywrightConfigurationParser({ environment = process.env, configReader = readCodexConfig } = {}) {
+  const home = await mkdtemp(join(tmpdir(), "playwright-parser-"));
+  try {
+    for (const original of ["", '[mcp_servers.playwright]\ncommand = "custom-browser"\nargs = ["user-version"]\n', '[mcp_servers.playwright]\nurl = "https://example.test/mcp"\n']) {
+      const configPath = join(home, "config.toml");
+      await writeFile(configPath, original);
+      const disableUserPlaywright = original !== "";
+      const runtime = await createPlaywrightMcpRuntime({ environment, disableUserPlaywright });
+      try {
+        const effective = await configReader({ cwd: home, environment: { ...runtime.environment, HOME: home, USERPROFILE: home, CODEX_HOME: home }, configurationOverrides: runtime.overrides });
+        validatePlaywrightMcpRuntimeConfiguration(effective, runtime.outputDirectory, { disableUserPlaywright });
+        if (await readFile(configPath, "utf8") !== original) throw new Error("The private MCP parser probe changed its source configuration.");
+      } finally { await removePlaywrightMcpRuntime(runtime); }
+    }
+  } finally { await rm(home, { recursive: true, force: true }); }
 }
 
 async function runExploreProbe(repositoryRoot, sessionRoots) {
@@ -798,7 +825,58 @@ async function runReviewProbe(repository, sessionRoots) {
   return executor.result;
 }
 
-async function runPlaywrightProbe(repositoryRoot, sessionRoots) {
+export async function snapshotPlaywrightInputs(repositoryRoot, environment = process.env) {
+  const { stdout } = await execFileAsync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], { cwd: repositoryRoot, windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
+  const hash = createHash("sha256");
+  hash.update(await gitStatus(repositoryRoot));
+  for (const args of [["diff", "--binary"], ["diff", "--cached", "--binary"]]) {
+    const diff = await execFileAsync("git", args, { cwd: repositoryRoot, windowsHide: true, encoding: "buffer", maxBuffer: 64 * 1024 * 1024 });
+    hash.update(diff.stdout);
+  }
+  const paths = [...new Set(stdout.split("\0").filter(Boolean))].sort().map((path) => join(repositoryRoot, path));
+  const codexHome = environment.CODEX_HOME || join(homedir(), ".codex");
+  paths.push(join(codexHome, "config.toml"), join(codexHome, "hooks.json"));
+  for (const path of paths) {
+    hash.update(path);
+    try {
+      const metadata = await lstat(path);
+      hash.update(String(metadata.mode));
+      if (metadata.isSymbolicLink()) hash.update(await readlink(path));
+      else if (metadata.isFile()) hash.update(await readFile(path));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      hash.update("missing");
+    }
+  }
+  return hash.digest("hex");
+}
+
+export async function validatePlaywrightProbeEvidence({ runtime, server, calls }, url) {
+  if (server?.name !== PLAYWRIGHT_MCP_SERVER_NAME || server.packageVersion !== PLAYWRIGHT_MCP_VERSION || server.runtimeVersion !== PLAYWRIGHT_RUNTIME_VERSION || !Array.isArray(calls)) {
+    throw new Error("The browser probe has no verified private MCP server evidence.");
+  }
+  const navigation = calls.findIndex((call) => call.tool === "browser_navigate" && call.arguments?.url === url);
+  const heading = calls.findIndex((call, index) => index >= navigation && JSON.stringify(call.result).includes('Astra-Luna Playwright probe'));
+  const click = calls.findIndex((call, index) => index > heading && call.tool === "browser_click");
+  const state = calls.findIndex((call, index) => index >= click && call.tool === "browser_snapshot" &&
+    call.result?.content?.some((part) => part.type === "text" && /^\s*- paragraph(?: \[[^\]\r\n]+\])*: verified\s*$/m.test(part.text)) === true);
+  const screenshot = calls.findIndex((call, index) => index > state && call.tool === "browser_take_screenshot" && call.arguments?.filename === "probe.png");
+  const closed = calls.findIndex((call, index) => index > screenshot && call.tool === "browser_close");
+  if ([navigation, heading, click, state, screenshot, closed].some((index) => index < 0)) {
+    throw new Error("The browser probe did not prove navigation, heading, click, changed state, screenshot and close in order.");
+  }
+  const pngPath = join(runtime.outputDirectory, "probe.png");
+  const metadata = await lstat(pngPath);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size < 45 || metadata.size > 16 * 1024 * 1024) throw new Error("The browser probe screenshot is not a bounded PNG file.");
+  const png = await readFile(pngPath);
+  if (!png.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) || png.toString("ascii", 12, 16) !== "IHDR" || png.readUInt32BE(16) === 0 || png.readUInt32BE(20) === 0 || !png.subarray(-8, -4).equals(Buffer.from("IEND"))) {
+    throw new Error("The browser probe screenshot is not a valid PNG image.");
+  }
+  return createHash("sha256").update(png).digest("hex");
+}
+
+async function runPlaywrightProbe(repositoryRoot, sessionRoots, { onVerifiedRuntime } = {}) {
+  const beforeSnapshot = await snapshotPlaywrightInputs(repositoryRoot);
   const server = createServer((_request, response) => {
     response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     response.end(
@@ -810,11 +888,13 @@ async function runPlaywrightProbe(repositoryRoot, sessionRoots) {
   const address = server.address();
   const url = `http://127.0.0.1:${address.port}/`;
   const beforeStatus = await gitStatus(repositoryRoot);
+  let runtimeDirectory;
+  let screenshotDigest;
   try {
     const executor = await invokeExecutor({
       briefing: [
         `Use the Playwright MCP to open ${url}`,
-        "Verify the h1 text is Astra-Luna Playwright probe, click #action, verify #status becomes verified, and take one screenshot.",
+        "Use only sol_luna_playwright tools. Verify the h1 text is Astra-Luna Playwright probe, click #action, then call browser_snapshot and verify #status becomes verified. Call browser_take_screenshot with filename probe.png, then browser_close. Do not use shell or another browser integration.",
         "Do not modify repository files. Return completed, no changed files, at least two concise evidence checks, and no blockers or warnings.",
       ].join("\n"),
       options: {
@@ -824,6 +904,11 @@ async function runPlaywrightProbe(repositoryRoot, sessionRoots) {
         timeoutSeconds: 300,
       },
       sessionRoots,
+      onPlaywrightEvidence: async (evidence) => {
+        runtimeDirectory = evidence.runtime.rootDirectory;
+        screenshotDigest = await validatePlaywrightProbeEvidence(evidence, url);
+        onVerifiedRuntime?.({ root: runtimeDirectory, readyAt: evidence.server.readyAt, closedAt: evidence.calls.at(-1).observedAt });
+      },
     });
     verifyExecutorResultSchema(executor.result);
     if (executor.exitCode !== 0) {
@@ -838,11 +923,42 @@ async function runPlaywrightProbe(repositoryRoot, sessionRoots) {
     ) {
       throw new Error("The Playwright probe did not prove isolated MCP browser access.");
     }
+    if (!runtimeDirectory || !screenshotDigest) throw new Error("The browser probe did not validate its screenshot before cleanup.");
+    try { await stat(runtimeDirectory); throw new Error("The browser probe left its temporary runtime directory behind."); }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+    executor.result.checks.push(`playwright_screenshot_sha256:${screenshotDigest}`, "playwright_cleanup:verified");
     return executor.result;
   } finally {
     server.close();
     await once(server, "close");
+    if (await snapshotPlaywrightInputs(repositoryRoot) !== beforeSnapshot) throw new Error("The Playwright probe changed repository content, staging, global config or hooks.json.");
   }
+}
+
+async function runPlaywrightIsolationProbe(repositoryRoot, sessionRoots) {
+  const initial = await getOrchestrationStatus(repositoryRoot);
+  if (initial.capacity.machine.total !== 0) throw new Error("Playwright isolation verification requires an idle executor pool.");
+  const leases = [];
+  try {
+    for (let index = 0; index < 2; index += 1) leases.push(await beginExecutorRun({ cwd: repositoryRoot, profile: "playwright", model: EXECUTOR_PROFILES.playwright.model }));
+    let rejected = false;
+    try { leases.push(await beginExecutorRun({ cwd: repositoryRoot, profile: "playwright", model: EXECUTOR_PROFILES.playwright.model })); }
+    catch (error) {
+      if (!/Playwright executor capacity is full/.test(error.message)) throw error;
+      rejected = true;
+    }
+    if (!rejected) throw new Error("The third concurrent Playwright lease was not rejected.");
+  } finally {
+    for (const lease of leases) await abandonExecutorRun(lease, "Capacity-only probe completed without starting a model.");
+  }
+  const runtimes = [];
+  const results = await Promise.allSettled([0, 1].map(() => runPlaywrightProbe(repositoryRoot, sessionRoots, { onVerifiedRuntime: (runtime) => runtimes.push(runtime) })));
+  const failures = results.filter((result) => result.status === "rejected").map((result) => result.reason);
+  if (failures.length) throw new AggregateError(failures, `Parallel Playwright verification failed: ${failures.map((error) => error.message).join("; ")}`);
+  if (runtimes.length !== 2 || runtimes[0].root === runtimes[1].root || !runtimes.every((runtime) => Number.isFinite(runtime.readyAt) && Number.isFinite(runtime.closedAt)) || Math.max(...runtimes.map((runtime) => runtime.readyAt)) >= Math.min(...runtimes.map((runtime) => runtime.closedAt))) {
+    throw new Error("The Playwright probe did not prove two overlapping, isolated MCP runtimes.");
+  }
+  return ["playwright_parallel_isolation:verified", "playwright_third_lease:rejected", ...results.map((result) => `playwright_parallel_thread:${result.value.thread_id}`)];
 }
 
 async function runExecutorProbes(repositoryRoot, sessionRoots) {
@@ -1305,11 +1421,13 @@ export async function verifyPlaywrightOnly(repositoryRoot = REPOSITORY_ROOT, dep
   const codexVersionReader = dependencies.codexVersionReader
     ?? ((cwd) => readCodexVersion({ cwd }));
   const playwrightProbeRunner = dependencies.playwrightProbeRunner ?? runPlaywrightProbe;
+  const playwrightIsolationRunner = dependencies.playwrightIsolationRunner ?? runPlaywrightIsolationProbe;
   const beforeStatus = await statusReader(repositoryRoot);
   const playwright = await playwrightProbeRunner(
     repositoryRoot,
     dependencies.sessionRoots ?? getSessionRoots(),
   );
+  playwright.checks.push(...await playwrightIsolationRunner(repositoryRoot, dependencies.sessionRoots ?? getSessionRoots()));
   const afterStatus = await statusReader(repositoryRoot);
   if (afterStatus !== beforeStatus) {
     throw new Error("Git status changed during Playwright-only live verification.");

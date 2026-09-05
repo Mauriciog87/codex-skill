@@ -57,7 +57,7 @@ The installer checks for conflicts before changing files. Running it again with 
 - links the canonical skill to `$HOME/.agents/skills/sol-luna-orchestration`;
 - uses a junction on Windows and a directory symlink on macOS or Linux;
 - configures the global root as Astra/high/Standard with low verbosity;
-- configures the `playwright` MCP to run `npx --yes @playwright/mcp@0.0.80`;
+- preserves your existing MCP configuration; the Playwright executor supplies its own server at runtime;
 - preserves unrelated Codex configuration and instructions;
 - installs the Ultra SessionStart and PreToolUse hooks without changing an existing `hooks.json`;
 - migrates validated Sol-Sol and Sol-Terra links and managed blocks;
@@ -269,13 +269,15 @@ Dead leases are removed only after their registered process identity is confirme
 
 ## Playwright profile
 
-Before Codex starts, the `playwright` profile checks that Playwright MCP is enabled, uses stdio, and is configured to run `npx --yes @playwright/mcp@0.0.80`. `npm run install:global` creates or repairs that configuration without changing unrelated MCP settings.
+The `playwright` profile starts a private stdio server named `sol_luna_playwright`, pinned to `@playwright/mcp@0.0.80`. You do not need a global Playwright MCP entry. The installer leaves existing MCP entries alone, including entries created by earlier releases. The internal name is reserved: if your configuration already uses it, the executor stops and asks you to rename that entry.
 
-For this profile only, the launcher sets `mcp_servers.playwright.default_tools_approval_mode="approve"` in the App Server process. This lets browser actions authorized by the briefing run without an interactive prompt. It also adds `browser_run_code_unsafe` to that process's MCP deny-list. Neither override changes the global configuration.
+Only this executor's App Server process receives the private configuration. Its `default_tools_approval_mode` remains `"approve"` for browser actions authorized by the briefing, and `browser_run_code_unsafe` is disabled. The user's server named `playwright` is disabled in that process only; unrelated MCP entries are not changed.
 
-Each run uses a unique temporary MCP working directory and passes `--isolated` and `--output-dir` for that location. This keeps ordinary relative screenshots and other MCP output outside the repository. The launcher removes the temporary directory in `finally`.
+Each run has a unique temporary directory with separate browser-temp and artifact subdirectories. The launcher checks that both are writable, removes inherited `PLAYWRIGHT_MCP_*` variables from the child environment, and passes `--isolated` and `--output-dir`. Cleanup runs after App Server stops, including on failure; cleanup errors are reported. Browser isolation does not replace sandbox or authorization rules.
 
-The session must emit an actual Playwright MCP tool call. A successful result includes `playwright_mcp:verified` in `checks`; the executor cannot add that verification itself.
+Before starting the turn, the launcher verifies the exact package pin in effective configuration and waits up to 30 seconds, within the overall timeout, for the thread's MCP inventory. Package `0.0.80` bundles Playwright `1.63.0-alpha-2026-08-31`; the server advertises that runtime version, not the package version. Both are checked separately. The inventory must also expose navigation, snapshot, click, screenshot, and close tools. Successful use requires a completed browser call from that server, thread, and turn without a tool error. Text mentioning Playwright does not count. The launcher adds `playwright_mcp:verified`, `playwright_mcp_version:0.0.80`, and `playwright_runtime_version:1.63.0-alpha-2026-08-31` to `checks`.
+
+Package upgrades are explicit: update the central package version and expected runtime version together with their regression expectations, then pass offline checks and the localhost browser probe before adopting the release. Runtime resolution never uses `@latest`. A browser or Windows sandbox failure leaves live verification pending; it does not trigger a version fallback or permission bypass.
 
 Executor turns are non-interactive and start with App Server approval policy `never`. Command and file approvals are declined, permission grants return an empty grant, and MCP elicitations are declined using the response shape required by the installed App Server.
 
@@ -325,7 +327,7 @@ Choose the check that matches what you need to verify:
 
 - `verify:platform` needs no login and starts no model turns. It checks compatibility, the current process fingerprint, and the App Server response contracts for approvals, permission grants, user input, and MCP elicitation.
 - `verify:live -- --schema-only` runs one root turn against the production output schema. Despite its name, this option uses a model.
-- `verify:live -- --playwright-only` runs one isolated localhost Playwright interaction without the other profiles.
+- `verify:live -- --playwright-only` checks a localhost interaction and a real PNG, then verifies two overlapping isolated Playwright runs and rejection of a third lease. It does not run the other profiles.
 - The full `verify:live` run checks the root and every profile against protocol and rollout evidence. Write tests use temporary repositories, and read-only checks must leave this repository unchanged.
 
 Add `--output <path-outside-the-repository>` to save verification evidence.

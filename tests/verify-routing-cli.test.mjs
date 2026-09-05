@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,6 +10,7 @@ import {
   verifyRootConfiguration,
   verifyOutputSchemaLive,
   verifyPlaywrightOnly,
+  validatePlaywrightProbeEvidence,
 } from "../scripts/verify-routing.mjs";
 import { loadExecutorResultContract } from "../.agents/skills/sol-luna-orchestration/scripts/executor-result-contract.mjs";
 
@@ -247,12 +248,39 @@ test("playwright-only live verification preserves the checkout", async () => {
         checks: ["playwright_mcp:verified", "heading:verified", "interaction:verified"],
       };
     },
+    playwrightIsolationRunner: async () => ["playwright_parallel_isolation:verified", "playwright_third_lease:rejected"],
   });
   assert.equal(result.status, "completed");
   assert.equal(result.mode, "playwright-only");
   assert.equal(result.codex_version, "0.151.0");
   assert.equal(result.playwright.profile, "playwright");
   assert.equal(result.git_unchanged, true);
+});
+
+test("Playwright probe requires ordered tool evidence and a real PNG before cleanup", async (context) => {
+  const outputDirectory = await mkdtemp(join(tmpdir(), "playwright-png-evidence-"));
+  context.after(() => rm(outputDirectory, { recursive: true, force: true }));
+  const url = "http://127.0.0.1:1234/";
+  const evidence = { runtime: { outputDirectory }, server: { name: "sol_luna_playwright", packageVersion: "0.0.80", runtimeVersion: "1.63.0-alpha-2026-08-31" }, calls: [
+    { tool: "browser_navigate", arguments: { url }, result: { content: [{ type: "text", text: '- heading "Astra-Luna Playwright probe" [level=1] [ref=e2]' }] } },
+    { tool: "browser_click", result: {} },
+    { tool: "browser_snapshot", result: { content: [{ type: "text", text: "### Snapshot\n```yaml\n- generic [ref=e1]:\n  - paragraph [ref=e4]: verified\n```" }] } },
+    { tool: "browser_take_screenshot", arguments: { filename: "probe.png" }, result: {} },
+    { tool: "browser_close", result: {} },
+  ] };
+  await assert.rejects(validatePlaywrightProbeEvidence(evidence, url), { code: "ENOENT" });
+  await writeFile(join(outputDirectory, "probe.png"), "not a screenshot");
+  await assert.rejects(validatePlaywrightProbeEvidence(evidence, url), /PNG/);
+  await writeFile(join(outputDirectory, "probe.png"), Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aElQAAAAASUVORK5CYII=", "base64"));
+  assert.match(await validatePlaywrightProbeEvidence(evidence, url), /^[a-f0-9]{64}$/);
+  for (const version of [{ packageVersion: "0.0.79" }, { runtimeVersion: "0.0.80" }, { runtimeVersion: undefined }]) {
+    await assert.rejects(validatePlaywrightProbeEvidence({ ...evidence, server: { ...evidence.server, ...version } }, url), /server evidence/);
+  }
+  await assert.rejects(validatePlaywrightProbeEvidence({ ...evidence, calls: evidence.calls.slice(1) }, url), /in order/);
+  for (const text of ["- paragraph [ref=e4]: pending", "The paragraph is verified.", "- paragraph [ref=e4]: verified later"]) {
+    const calls = evidence.calls.map((call) => call.tool === "browser_snapshot" ? { ...call, result: { content: [{ type: "text", text }] } } : call);
+    await assert.rejects(validatePlaywrightProbeEvidence({ ...evidence, calls }, url), /in order/);
+  }
 });
 
 test("verify-live writes its preserved result with platform metadata", async (context) => {

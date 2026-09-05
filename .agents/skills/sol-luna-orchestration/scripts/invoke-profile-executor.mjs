@@ -1,7 +1,7 @@
 import { spawn as spawnChildProcess } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { readdir, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -15,6 +15,7 @@ import {
   AppServerError,
   AppServerTimeoutError,
   buildAppServerArguments,
+  readCodexConfig,
   runAppServerTurn,
 } from "./codex-app-server-client.mjs";
 import {
@@ -37,6 +38,11 @@ import {
 } from "./executor-result-contract.mjs";
 import {
   createPlaywrightMcpRuntimeOverrides,
+  createPlaywrightMcpRuntime,
+  removePlaywrightMcpRuntime,
+  PLAYWRIGHT_MCP_SERVER_NAME,
+  PLAYWRIGHT_MCP_VERSION,
+  PLAYWRIGHT_RUNTIME_VERSION,
   validatePlaywrightMcpConfiguration,
 } from "./playwright-mcp-configuration.mjs";
 
@@ -619,27 +625,10 @@ export async function verifyPlaywrightMcp({
   command = "codex",
   cwd = process.cwd(),
   environment = process.env,
-  processRunner = runProcess,
+  configReader = readCodexConfig,
 } = {}) {
-  const result = await processRunner(command, ["mcp", "get", "playwright", "--json"], {
-    cwd,
-    environment,
-    timeoutMs: 10_000,
-  });
-  if (result.timedOut || result.aborted || result.exitCode !== 0) {
-    throw new ExecutorConfigurationError(
-      result.stderr || "The Playwright MCP preflight did not complete successfully.",
-    );
-  }
-  let configuration;
   try {
-    configuration = JSON.parse(result.stdout);
-  } catch (error) {
-    throw new ExecutorConfigurationError(
-      `The Playwright MCP preflight returned invalid JSON: ${error.message}`,
-    );
-  }
-  try {
+    const configuration = await configReader({ command, cwd, environment, timeoutMs: 10_000 });
     return validatePlaywrightMcpConfiguration(configuration);
   } catch (error) {
     throw new ExecutorConfigurationError(error.message);
@@ -995,6 +984,9 @@ async function runExecutor({
   signal,
   appServerRunner = runAppServerTurn,
   playwrightMcpVerifier = verifyPlaywrightMcp,
+  playwrightRuntimeFactory = createPlaywrightMcpRuntime,
+  playwrightRuntimeCleanup = removePlaywrightMcpRuntime,
+  onPlaywrightEvidence,
   onAppServerStarted,
   outputContract,
 }) {
@@ -1013,11 +1005,11 @@ async function runExecutor({
     throw new ExecutorInvocationError(`Executor cwd is not a directory: ${options.cwd}`);
   }
 
-  let playwrightOutputDirectory = null;
+  let playwrightRuntime = null;
   if (profile.name === "playwright") {
     try {
-      await playwrightMcpVerifier({ command, cwd: options.cwd, environment });
-      playwrightOutputDirectory = await mkdtemp(join(tmpdir(), "sol-luna-playwright-"));
+      const configuration = await playwrightMcpVerifier({ command, cwd: options.cwd, environment });
+      playwrightRuntime = await playwrightRuntimeFactory({ environment, disableUserPlaywright: Object.hasOwn(configuration.mcp_servers ?? {}, "playwright") });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return configurationFailure(message, options);
@@ -1026,7 +1018,7 @@ async function runExecutor({
 
   try {
     const executorEnvironment = {
-      ...environment,
+      ...(playwrightRuntime?.environment ?? environment),
       [ORCHESTRATION_ROLE_ENV]: "executor",
       CODEX_EXECUTOR_PROFILE: profile.name,
     };
@@ -1041,9 +1033,9 @@ async function runExecutor({
         serviceTier: profile.serviceTier,
         configuredServiceTier: profile.configuredServiceTier,
         fastMode: profile.fastMode,
-        configurationOverrides: profile.name === "playwright"
-          ? createPlaywrightMcpRuntimeOverrides(playwrightOutputDirectory)
-          : [],
+        configurationOverrides: playwrightRuntime?.overrides ?? [],
+        playwrightOutputDirectory: playwrightRuntime?.outputDirectory ?? null,
+        playwrightDisableUserServer: playwrightRuntime?.disableUserPlaywright ?? false,
         sandboxMode: options.sandboxMode,
         developerInstructions: createExecutorDeveloperInstructions(profile.name),
         briefing: briefing.trim(),
@@ -1215,7 +1207,10 @@ async function runExecutor({
           },
         );
       }
-      if (appServerResult.playwrightMcpUsed !== true) {
+      if (appServerResult.playwrightMcpUsed !== true ||
+          appServerResult.playwrightServer?.name !== PLAYWRIGHT_MCP_SERVER_NAME ||
+          appServerResult.playwrightServer?.packageVersion !== PLAYWRIGHT_MCP_VERSION ||
+          appServerResult.playwrightServer?.runtimeVersion !== PLAYWRIGHT_RUNTIME_VERSION) {
         return configurationFailure(
           "The Playwright executor did not emit a verified Playwright MCP tool call.",
           options,
@@ -1227,6 +1222,10 @@ async function runExecutor({
             warnings: diagnosticWarnings,
           },
         );
+      }
+      if (onPlaywrightEvidence) {
+        try { await onPlaywrightEvidence({ runtime: playwrightRuntime, server: appServerResult.playwrightServer, calls: appServerResult.playwrightCalls }); }
+        catch (error) { return configurationFailure(`Playwright evidence validation failed: ${error.message}`, options); }
       }
     }
 
@@ -1242,7 +1241,7 @@ async function runExecutor({
       summary: payload.summary,
       changedFiles: payload.changed_files,
       checks: profile.name === "playwright"
-        ? [...payload.checks, "playwright_mcp:verified"]
+        ? [...payload.checks, `playwright_mcp_version:${PLAYWRIGHT_MCP_VERSION}`, `playwright_runtime_version:${PLAYWRIGHT_RUNTIME_VERSION}`, "playwright_mcp:verified"]
         : payload.checks,
       blockers: payload.blockers,
       warnings: [...payload.warnings, ...protocolWarnings],
@@ -1256,8 +1255,9 @@ async function runExecutor({
       }),
     };
   } finally {
-    if (playwrightOutputDirectory !== null) {
-      await rm(playwrightOutputDirectory, { recursive: true, force: true });
+    if (playwrightRuntime !== null) {
+      try { await playwrightRuntimeCleanup(playwrightRuntime); }
+      catch (error) { throw new ExecutorConfigurationError(`Unable to clean the private Playwright runtime at ${playwrightRuntime.rootDirectory}: ${error.message}`); }
     }
   }
 }

@@ -155,9 +155,11 @@ node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs status
 
 `review` returns `APPROVE` or `COMMENT` with completed status, or `REQUEST_CHANGES` with blocked status and at least one blocker. It never changes files.
 
-`playwright` requires the enabled stdio MCP configuration `npx --yes @playwright/mcp@0.0.80`. The global installer pins or repairs that configuration.
+`playwright` uses the private stdio server `sol_luna_playwright`, pinned to `@playwright/mcp@0.0.80`. No global Playwright entry is required. The installer preserves existing MCP configuration; a collision with the reserved internal name fails closed.
 
-For each run, the launcher applies `mcp_servers.playwright.default_tools_approval_mode="approve"` only to its App Server process and adds `browser_run_code_unsafe` to the MCP deny-list. It starts the MCP in a unique temporary directory and passes `--isolated` and `--output-dir` for that location. A successful run must include evidence of an actual Playwright MCP tool call. The launcher removes the temporary artifacts afterward.
+The launcher replaces the private server's complete runtime configuration and verifies it through `config/read`. It disables the user's `playwright` server only in this executor process, retains `default_tools_approval_mode="approve"` for authorized browser actions, and disables `browser_run_code_unsafe`. It removes inherited `PLAYWRIGHT_MCP_*` variables from the child environment and creates writable, isolated browser-temp and artifact directories with `--isolated` and `--output-dir`.
+
+Before `turn/start`, effective configuration must pin package `0.0.80`, and thread-scoped MCP inventory must report its bundled runtime version `1.63.0-alpha-2026-08-31` and the required browser tools within 30 seconds and the overall timeout. Package and runtime versions are separate checks; either mismatch fails closed. Evidence must come from a successful, completed `mcpToolCall` on the private server in the active thread and turn. Mentions, started calls, and failed results do not count. Validate probe evidence before cleanup; report cleanup failures. Update both expected versions explicitly and pass offline and live checks, never use `@latest` or a fallback.
 
 Executor turns use App Server approval policy `never`. Command and file approvals, permission grants, and MCP elicitations fail closed with protocol-valid responses. Non-blocking user-input requests receive an empty answer. Blocking, non-sensitive questions become durable operator requests whose acknowledged answers are carried into a retry; sensitive answers are never persisted.
 

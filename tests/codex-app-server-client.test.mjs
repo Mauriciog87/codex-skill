@@ -19,6 +19,7 @@ import {
   readCodexConfig,
 } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
 import { loadExecutorResultContract } from "../.agents/skills/sol-luna-orchestration/scripts/executor-result-contract.mjs";
+import { createPlaywrightMcpConfiguration, PLAYWRIGHT_MCP_REQUIRED_TOOLS } from "../.agents/skills/sol-luna-orchestration/scripts/playwright-mcp-configuration.mjs";
 
 const TEST_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const MOCK_SERVER_PATH = join(TEST_DIRECTORY, "fixtures", "mock-codex-app-server.mjs");
@@ -51,7 +52,7 @@ function runMock(scenario = {}, overrides = {}) {
     developerInstructions: "Act as a bounded executor.",
     briefing: "Complete the bounded test task.",
     outputSchema: OUTPUT_SCHEMA,
-    timeoutMs: overrides.timeoutMs ?? 2_000,
+    timeoutMs: overrides.timeoutMs ?? (overrides.playwrightOutputDirectory ? 5_000 : 2_000),
     idleTimeoutMs: overrides.idleTimeoutMs ?? null,
     platform: overrides.platform ?? process.platform,
     architecture: overrides.architecture ?? process.arch,
@@ -60,6 +61,9 @@ function runMock(scenario = {}, overrides = {}) {
     spawnImplementation: overrides.spawnImplementation
       ?? spawnMock(scenario, overrides.capturePath),
     onProcessStarted: overrides.onProcessStarted,
+    playwrightOutputDirectory: overrides.playwrightOutputDirectory,
+    playwrightDisableUserServer: overrides.playwrightOutputDirectory !== undefined,
+    playwrightStartupTimeoutMs: overrides.playwrightStartupTimeoutMs,
   });
 }
 
@@ -473,13 +477,11 @@ test("secret and malformed user input requests fail closed without durable conte
 });
 
 test("tool notifications record Playwright evidence and unsafe use", async () => {
-  const result = await runMock({
-    toolName: "mcp__playwright__browser_snapshot",
-  });
+  const result = await runMock(privateScenario({ toolName: "browser_snapshot" }), { playwrightOutputDirectory: privateOutput });
   assert.equal(result.playwrightMcpUsed, true);
   assert.equal(result.unsafePlaywrightToolUsed, false);
-  const unsafe = await runMock({ toolName: "browser_run_code_unsafe" });
-  assert.equal(unsafe.playwrightMcpUsed, true);
+  const unsafe = await runMock(privateScenario({ toolName: "browser_run_code_unsafe" }), { playwrightOutputDirectory: privateOutput });
+  assert.equal(unsafe.playwrightMcpUsed, false);
   assert.equal(unsafe.unsafePlaywrightToolUsed, true);
 });
 
@@ -587,4 +589,86 @@ test("global timeout still ends a turn that keeps reporting item progress", asyn
       error instanceof AppServerTimeoutError &&
       !(error instanceof AppServerIdleTimeoutError),
   );
+});
+
+const privateOutput = join(tmpdir(), "private-playwright", "artifacts");
+function privateScenario(changes = {}) {
+  return {
+    config: { mcp_servers: { playwright: { enabled: false }, sol_luna_playwright: createPlaywrightMcpConfiguration(privateOutput) } },
+    mcpPages: [{ data: [{ name: "sol_luna_playwright", serverInfo: { name: "Playwright", version: "1.63.0-alpha-2026-08-31" }, tools: Object.fromEntries(PLAYWRIGHT_MCP_REQUIRED_TOOLS.map((name) => [name, { name, inputSchema: {} }])) }] }],
+    ...changes,
+  };
+}
+
+test("private MCP readiness precedes the turn and supports pagination and early notifications", async (context) => {
+  const temporary = await mkdtemp(join(tmpdir(), "private-mcp-rpc-"));
+  context.after(() => rm(temporary, { recursive: true, force: true }));
+  const capturePath = join(temporary, "rpc.jsonl");
+  const scenario = privateScenario();
+  scenario.mcpPages = [{ data: [], nextCursor: "page-two" }, ...scenario.mcpPages];
+  scenario.mcpStartup = "ready";
+  scenario.toolName = "browser_navigate";
+  const result = await runMock(scenario, { playwrightOutputDirectory: privateOutput, capturePath });
+  assert.equal(result.playwrightMcpUsed, true);
+  assert.equal(result.playwrightServer.packageVersion, "0.0.80");
+  assert.equal(result.playwrightServer.runtimeVersion, "1.63.0-alpha-2026-08-31");
+  const messages = (await readFile(capturePath, "utf8")).trim().split("\n").map(JSON.parse);
+  assert.ok(messages.findIndex((m) => m.method === "config/read") < messages.findIndex((m) => m.method === "thread/start"));
+  assert.ok(messages.findLastIndex((m) => m.method === "mcpServerStatus/list") < messages.findIndex((m) => m.method === "turn/start"));
+  assert.equal(messages.filter((m) => m.method === "mcpServerStatus/list").length, 2);
+});
+
+test("private MCP invalid configuration and inventory never start a turn", async (context) => {
+  const temporary = await mkdtemp(join(tmpdir(), "private-mcp-failures-"));
+  context.after(() => rm(temporary, { recursive: true, force: true }));
+  const wrongVersion = privateScenario();
+  wrongVersion.mcpPages[0].data[0].serverInfo.version = "0.0.79";
+  const missingTool = privateScenario();
+  delete missingTool.mcpPages[0].data[0].tools.browser_click;
+  for (const [index, scenario] of [privateScenario({ config: {} }), wrongVersion, missingTool, privateScenario({ mcpStartup: "failed" }), privateScenario({ mcpPages: [{ data: [] }] }), privateScenario({ mcpPages: [{ data: [{ name: "sol_luna_playwright", tools: {} }] }] })].entries()) {
+    const capturePath = join(temporary, `${index}.jsonl`);
+    await assert.rejects(runMock(scenario, { playwrightOutputDirectory: privateOutput, playwrightStartupTimeoutMs: 100, capturePath }), /Playwright|MCP/);
+    assert.equal((await readFile(capturePath, "utf8")).includes('"method":"turn/start"'), false);
+  }
+});
+
+test("private MCP verifies the package pin and advertised runtime independently", async (context) => {
+  const temporary = await mkdtemp(join(tmpdir(), "private-mcp-versions-"));
+  context.after(() => rm(temporary, { recursive: true, force: true }));
+  const wrongPackage = privateScenario();
+  wrongPackage.config.mcp_servers.sol_luna_playwright.args[1] = "@playwright/mcp@0.0.79";
+  const wrongRuntime = privateScenario();
+  wrongRuntime.mcpPages[0].data[0].serverInfo.version = "1.63.0-alpha-2026-08-30";
+  const packageAsRuntime = privateScenario();
+  packageAsRuntime.mcpPages[0].data[0].serverInfo.version = "0.0.80";
+  for (const [index, scenario] of [wrongPackage, wrongRuntime, packageAsRuntime].entries()) {
+    const capturePath = join(temporary, `${index}.jsonl`);
+    await assert.rejects(runMock(scenario, { playwrightOutputDirectory: privateOutput, capturePath }), /configuration|runtime version/);
+    assert.equal((await readFile(capturePath, "utf8")).includes('"method":"turn/start"'), false);
+  }
+});
+
+test("private MCP waits for delayed inventory and respects the global timeout", async () => {
+  const ready = await runMock(privateScenario({ mcpInventoryDelay: 2, toolName: "browser_snapshot" }), { playwrightOutputDirectory: privateOutput, timeoutMs: 5_000 });
+  assert.equal(ready.playwrightMcpUsed, true);
+  await assert.rejects(runMock(privateScenario({ hangAfter: "mcpServerStatus/list" }), { playwrightOutputDirectory: privateOutput, timeoutMs: 500 }), AppServerTimeoutError);
+});
+
+test("Playwright evidence excludes text, other sessions, started calls and failed results", async () => {
+  for (const changes of [
+    { finalResponse: 'mcp__playwright__ browser_run_code_unsafe "server":"playwright"' },
+    { toolName: "browser_navigate", toolServer: "playwright" },
+    { toolName: "browser_navigate", toolThread: "other" },
+    { toolName: "browser_navigate", toolTurn: "other" },
+    { toolName: "browser_navigate", toolStartedOnly: true },
+    { toolName: "browser_navigate", toolStatus: "failed" },
+    { toolName: "browser_navigate", toolResult: { isError: true, content: [] } },
+    { toolName: "browser_navigate", toolResult: { content: "malformed" } },
+  ]) {
+    const result = await runMock(privateScenario(changes), { playwrightOutputDirectory: privateOutput });
+    assert.equal(result.playwrightMcpUsed, false);
+    assert.equal(result.unsafePlaywrightToolUsed, false);
+  }
+  const unsafe = await runMock(privateScenario({ toolName: "browser_run_code_unsafe", toolStartedOnly: true }), { playwrightOutputDirectory: privateOutput });
+  assert.equal(unsafe.unsafePlaywrightToolUsed, true);
 });

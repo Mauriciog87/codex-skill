@@ -8,6 +8,7 @@ const turnId = scenario.turnId ?? "mock-turn";
 const model = scenario.model ?? "gpt-6-astra";
 const effort = scenario.effort ?? "high";
 const serviceTier = scenario.serviceTier ?? "default";
+let inventoryRequests = 0;
 const payload = scenario.payload ?? {
   status: "completed",
   summary: "Mock task completed.",
@@ -103,13 +104,20 @@ function defaultServerRequestParams(method) {
 function completeTurn() {
   if (scenario.toolName !== undefined) {
     notification("item/started", {
-      threadId,
-      turnId,
+      threadId: scenario.toolThread ?? threadId,
+      turnId: scenario.toolTurn ?? turnId,
       item: {
         type: "mcpToolCall",
-        server: "playwright",
+        id: "mcp-call-1",
+        server: scenario.toolServer ?? "sol_luna_playwright",
         tool: scenario.toolName,
+        status: "inProgress",
       },
+    });
+    if (scenario.toolStartedOnly !== true) notification("item/completed", {
+      threadId: scenario.toolThread ?? threadId,
+      turnId: scenario.toolTurn ?? turnId,
+      item: { id: "mcp-call-1", type: "mcpToolCall", server: scenario.toolServer ?? "sol_luna_playwright", tool: scenario.toolName, status: scenario.toolStatus ?? "completed", arguments: {}, result: scenario.toolResult ?? { content: [] }, error: null },
     });
   }
   const item = {
@@ -206,6 +214,7 @@ async function handle(message) {
     return;
   }
   if (message.method === "thread/start") {
+    if (scenario.mcpStartup) notification("mcpServer/startupStatus/updated", { threadId, name: "sol_luna_playwright", status: scenario.mcpStartup });
     result(message.id, {
       model: scenario.threadModel ?? model,
       serviceTier: scenario.threadServiceTier ?? message.params.serviceTier,
@@ -228,6 +237,15 @@ async function handle(message) {
       result(message.id, scenario.settingsResult ?? {});
       settingsNotification();
     }
+    return;
+  }
+  if (message.method === "mcpServerStatus/list") {
+    inventoryRequests += 1;
+    if (inventoryRequests <= (scenario.mcpInventoryDelay ?? 0)) {
+      result(message.id, { data: [] });
+      return;
+    }
+    result(message.id, scenario.mcpPages?.[message.params.cursor ? 1 : 0] ?? { data: [] });
     return;
   }
   if (message.method === "turn/start") {

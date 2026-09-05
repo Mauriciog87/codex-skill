@@ -57,7 +57,7 @@ const PROFILE_DEFINITIONS = {
     concurrencyLimit: 2,
     colorCode: 94,
     instructions: [
-      "Use only the configured Playwright MCP tools for the browser task and keep repository files unchanged.",
+      "Use only the private sol_luna_playwright MCP tools for the browser task and keep repository files unchanged. Do not use the user's playwright server, shell browser automation, or another browser integration.",
       "You may navigate, inspect, and interact fully with localhost and explicitly named development or test environments.",
       "Actions explicitly requested by the briefing against localhost or a named development or test environment are already authorized; perform them without requesting live input.",
       "Treat external sites as observation-only unless the briefing explicitly authorizes a named state-changing action and destination.",

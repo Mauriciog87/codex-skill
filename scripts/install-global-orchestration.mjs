@@ -28,10 +28,6 @@ import {
   getDeliveryConfigurationPath,
   parseDeliveryConfiguration,
 } from "../.agents/skills/sol-luna-orchestration/scripts/delivery-configuration.mjs";
-import {
-  PLAYWRIGHT_MCP_ARGUMENTS,
-  PLAYWRIGHT_MCP_COMMAND,
-} from "../.agents/skills/sol-luna-orchestration/scripts/playwright-mcp-configuration.mjs";
 
 export const SKILL_NAME = "sol-luna-orchestration";
 export const LEGACY_SKILL_NAME = "sol-sol-orchestration";
@@ -201,14 +197,6 @@ function setFeaturesValues(lines, values) {
   setTomlValues(lines, "features", values);
 }
 
-function setPlaywrightMcpValues(lines) {
-  setTomlValues(lines, "mcp_servers.playwright", {
-    enabled: true,
-    command: PLAYWRIGHT_MCP_COMMAND,
-    args: PLAYWRIGHT_MCP_ARGUMENTS,
-  });
-}
-
 function managedHooksLines(hookScriptPath) {
   const command = `node ${JSON.stringify(resolve(hookScriptPath))} hook`;
   const serializedCommand = JSON.stringify(command);
@@ -286,7 +274,6 @@ export function updateGlobalConfig(content, { hookScriptPath = null } = {}) {
   setTopLevelValues(shape.lines, ROOT_CONFIG_VALUES);
   setAgentsValues(shape.lines, { max_depth: 1, max_threads: 4 });
   setFeaturesValues(shape.lines, { fast_mode: false });
-  setPlaywrightMcpValues(shape.lines);
   if (hookScriptPath !== null) {
     setFeaturesValues(shape.lines, { hooks: true });
     updateManagedHooks(shape.lines, hookScriptPath);
@@ -296,74 +283,29 @@ export function updateGlobalConfig(content, { hookScriptPath = null } = {}) {
   return { content: updated, changed: updated !== original };
 }
 
-function managedBlockLines() {
-  return [
-    MANAGED_BLOCK_START,
-    "# Global Astra-Luna orchestration",
-    "",
-    "For every new substantive root task, explicitly invoke `$sol-luna-orchestration` before planning, delegating, or editing. The root uses Astra/high/Standard. Verified executors use the profile registry; Luna has capacity 10, Astra has capacity 4, and Playwright has a global sublimit of 2. Capacity is not a fan-out target.",
-    "",
-    "Rebases, merges, cherry-picks, reverts, and conflict resolution stay with the root. Loading the skill does not make delegation mandatory. Check the current checkout, working tree, linked worktrees, upstream, and refs; fetch the latest remote refs; then run the Git operation and work from the conflicts it actually reports. Do not ask `explore` to scan commits and guess what might conflict. After Git stops on a real conflict, `explore` may answer one focused question about those files, once. The root still makes the edit. If that run stalls or fails, do not repeat the same request. Stop and ask the operator when the checkout is dirty, another Git operation is in progress, or the target branch is checked out in another worktree. This does not change who may push or force-push.",
-    "",
-    "Writer profiles keep `workspace-write` sandboxing and run only in controller-created isolated worktrees with explicit write roots. The controller saves validated changes as immutable candidates. Root or Ultra owns review, approval, integration, delivery, acknowledgment, and cleanup. New writer assignments use automatic delivery by default: the controller commits only the validated candidate and pushes only to the matching configured upstream branch without force. Set `automatic_delivery` to `false` in the Astra-Luna configuration file to opt out, or use an explicit `--delivery` mode for one assignment. A delivery failure stops in `delivery_blocked` until an explicit retry. Never fall back to a writable shared checkout.",
-    "",
-    "A human-confirmed Ultra takeover owns its repository exclusively while its lock is active. Other root sessions must pause, and only executors carrying the matching `CODEX_ORCHESTRATION_LOCK_ID` and `CODEX_ORCHESTRATION_GENERATION` may run. Recovery fails closed while a registered process is live or unknown. Never remove lock state manually; inspect history or recover it through the orchestration gate.",
-    MANAGED_BLOCK_END,
-  ];
-}
-
 export function updateGlobalInstructions(content) {
   const original = content ?? "";
-  const shape = textShape(content);
-  for (let index = 0; index < shape.lines.length; index += 1) {
-    if ([LEGACY_MANAGED_BLOCK_START, TERRA_MANAGED_BLOCK_START].includes(shape.lines[index].trim())) {
-      shape.lines[index] = MANAGED_BLOCK_START;
-    }
-    if ([LEGACY_MANAGED_BLOCK_END, TERRA_MANAGED_BLOCK_END].includes(shape.lines[index].trim())) {
-      shape.lines[index] = MANAGED_BLOCK_END;
-    }
-  }
-  const starts = [];
-  const ends = [];
-  for (let index = 0; index < shape.lines.length; index += 1) {
-    const line = shape.lines[index].trim();
-    if (line === MANAGED_BLOCK_START) {
-      starts.push(index);
-    }
-    if (line === MANAGED_BLOCK_END) {
-      ends.push(index);
+  const markerPairs = new Map([
+    [MANAGED_BLOCK_START, MANAGED_BLOCK_END],
+    [LEGACY_MANAGED_BLOCK_START, LEGACY_MANAGED_BLOCK_END],
+    [TERRA_MANAGED_BLOCK_START, TERRA_MANAGED_BLOCK_END],
+  ]);
+  const knownMarkers = new Set([...markerPairs.keys(), ...markerPairs.values()]);
+  const markers = [];
+  for (const match of original.matchAll(/[^\r\n]*(?:\r\n|[\r\n]|$)/g)) {
+    if (knownMarkers.has(match[0].trim())) {
+      markers.push(match);
     }
   }
-  if (starts.length !== ends.length || starts.length > 1) {
-    throw new Error("Global instructions contain malformed Astra-Luna managed markers.");
+  if (markers.length === 0) {
+    return { content: original, changed: false };
   }
-  if (starts.length === 1 && starts[0] >= ends[0]) {
-    throw new Error("Global instructions contain malformed Astra-Luna managed markers.");
+  if (markers.length !== 2 || markerPairs.get(markers[0][0].trim()) !== markers[1][0].trim()) {
+    throw new Error("Global instructions contain malformed orchestration markers; the file was left unchanged.");
   }
-
-  const unmanagedLines = [...shape.lines];
-  if (starts.length === 1) {
-    unmanagedLines.splice(starts[0], ends[0] - starts[0] + 1);
-  }
-  if (unmanagedLines.some((line) => /sol-(?:sol|terra)-orchestration|SOL_TERRA_ROLE/.test(line))) {
-    throw new Error("Global instructions contain unmanaged legacy orchestration references.");
-  }
-
-  const block = managedBlockLines();
-  if (starts.length === 1) {
-    shape.lines.splice(starts[0], ends[0] - starts[0] + 1, ...block);
-  } else {
-    while (shape.lines.length > 0 && shape.lines.at(-1).trim() === "") {
-      shape.lines.pop();
-    }
-    if (shape.lines.length > 0) {
-      shape.lines.push("");
-    }
-    shape.lines.push(...block);
-  }
-  shape.trailingNewline = true;
-  const updated = renderText(shape);
-  return { content: updated, changed: updated !== original };
+  const start = markers[0].index === 0 && original.startsWith("\uFEFF") ? 1 : markers[0].index;
+  const end = markers[1].index + markers[1][0].length;
+  return { content: original.slice(0, start) + original.slice(end), changed: true };
 }
 
 async function selectGlobalInstructions(codexHome) {
@@ -447,7 +389,6 @@ export async function validateConfigUpdate(original, proposed, configReader = re
         const expected = {
           ...ROOT_CONFIG_VALUES,
           "agents.max_depth": 1, "agents.max_threads": 4, "features.fast_mode": false, "features.hooks": true,
-          "mcp_servers.playwright.enabled": true, "mcp_servers.playwright.command": PLAYWRIGHT_MCP_COMMAND, "mcp_servers.playwright.args": PLAYWRIGHT_MCP_ARGUMENTS,
         };
         for (const [path, value] of Object.entries(expected)) {
           let actual = path.split(".").reduce((object, key) => object?.[key], config);

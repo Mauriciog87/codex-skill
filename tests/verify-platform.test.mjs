@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { MINIMUM_CODEX_VERSION } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
 import { loadExecutorResultContract } from "../.agents/skills/sol-luna-orchestration/scripts/executor-result-contract.mjs";
-import { getSkillLinkType } from "../scripts/install-global-orchestration.mjs";
+import { getSkillLinkType, installGlobalOrchestration } from "../scripts/install-global-orchestration.mjs";
 import {
   createPlatformVerificationResult,
   main,
@@ -86,12 +86,19 @@ test("platform result property order remains stable", () => {
   ]);
 });
 
-test("platform smoke installs twice and verifies the native link", async () => {
+test("platform smoke installs twice without creating global instructions", async () => {
+  const installations = [];
   const result = await verifyPlatform(
     { expectedCodexVersion: MINIMUM_CODEX_VERSION },
     {
       commandRunner: createCommandRunner(),
       schemaVerifier: schemaVerifier(7),
+      installer: async (options) => {
+        const installation = await installGlobalOrchestration(options);
+        installations.push(installation);
+        await assert.rejects(lstat(installation.global_instructions), { code: "ENOENT" });
+        return installation;
+      },
     },
   );
   assert.equal(result.status, "completed");
@@ -106,6 +113,7 @@ test("platform smoke installs twice and verifies the native link", async () => {
   assert.equal(result.installation_idempotent, true);
   assert.equal(result.git_unchanged, true);
   assert.deepEqual(result.warnings, []);
+  assert.deepEqual(installations.map((installation) => installation.instructions_changed), [false, false]);
 });
 
 test("platform smoke fails closed on version, strict config, and schema errors", async () => {

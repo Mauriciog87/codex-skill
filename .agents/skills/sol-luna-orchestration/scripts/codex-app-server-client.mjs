@@ -2,6 +2,15 @@ import { spawn as spawnChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { resolveCodexInvocation } from "./codex-command.mjs";
 import { MODEL_VERBOSITY } from "./model-policy.mjs";
+import {
+  PLAYWRIGHT_MCP_SERVER_NAME,
+  PLAYWRIGHT_MCP_VERSION,
+  PLAYWRIGHT_RUNTIME_VERSION,
+  PLAYWRIGHT_MCP_REQUIRED_TOOLS,
+  PLAYWRIGHT_MCP_DISABLED_TOOLS,
+  PLAYWRIGHT_MCP_STARTUP_TIMEOUT_MS,
+  validatePlaywrightMcpRuntimeConfiguration,
+} from "./playwright-mcp-configuration.mjs";
 
 const MAX_CAPTURE_LENGTH = 32_768;
 const MAX_OPERATOR_QUESTIONS = 3;
@@ -375,7 +384,7 @@ export function createServerRequestDecision(method, params) {
 class JsonRpcConnection {
   constructor(
     child,
-    { timeoutMs, idleTimeoutMs, signal },
+    { timeoutMs, idleTimeoutMs, signal, capturePlaywrightEvidence = false },
   ) {
     this.child = child;
     this.signal = signal;
@@ -388,8 +397,10 @@ class JsonRpcConnection {
     this.warnings = [];
     this.agentMessages = [];
     this.operatorRequests = [];
-    this.playwrightMcpUsed = false;
-    this.unsafePlaywrightToolUsed = false;
+    this.mcpEvents = [];
+    this.capturePlaywrightEvidence = capturePlaywrightEvidence;
+    this.mcpEvidenceBytes = 0;
+    this.mcpStartupStates = new Map();
     this.blocked = createDeferred();
     this.failure = createDeferred();
     this.failure.promise.catch(() => {});
@@ -544,17 +555,33 @@ class JsonRpcConnection {
 
   handleNotification(message) {
     const entry = { method: message.method, params: message.params ?? {} };
+    if (entry.method === "mcpServer/startupStatus/updated") {
+      this.mcpStartupStates.set(`${entry.params.threadId}:${entry.params.name}`, entry.params);
+    }
     const belongsToActiveThread =
       this.activeThreadId === null || entry.params?.threadId === this.activeThreadId;
     if (belongsToActiveThread && entry.method.startsWith("item/")) {
       this.idleWatchdog?.progress(entry.method);
-      const serialized = JSON.stringify(entry);
-      if (/mcp__playwright__|"server"\s*:\s*"playwright"|"serverName"\s*:\s*"playwright"/i.test(serialized)) {
-        this.playwrightMcpUsed = true;
+    }
+    if (this.capturePlaywrightEvidence && ["item/started", "item/completed"].includes(entry.method) && entry.params.item?.type === "mcpToolCall") {
+      const item = entry.params.item;
+      const validResult = item.result !== null && typeof item.result === "object" && !Array.isArray(item.result) &&
+        Array.isArray(item.result.content) && item.result.content.every((content) => content !== null && typeof content === "object" && typeof content.type === "string") &&
+        (item.result.isError === undefined || typeof item.result.isError === "boolean");
+      const result = !validResult ? null : {
+        isError: item.result.isError,
+        content: item.result.content?.filter((content) => content.type === "text"),
+        structuredContent: item.result.structuredContent,
+      };
+      const evidence = { method: entry.method, threadId: entry.params.threadId, turnId: entry.params.turnId,
+        id: item.id, server: item.server, tool: item.tool, status: item.status, observedAt: Date.now(),
+        arguments: item.arguments, result, error: item.error };
+      this.mcpEvidenceBytes += Buffer.byteLength(JSON.stringify(evidence));
+      if (this.mcpEvents.length >= 512 || this.mcpEvidenceBytes > 2 * 1024 * 1024) {
+        this.fail(new AppServerProtocolError("MCP evidence exceeded its capture limit; the result cannot be verified."));
+        return;
       }
-      if (/browser_run_code_unsafe/i.test(serialized)) {
-        this.unsafePlaywrightToolUsed = true;
-      }
+      this.mcpEvents.push(evidence);
     }
     if (belongsToActiveThread && entry.method === "item/completed") {
       const item = entry.params?.item;
@@ -654,11 +681,12 @@ export async function readCodexConfig({
   environment = process.env,
   command = "codex",
   timeoutMs = 15_000,
+  configurationOverrides = [],
   commandResolver = resolveCodexInvocation,
   spawnImplementation = spawnChildProcess,
 } = {}) {
   const invocation = await commandResolver(command, { platform: process.platform, architecture: process.arch, environment });
-  const child = spawnImplementation(invocation.executable, ["--strict-config", "app-server", "--listen", "stdio://"], {
+  const child = spawnImplementation(invocation.executable, ["--strict-config", ...configurationOverrides.flatMap((value) => ["-c", value]), "app-server", "--listen", "stdio://"], {
     cwd, env: invocation.environment, windowsHide: true, shell: false, stdio: ["pipe", "pipe", "pipe"],
   });
   const connection = new JsonRpcConnection(child, { timeoutMs, idleTimeoutMs: null });
@@ -670,9 +698,65 @@ export async function readCodexConfig({
       throw new AppServerProtocolError("config/read did not return an effective configuration.");
     }
     return result.config;
+  } catch (error) {
+    if (error instanceof AppServerError) error.stderr ??= connection.stderr;
+    throw error;
   } finally {
     await connection.close();
   }
+}
+
+async function waitForPlaywrightMcp(connection, threadId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new AppServerProtocolError("The private Playwright MCP did not become ready before its startup deadline.")), timeoutMs);
+  });
+  const inspect = async () => {
+    while (Date.now() < deadline) {
+      const startup = connection.mcpStartupStates.get(`${threadId}:${PLAYWRIGHT_MCP_SERVER_NAME}`);
+      if (["failed", "cancelled"].includes(startup?.status)) {
+        throw new AppServerProtocolError(`The private Playwright MCP startup ${startup.status}: ${startup.error ?? "no details reported"}.`);
+      }
+      let cursor;
+      const cursors = new Set();
+      let found = null;
+      do {
+        const page = await connection.request("mcpServerStatus/list", {
+          threadId, detail: "toolsAndAuthOnly", limit: 100, ...(cursor ? { cursor } : {}),
+        });
+        if (!Array.isArray(page?.data)) throw new AppServerProtocolError("MCP inventory did not return a data array.");
+        for (const server of page.data) {
+          if (server.name !== PLAYWRIGHT_MCP_SERVER_NAME) continue;
+          if (found !== null) throw new AppServerProtocolError("MCP inventory repeated the private Playwright server.");
+          found = server;
+        }
+        cursor = page.nextCursor;
+        if (cursor != null) {
+          if (typeof cursor !== "string" || !cursor || cursors.has(cursor)) throw new AppServerProtocolError("MCP inventory returned an invalid pagination cursor.");
+          cursors.add(cursor);
+        }
+      } while (cursor != null);
+      const latest = connection.mcpStartupStates.get(`${threadId}:${PLAYWRIGHT_MCP_SERVER_NAME}`);
+      if (["failed", "cancelled"].includes(latest?.status) || ["failed", "cancelled", "disabled", "authenticationRequired"].includes(found?.runtimeStatus)) {
+        throw new AppServerProtocolError("The private Playwright MCP failed to start.");
+      }
+      if (found?.serverInfo != null || latest?.status === "ready") {
+        if (typeof found?.serverInfo?.name !== "string" || !found.serverInfo.name || found.serverInfo.version !== PLAYWRIGHT_RUNTIME_VERSION) {
+          throw new AppServerProtocolError(`The private Playwright MCP must report runtime version ${PLAYWRIGHT_RUNTIME_VERSION}; received ${found?.serverInfo?.version ?? "no version"}.`);
+        }
+        const tools = found.tools;
+        if (!tools || PLAYWRIGHT_MCP_REQUIRED_TOOLS.some((name) => tools[name]?.name !== name || !tools[name]?.inputSchema)) {
+          throw new AppServerProtocolError("The private Playwright MCP does not expose all required browser tools.");
+        }
+        return { name: found.name, serverName: found.serverInfo.name, packageVersion: PLAYWRIGHT_MCP_VERSION, runtimeVersion: found.serverInfo.version, readyAt: Date.now() };
+      }
+      await Promise.race([new Promise((resolvePromise) => setTimeout(resolvePromise, Math.min(100, Math.max(0, deadline - Date.now())))), connection.failure.promise]);
+    }
+    throw new AppServerProtocolError("The private Playwright MCP did not become ready before its startup deadline.");
+  };
+  try { return await Promise.race([inspect(), timeout, connection.failure.promise]); }
+  finally { clearTimeout(timer); }
 }
 
 function validateModelCapability(modelListResult, expected) {
@@ -786,6 +870,9 @@ export async function runAppServerTurn({
   spawnImplementation = spawnChildProcess,
   minimumVersion = MINIMUM_CODEX_VERSION,
   onProcessStarted,
+  playwrightOutputDirectory = null,
+  playwrightDisableUserServer = false,
+  playwrightStartupTimeoutMs = PLAYWRIGHT_MCP_STARTUP_TIMEOUT_MS,
 }) {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new AppServerProtocolError("timeoutMs must be a positive number.");
@@ -820,10 +907,12 @@ export async function runAppServerTurn({
     timeoutMs,
     idleTimeoutMs,
     signal,
+    capturePlaywrightEvidence: playwrightOutputDirectory !== null,
   });
   let threadId = null;
   let turnId = null;
   let effectiveRouting = null;
+  let playwrightServer = null;
   try {
     if (typeof onProcessStarted === "function") {
       if (!Number.isInteger(child.pid) || child.pid < 1) {
@@ -836,6 +925,10 @@ export async function runAppServerTurn({
       capabilities: { experimentalApi: true },
     });
     connection.notify("initialized", {});
+    if (playwrightOutputDirectory !== null) {
+      const effectiveConfig = await connection.request("config/read", { includeLayers: false });
+      validatePlaywrightMcpRuntimeConfiguration(effectiveConfig?.config, playwrightOutputDirectory, { disableUserPlaywright: playwrightDisableUserServer });
+    }
     const modelList = await connection.request("model/list", {
       includeHidden: true,
       limit: 100,
@@ -868,6 +961,9 @@ export async function runAppServerTurn({
       threadId,
       expected,
     );
+    if (playwrightOutputDirectory !== null) {
+      playwrightServer = await waitForPlaywrightMcp(connection, threadId, Math.min(playwrightStartupTimeoutMs, PLAYWRIGHT_MCP_STARTUP_TIMEOUT_MS));
+    }
     const terminalNotification = connection.waitForNotification(
       "turn/completed",
       (params) => params?.threadId === threadId,
@@ -896,6 +992,11 @@ export async function runAppServerTurn({
     } else {
       turnStatus = completion.params?.turn?.status ?? completion.params?.status ?? null;
     }
+    const scopedMcpEvents = connection.mcpEvents.filter((entry) => entry.threadId === threadId && entry.turnId === turnId);
+    const playwrightCalls = scopedMcpEvents.filter((entry) => entry.method === "item/completed" &&
+      typeof entry.id === "string" && entry.id.length > 0 &&
+      entry.server === PLAYWRIGHT_MCP_SERVER_NAME && entry.status === "completed" &&
+      entry.result !== null && entry.result.isError !== true && entry.error == null);
     return {
       threadId,
       model: effectiveRouting.model,
@@ -905,8 +1006,10 @@ export async function runAppServerTurn({
       finalResponse: connection.agentMessages.at(-1) ?? null,
       blockedReason,
       operatorRequests: connection.operatorRequests,
-      playwrightMcpUsed: connection.playwrightMcpUsed,
-      unsafePlaywrightToolUsed: connection.unsafePlaywrightToolUsed,
+      playwrightMcpUsed: playwrightServer !== null && playwrightCalls.some((entry) => PLAYWRIGHT_MCP_REQUIRED_TOOLS.includes(entry.tool) && entry.tool !== "browser_close"),
+      unsafePlaywrightToolUsed: scopedMcpEvents.some((entry) => PLAYWRIGHT_MCP_DISABLED_TOOLS.includes(entry.tool)),
+      playwrightServer,
+      playwrightCalls,
       warnings: connection.warnings,
       stderr: connection.stderr,
     };

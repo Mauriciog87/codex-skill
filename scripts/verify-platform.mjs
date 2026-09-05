@@ -142,7 +142,7 @@ async function validateInstallation({
     first.already_linked ||
     !first.configuration_changed ||
     !first.delivery_configuration_changed ||
-    !first.instructions_changed ||
+    first.instructions_changed ||
     !second.already_linked ||
     second.configuration_changed ||
     second.delivery_configuration_changed ||
@@ -159,9 +159,11 @@ async function validateInstallation({
   if (!parseDeliveryConfiguration(deliveryConfig, first.delivery_config).automatic_delivery) {
     throw new Error("The temporary automatic-delivery configuration is not enabled by default.");
   }
-  const instructions = await readFile(first.global_instructions, "utf8");
+  const instructions = await pathExists(first.global_instructions)
+    ? await readFile(first.global_instructions, "utf8")
+    : null;
   if (updateGlobalInstructions(instructions).changed) {
-    throw new Error("The temporary global Codex instructions are incomplete.");
+    throw new Error("The temporary global instructions still contain an old orchestration block.");
   }
   return expectedLinkType;
 }

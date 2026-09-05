@@ -36,6 +36,7 @@ import {
   AppServerProtocolError,
 } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
 import { loadExecutorResultContract } from "../.agents/skills/sol-luna-orchestration/scripts/executor-result-contract.mjs";
+import { createPlaywrightMcpRuntimeOverrides, createPlaywrightMcpRuntime, removePlaywrightMcpRuntime } from "../.agents/skills/sol-luna-orchestration/scripts/playwright-mcp-configuration.mjs";
 
 const OUTPUT_CONTRACT = await loadExecutorResultContract();
 
@@ -46,32 +47,8 @@ async function mkdtemp(prefix) {
 }
 
 function assertPlaywrightRuntimeOverrides(overrides) {
-  assert.equal(overrides.length, 4);
-  assert.equal(
-    overrides[0],
-    'mcp_servers.playwright.default_tools_approval_mode="approve"',
-  );
-  assert.equal(
-    overrides[1],
-    'mcp_servers.playwright.disabled_tools=["browser_run_code_unsafe"]',
-  );
-  const outputDirectory = JSON.parse(
-    overrides[2].slice("mcp_servers.playwright.cwd=".length),
-  );
-  assert.equal(
-    overrides[2],
-    `mcp_servers.playwright.cwd=${JSON.stringify(outputDirectory)}`,
-  );
-  const prefix = "mcp_servers.playwright.args=";
-  assert.ok(overrides[3].startsWith(prefix));
-  const runtimeArguments = JSON.parse(overrides[3].slice(prefix.length));
-  assert.deepEqual(runtimeArguments.slice(0, 4), [
-    "--yes",
-    "@playwright/mcp@0.0.80",
-    "--isolated",
-    "--output-dir",
-  ]);
-  assert.equal(runtimeArguments[4], outputDirectory);
+  const outputDirectory = JSON.parse(overrides[0].match(/cwd=("(?:\\.|[^"\\])*")/)[1]);
+  assert.deepEqual(overrides, createPlaywrightMcpRuntimeOverrides(outputDirectory));
   assert.ok(resolve(outputDirectory) === outputDirectory);
   return outputDirectory;
 }
@@ -107,6 +84,7 @@ function createAppServerRunner(threadId, payload, overrides = {}) {
       warnings: [],
       stderr: "",
       playwrightMcpUsed: true,
+      playwrightServer: { name: "sol_luna_playwright", packageVersion: "0.0.80", runtimeVersion: "1.63.0-alpha-2026-08-31" },
       unsafePlaywrightToolUsed: false,
       ...overrides,
     };
@@ -303,30 +281,9 @@ test("buildProfileAppServerArguments pins each selected route without bypass fla
     assert.ok(args.includes("features.multi_agent=false"));
     assert.ok(args.includes("agents.max_depth=1"));
     assert.ok(args.includes("agents.max_threads=1"));
-    assert.equal(
-      args.includes('mcp_servers.playwright.default_tools_approval_mode="approve"'),
-      profileName === "playwright",
-    );
-    assert.equal(
-      args.includes('mcp_servers.playwright.disabled_tools=["browser_run_code_unsafe"]'),
-      profileName === "playwright",
-    );
-    assert.equal(
-      args.includes(`mcp_servers.playwright.cwd=${JSON.stringify(playwrightOutputDirectory)}`),
-      profileName === "playwright",
-    );
-    assert.equal(
-      args.includes(
-        `mcp_servers.playwright.args=${JSON.stringify([
-          "--yes",
-          "@playwright/mcp@0.0.80",
-          "--isolated",
-          "--output-dir",
-          playwrightOutputDirectory,
-        ])}`,
-      ),
-      profileName === "playwright",
-    );
+    for (const override of createPlaywrightMcpRuntimeOverrides(playwrightOutputDirectory)) {
+      assert.equal(args.includes(override), profileName === "playwright");
+    }
     assert.deepEqual(args.slice(-3), ["app-server", "--listen", "stdio://"]);
     assert.equal(args.includes("exec"), false);
     assert.equal(args.includes("--json"), false);
@@ -843,57 +800,15 @@ test("Astra profiles reject historical Sol rollout metadata and preserve observe
   }
 });
 
-test("verifyPlaywrightMcp requires an enabled stdio server", async () => {
-  const valid = await verifyPlaywrightMcp({
-    processRunner: async () => ({
-      exitCode: 0,
-      timedOut: false,
-      aborted: false,
-      stdout: JSON.stringify({
-        name: "playwright",
-        enabled: true,
-        transport: {
-          type: "stdio",
-          command: "npx",
-          args: ["--yes", "@playwright/mcp@0.0.80"],
-        },
-      }),
-      stderr: "",
-    }),
-  });
-  assert.equal(valid.enabled, true);
-  await assert.rejects(
-    verifyPlaywrightMcp({
-      processRunner: async () => ({
-        exitCode: 0,
-        timedOut: false,
-        aborted: false,
-        stdout: JSON.stringify({ name: "playwright", enabled: false }),
-        stderr: "",
-      }),
-    }),
-    ExecutorConfigurationError,
-  );
-  await assert.rejects(
-    verifyPlaywrightMcp({
-      processRunner: async () => ({
-        exitCode: 0,
-        timedOut: false,
-        aborted: false,
-        stdout: JSON.stringify({
-          name: "playwright",
-          enabled: true,
-          transport: {
-            type: "stdio",
-            command: "npx",
-            args: ["@playwright/mcp@latest"],
-          },
-        }),
-        stderr: "",
-      }),
-    }),
-    /@playwright\/mcp@0\.0\.80/,
-  );
+test("verifyPlaywrightMcp reads config without requiring a user Playwright server", async () => {
+  const config = { mcp_servers: { playwright: { enabled: false, command: "custom" } } };
+  const valid = await verifyPlaywrightMcp({ configReader: async ({ timeoutMs }) => {
+    assert.equal(timeoutMs, 10_000);
+    return config;
+  } });
+  assert.equal(valid, config);
+  await assert.rejects(verifyPlaywrightMcp({ configReader: async () => ({ mcp_servers: { sol_luna_playwright: {} } }) }), /reserved/);
+  await assert.rejects(verifyPlaywrightMcp({ configReader: async () => { throw new Error("config failed"); } }), ExecutorConfigurationError);
 });
 
 test("playwright profile verifies MCP use and removes its temporary output", async (context) => {
@@ -933,6 +848,8 @@ test("playwright profile verifies MCP use and removes its temporary output", asy
   });
   assert.equal(execution.exitCode, 0);
   assert.ok(execution.result.checks.includes("playwright_mcp:verified"));
+  assert.ok(execution.result.checks.includes("playwright_mcp_version:0.0.80"));
+  assert.ok(execution.result.checks.includes("playwright_runtime_version:1.63.0-alpha-2026-08-31"));
   await assert.rejects(access(outputDirectory), { code: "ENOENT" });
 });
 
@@ -943,6 +860,9 @@ test("playwright profile rejects missing or unsafe MCP evidence", async (context
   for (const [threadId, processFields, expected] of [
     ["playwright-missing", { playwrightMcpUsed: false }, /did not emit/],
     ["playwright-unsafe", { unsafePlaywrightToolUsed: true }, /browser_run_code_unsafe/],
+    ["playwright-wrong-package", { playwrightServer: { name: "sol_luna_playwright", packageVersion: "0.0.79", runtimeVersion: "1.63.0-alpha-2026-08-31" } }, /did not emit/],
+    ["playwright-wrong-runtime", { playwrightServer: { name: "sol_luna_playwright", packageVersion: "0.0.80", runtimeVersion: "0.0.80" } }, /did not emit/],
+    ["playwright-missing-runtime", { playwrightServer: { name: "sol_luna_playwright", packageVersion: "0.0.80" } }, /did not emit/],
   ]) {
     await writeRoutingMetadata(
       sessionsRoot,
@@ -969,6 +889,35 @@ test("playwright profile rejects missing or unsafe MCP evidence", async (context
     });
     assert.equal(execution.exitCode, 2);
     assert.match(execution.result.summary, expected);
+  }
+});
+
+test("Playwright runtime is removed after failure and cleanup errors remain visible", async (context) => {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "playwright-cleanup-test-"));
+  context.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  for (const cleanupFails of [false, true]) {
+    let runtime;
+    const execution = invokeExecutor({
+      briefing: "Inspect localhost.", options: profileOptions(temporaryRoot, "playwright"),
+      coordinationOptions: { homeDirectory: temporaryRoot },
+      playwrightMcpVerifier: async () => ({}),
+      playwrightRuntimeFactory: async (options) => {
+        runtime = await createPlaywrightMcpRuntime({ ...options, temporaryRoot });
+        return runtime;
+      },
+      playwrightRuntimeCleanup: async (value) => {
+        if (cleanupFails) throw new Error("simulated cleanup failure");
+        await removePlaywrightMcpRuntime(value);
+      },
+      appServerRunner: async () => { throw new AppServerProtocolError("simulated process failure"); },
+    });
+    if (cleanupFails) {
+      await assert.rejects(execution, /Unable to clean.*simulated cleanup failure/);
+      await removePlaywrightMcpRuntime(runtime);
+    } else {
+      assert.equal((await execution).exitCode, 2);
+      await assert.rejects(access(runtime.rootDirectory), { code: "ENOENT" });
+    }
   }
 });
 
