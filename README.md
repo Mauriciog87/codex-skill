@@ -265,7 +265,22 @@ Inspect active leases and capacity with:
 node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs status --cwd .
 ```
 
-Dead leases are removed only after their registered process identity is confirmed stopped or reused. An identity that cannot be inspected fails closed. Corrupt authority state also fails closed.
+`status` is an observational snapshot. It reports `snapshot_at`, persisted capacity, `orphaned_run_ids`, and `pending_finalizations`. It does not create a namespace, remove leases, update metadata, or write history. Process checks run outside the coordination mutexes: Windows uses one batched query, while Linux and macOS allow up to four concurrent inspections. A missing history entry produces an incomplete-snapshot warning, not a cleanup action.
+
+Mutations revalidate captured records before changing state. The mutex wait remains five seconds; changed records allow at most three preflight attempts. Dead reservations may be removed only when every registered identity is confirmed stopped or reused. Unknown identities and corrupt state fail closed. Pending results keep their capacity reserved.
+
+### Recover a saved result
+
+The launcher saves an immutable, hashed receipt before finalizing an executor. If coordination fails, it returns code `2` and `status=failed`, keeps the verified routing metadata, and prints the run id and recovery command. This is not a reason to rerun the model or discard the writer's worktree.
+
+```text
+node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs finalize --cwd . --run-id <id>
+node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs finalize --cwd . --run-id <id> --expected-revision <n>
+```
+
+Assignments require the second form, using the revision saved in the receipt and shown by `status`. Recovery verifies the receipt, stopped or reused process identities, current ownership, and the assignment attempt, revision, worktree content, and artifacts. Repeating the exact recovery does not republish the result. Recovery stops at result publication: it does not approve, integrate, commit, push, or invoke Codex again.
+
+An Ultra result can be finalized only by its still-authorized owner in the same active epoch. A `recovery-required` lock or newer generation blocks it; `finalize` never recovers or releases Ultra. Receipts and separate completion confirmations live under the repository's existing state namespace in `finalizations/<run_id>/` and are not automatically deleted. No finalization retry runs in the background.
 
 ## Playwright profile
 

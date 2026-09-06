@@ -23,6 +23,13 @@ const ownerEnvironment = {
   [ORCHESTRATION_GENERATION_ENV]: String(lock.generation),
 };
 
+test("finalize accepts exact run and revision identifiers without accepting recovery flags", () => {
+  const parsed = parseGateArguments(["finalize", "--cwd", ".", "--run-id", "run-1", "--expected-revision", "2"]);
+  assert.equal(parsed.runId, "run-1");
+  assert.equal(parsed.expectedRevision, 2);
+  for (const args of [["finalize", "--cwd", "."], ["finalize", "--cwd", ".", "--run-id", "../escape"], ["finalize", "--cwd", ".", "--run-id", "run-1", "--lock-id", "lock"], ["finalize", "--cwd", ".", "--run-id", "run-1", "--expected-revision", "-1"], ["finalize", "--cwd", ".", "--run-id", "run-1", "--run-id", "run-1"], ["status", "--cwd", ".", "--run-id", "run-1"]]) assert.throws(() => parseGateArguments(args));
+});
+
 test("gate arguments require explicit repository and recovery id", () => {
   const repository = resolve("gate-test-repository");
   assert.deepEqual(parseGateArguments(["status", "--cwd", "."], repository), {

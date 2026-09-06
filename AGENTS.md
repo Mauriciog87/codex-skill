@@ -56,6 +56,10 @@ The local dashboard is projection-only, bound to loopback, protected by a one-ti
 
 The launchers acquire atomic repository and machine leases and fail immediately with code `2` when a pool is full. Inspect utilization through `orchestration-gate.mjs status`. Never manually edit state.
 
+`status` is an observational snapshot: it does not initialize namespaces, prune leases, update metadata, or write history. Capacity reflects persisted reservations, including potentially orphaned runs. Process inspection happens outside the coordination mutexes. An incomplete history snapshot is a warning, not permission to change state.
+
+Executors save immutable finalization receipts before closing their leases. A coordination failure returns code `2` with the verified routing evidence intact. Inspect `pending_finalizations`, then use `orchestration-gate.mjs finalize --cwd <repository> --run-id <id>` explicitly; assignments also require the receipt's `--expected-revision <n>`. Never rerun the model or archive its worktree to resolve a pending finalization. Recovery verifies process identities, the current epoch, the assignment revision, and worktree evidence, and stops at result publication. It does not approve, integrate, commit, push, or recover Ultra. Live or unknown processes and recovery-required or superseded Ultra epochs block recovery. Receipts and confirmations are retained without automatic deletion.
+
 ## Exclusive Ultra takeover
 
 Use Ultra only for a named decision that root Astra/high cannot resolve responsibly. Activation requires a nonempty `--reason` and `--confirm-exclusive-takeover`. The canonical launcher is:

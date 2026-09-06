@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import {
   CONTROL_PLANE_RESULT_VERSION,
   ControlPlaneError,
@@ -10,6 +10,8 @@ import {
   findAssignmentByCandidate,
   readAssignment,
   readAssignmentBriefing,
+  canonicalJson,
+  sha256,
 } from "./control-plane.mjs";
 import { getExecutorProfile } from "./executor-profiles.mjs";
 import {
@@ -24,12 +26,19 @@ import {
   createCandidateReviewWorktree,
   inspectGitRepository,
   runRequiredChecks,
+  captureWorkspaceFingerprint,
 } from "./git-workspace.mjs";
 import {
   ORCHESTRATION_GENERATION_ENV,
   ORCHESTRATION_LOCK_ENV,
   ORCHESTRATION_ROLE_ENV,
   ULTRA_ORCHESTRATOR_ROLE,
+  atomicCreate,
+  getEntry,
+  readJson,
+  closeExecutorFinalization,
+  finalizationFailure,
+  validateExecutorFinalization,
 } from "./orchestration-state.mjs";
 
 function authorityFromEnvironment(environment) {
@@ -157,6 +166,11 @@ function failedExecution(execution, error) {
     operatorRequests: [],
     exitCode: 2,
   };
+}
+
+function pendingExecutionResponse(execution, record, options) {
+  const envelope = createResultEnvelopeV2({ record, execution });
+  return { ...execution, durableResult: envelope, result: options.resultFormat === "v1" ? execution.result : envelope };
 }
 
 async function createNewRecord({ briefing, options, environment, coordinationOptions }) {
@@ -424,9 +438,14 @@ export async function invokeDurableExecutor({
       appServerRunner,
       playwrightMcpVerifier,
       outputContract,
+      deferFinalization: true,
+      finalizationContext: async () => ({
+        assignment: { assignment_id: record.assignment_id, attempt: record.attempt, state_revision: record.state_revision, record_sha256: sha256(canonicalJson(record)), workspace_path: workspace.path, writer: record.writer },
+        workspaceFingerprint: record.writer ? await captureWorkspaceFingerprint(record, workspace.path, coordinationOptions) : null,
+      }),
     });
   } catch (error) {
-    await dispatchAssignmentAction(
+    try { await dispatchAssignmentAction(
       record.repository,
       createAction({
         op: "mark_recovery_required",
@@ -435,16 +454,34 @@ export async function invokeDurableExecutor({
         payload: { reason: error instanceof Error ? error.message : String(error) },
       }),
       coordinationOptions,
-    );
+    ); } catch (coordinationError) { if (error instanceof Error) error.cause ??= coordinationError; }
     throw error;
   }
+  if (execution.finalizationPending) return pendingExecutionResponse(execution, record, options);
+  try {
+    if (execution.finalization) await validateExecutorFinalization(execution.finalization.lease, execution.finalization.receipt, { ...coordinationOptions, environment: executorEnvironment });
+    const result = await continueExecutorResult({ record, workspace, execution, target, authority, options, coordinationOptions, executorEnvironment });
+    if (execution.finalization) await closeExecutorFinalization(execution.finalization.lease, execution.finalization.receipt, coordinationOptions);
+    return result;
+  } catch (error) {
+    if (!execution.finalization) throw error;
+    return pendingExecutionResponse(finalizationFailure(execution, execution.finalization.lease, error, record.state_revision), record, options);
+  }
+}
+
+async function continueExecutorResult({ record, workspace, execution, target = null, authority = "root", options = {}, coordinationOptions = {}, executorEnvironment = process.env, recovery = false }) {
+  const receipt = execution.finalization?.receipt;
+  const publicationPath = receipt ? join(execution.finalization.lease.stateDirectory, "finalizations", receipt.run_id, "publication.json") : null;
+  let storedPublication = publicationPath && (await getEntry(publicationPath)) !== null ? await readJson(publicationPath, "Saved result publication") : null;
+  if (storedPublication && (storedPublication.version !== 1 || storedPublication.receipt_sha256 !== receipt.receipt_sha256 || storedPublication.action_sha256 !== sha256(canonicalJson(storedPublication.action)) || storedPublication.action.op !== "publish_result" || storedPublication.action.assignment_id !== receipt.assignment.assignment_id || storedPublication.action.expected_state_revision !== receipt.assignment.state_revision || storedPublication.action.authority !== "executor")) throw new ControlPlaneError("Saved publication failed its receipt or hash verification.", "finalization-publication");
+  if (!storedPublication && receipt?.assignment?.writer && await captureWorkspaceFingerprint(record, workspace.path, coordinationOptions) !== receipt.workspace_fingerprint) throw new ControlPlaneError("Worktree content or artifacts changed after the result was saved.", "finalization-workspace-changed");
   let candidateResult = {
     candidate: null,
     changedFiles: execution.result.changed_files,
     artifacts: [],
     checkResults: [],
   };
-  if (record.writer && execution.result.status === "completed") {
+  if (!storedPublication && record.writer && execution.result.status === "completed") {
     try {
       const checkResults = await runRequiredChecks(record, workspace.path, coordinationOptions);
       candidateResult = await createCandidate(record, workspace.path, {
@@ -466,11 +503,11 @@ export async function invokeDurableExecutor({
       };
     }
   }
-  const operatorRequests = createOperatorRequests(record, execution.operatorRequests ?? []);
+  const operatorRequests = storedPublication?.action.payload.operator_requests ?? createOperatorRequests(record, execution.operatorRequests ?? []);
   const warnings = record.writer && workspace.excluded_dirty_paths?.length > 0
     ? [`Main checkout changes outside the assignment scope were excluded: ${workspace.excluded_dirty_paths.join(", ")}.`]
     : [];
-  const envelope = createResultEnvelopeV2({
+  const envelope = storedPublication?.action.payload.result ?? createResultEnvelopeV2({
     record,
     execution,
     candidate: candidateResult.candidate,
@@ -480,10 +517,9 @@ export async function invokeDurableExecutor({
     checkResults: candidateResult.checkResults,
     extraWarnings: warnings,
   });
-  record = (
-    await dispatchAssignmentAction(
-      record.repository,
-      createAction({
+  if (!storedPublication) {
+    if (receipt?.assignment?.writer && await captureWorkspaceFingerprint(record, workspace.path, coordinationOptions) !== receipt.workspace_fingerprint) throw new ControlPlaneError("Worktree content or artifacts changed during result validation.", "finalization-workspace-changed");
+    const action = createAction({
         op: "publish_result",
         authority: "executor",
         record,
@@ -492,11 +528,14 @@ export async function invokeDurableExecutor({
           candidate: candidateResult.candidate,
           operator_requests: operatorRequests,
         },
-      }),
-      coordinationOptions,
-    )
-  ).record;
-  if (target !== null && envelope.status !== "failed") {
+      });
+    storedPublication = { version: 1, receipt_sha256: receipt?.receipt_sha256 ?? null, action, action_sha256: sha256(canonicalJson(action)) };
+    if (publicationPath) await atomicCreate(publicationPath, storedPublication);
+    await coordinationOptions.onFinalizationBoundary?.("publication-prepared");
+  }
+  record = (await dispatchAssignmentAction(record.repository, storedPublication.action, coordinationOptions)).record;
+  await coordinationOptions.onFinalizationBoundary?.("result-published");
+  if (!recovery && target !== null && envelope.status !== "failed") {
     const currentTarget = await readAssignment(target.repository, target.assignment_id, coordinationOptions);
     await dispatchAssignmentAction(
       currentTarget.repository,
@@ -544,4 +583,18 @@ export async function invokeDurableExecutor({
     record,
     exitCode: execution.exitCode,
   };
+}
+
+export async function resumeExecutorFinalization({ state, lease, receipt, expectedRevision, environment = process.env, ...coordinationOptions }) {
+  const binding = receipt.assignment;
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision !== binding.state_revision) throw new ControlPlaneError("Assignment finalization requires its exact --expected-revision.", "stale-state-revision");
+  let record = await readAssignment(state.repository, binding.assignment_id, { ...coordinationOptions, environment });
+  const publicationPath = join(state.stateDirectory, "finalizations", receipt.run_id, "publication.json");
+  const publication = (await getEntry(publicationPath)) === null ? null : await readJson(publicationPath, "Saved result publication");
+  const ownPublication = publication && record.last_action_id === publication.action.action_id && record.state_revision === binding.state_revision + 1;
+  if (record.attempt !== binding.attempt || (!ownPublication && (record.state_revision !== binding.state_revision || sha256(canonicalJson(record)) !== binding.record_sha256))) throw new ControlPlaneError("Assignment attempt or revision changed after the result was saved.", "stale-state-revision");
+  if (record.workspace?.path !== binding.workspace_path) throw new ControlPlaneError("Assignment worktree changed after execution.", "finalization-workspace-changed");
+  assertEpochEnvironment(record, environment);
+  if (record.writer && await captureWorkspaceFingerprint(record, record.workspace.path, coordinationOptions) !== receipt.workspace_fingerprint) throw new ControlPlaneError("Worktree content or artifacts changed after the result was saved.", "finalization-workspace-changed");
+  return continueExecutorResult({ record, workspace: record.workspace, execution: { ...receipt.execution, finalization: { lease, receipt } }, coordinationOptions: { ...coordinationOptions, environment }, executorEnvironment: environment, recovery: true });
 }

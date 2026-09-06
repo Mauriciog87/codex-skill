@@ -23,7 +23,7 @@ export function isPidAlive(pid, kill = process.kill) {
     kill(pid, 0);
     return true;
   } catch (error) {
-    return error.code === "EPERM";
+    return error.code !== "ESRCH";
   }
 }
 
@@ -264,4 +264,71 @@ export async function inspectProcessIdentity(
   return captured.fingerprint === identity.start_fingerprint
     ? { status: "same" }
     : { status: "reused" };
+}
+
+export async function inspectProcessIdentities(identities, {
+  platform = process.platform,
+  architecture = arch(),
+  hostnameValue = hostname(),
+  captureFingerprint,
+  execFileImplementation = execFile,
+  readFileImplementation = readFile,
+  processAlive = isPidAlive,
+} = {}) {
+  const local = identities.map((identity) => {
+    validateProcessIdentity(identity);
+    if (!Number.isSafeInteger(identity.pid) || identity.pid > 4_294_967_295) {
+      throw new ProcessIdentityError("Process identity contains an invalid native PID.");
+    }
+    return identity.hostname === hostnameValue && identity.platform === platform && identity.architecture === architecture;
+  });
+  const pids = [...new Set(identities.filter((_, index) => local[index]).map((identity) => identity.pid))];
+  const captures = new Map();
+  if (platform === "win32" && captureFingerprint === undefined && pids.length > 0) {
+    const filter = pids.map((pid) => `ProcessId = ${pid}`).join(" OR ");
+    const script = [
+      `$items = @(Get-CimInstance Win32_Process -Filter '${filter}' -Property ProcessId,CreationDate -ErrorAction Stop)`,
+      "$result = @($items | ForEach-Object { @{ pid = [long]$_.ProcessId; fingerprint = $_.CreationDate.ToUniversalTime().ToString('o') } })",
+      "ConvertTo-Json -InputObject $result -Compress",
+    ].join("; ");
+    try {
+      const { stdout } = await execFileImplementation("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+        encoding: "utf8", timeout: PROCESS_QUERY_TIMEOUT_MS, windowsHide: true, maxBuffer: 1024 * 1024,
+      });
+      const rows = JSON.parse(stdout);
+      if (!Array.isArray(rows)) throw new ProcessIdentityError("CIM process batch did not return an array.");
+      for (const row of rows) {
+        if (!pids.includes(row?.pid) || captures.has(row.pid) || typeof row.fingerprint !== "string" || row.fingerprint.length === 0) {
+          throw new ProcessIdentityError("CIM process batch contains invalid or duplicate identities.");
+        }
+        captures.set(row.pid, { status: "found", fingerprint: row.fingerprint });
+      }
+      for (const pid of pids) {
+        if (!captures.has(pid)) captures.set(pid, processAlive(pid) ? { status: "unknown", reason: "CIM did not return an active process." } : { status: "dead" });
+      }
+    } catch (error) {
+      captures.clear();
+      for (const pid of pids) captures.set(pid, captureFailure(error, pid, processAlive));
+    }
+  } else {
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(4, pids.length) }, async () => {
+      while (next < pids.length) {
+        const pid = pids[next++];
+        try {
+          const result = await (captureFingerprint ?? captureProcessFingerprint)(pid, { platform, execFileImplementation, readFileImplementation, processAlive });
+          captures.set(pid, validateCaptureResult(result));
+        } catch (error) {
+          captures.set(pid, { status: "unknown", reason: error instanceof Error ? error.message : String(error) });
+        }
+      }
+    }));
+  }
+  return identities.map((identity, index) => {
+    if (!local[index]) return { status: "unknown", reason: "Process identity belongs to another host runtime." };
+    const captured = captures.get(identity.pid);
+    return captured.status === "found"
+      ? { status: captured.fingerprint === identity.start_fingerprint ? "same" : "reused" }
+      : captured;
+  });
 }

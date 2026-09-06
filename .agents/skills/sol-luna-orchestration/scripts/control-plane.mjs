@@ -17,6 +17,7 @@ import {
   readUltraLock,
   resolveAssignmentState,
   withStateMutex,
+  withInspectedState,
 } from "./orchestration-state.mjs";
 
 export const CONTROL_PLANE_VERSION = 1;
@@ -1176,7 +1177,11 @@ export async function dispatchAssignmentAction(cwd, inputAction, options = {}) {
   const state = await resolveAssignmentState(cwd, assignmentId, options);
   const paths = assignmentPaths(state, assignmentId);
   const timestamp = (options.now ?? (() => new Date()))().toISOString();
-  return withStateMutex(state, async () => {
+  const inspectQuiescence = ["archive_workspace", "cleanup_workspace", "abandon_assignment", "retry_assignment"].includes(inputAction.op);
+  const protect = inspectQuiescence
+    ? (action) => withInspectedState([state], action, { ...options, operation: inputAction.op })
+    : (action) => withStateMutex(state, action, { operation: inputAction.op });
+  return protect(async (processInspector) => {
     const record = validateRecord(await readJson(paths.record, `Assignment ${assignmentId}`), assignmentId);
     if (record.repository_key !== state.key || resolve(record.repository) !== resolve(state.repository)) {
       throw new ControlPlaneError("Assignment repository identity does not match its namespace.", "repository-mismatch");
@@ -1215,7 +1220,7 @@ export async function dispatchAssignmentAction(cwd, inputAction, options = {}) {
     }
     const requestedAction = validateEffectRequest(record, inputAction);
     if (["archive_workspace", "cleanup_workspace", "abandon_assignment", "retry_assignment"].includes(requestedAction.op)) {
-      await assertRepositoryQuiescent(state, record.assignment_id, options);
+      await assertRepositoryQuiescent(state, record.assignment_id, { ...options, processInspector });
     }
     if (options.beforeTransition !== undefined && (typeof options.beforeTransition !== "function" || !EFFECT_OPERATIONS.has(requestedAction.op))) {
       throw new ControlPlaneError("This action cannot execute a transition effect.", "invalid-action");

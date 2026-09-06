@@ -952,13 +952,30 @@ async function runPlaywrightIsolationProbe(repositoryRoot, sessionRoots) {
     for (const lease of leases) await abandonExecutorRun(lease, "Capacity-only probe completed without starting a model.");
   }
   const runtimes = [];
+  let finished = false;
+  let observations = 0;
+  let overlappingObserved = false;
+  let observationError = null;
+  const readings = (async () => {
+    while (!finished) {
+      const snapshot = await getOrchestrationStatus(repositoryRoot);
+      observations++;
+      overlappingObserved ||= snapshot.capacity.repository.playwright === 2;
+      if (!finished) await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  })().catch((error) => { observationError = error; });
   const results = await Promise.allSettled([0, 1].map(() => runPlaywrightProbe(repositoryRoot, sessionRoots, { onVerifiedRuntime: (runtime) => runtimes.push(runtime) })));
+  finished = true;
+  await readings;
+  if (observationError) throw observationError;
   const failures = results.filter((result) => result.status === "rejected").map((result) => result.reason);
   if (failures.length) throw new AggregateError(failures, `Parallel Playwright verification failed: ${failures.map((error) => error.message).join("; ")}`);
   if (runtimes.length !== 2 || runtimes[0].root === runtimes[1].root || !runtimes.every((runtime) => Number.isFinite(runtime.readyAt) && Number.isFinite(runtime.closedAt)) || Math.max(...runtimes.map((runtime) => runtime.readyAt)) >= Math.min(...runtimes.map((runtime) => runtime.closedAt))) {
     throw new Error("The Playwright probe did not prove two overlapping, isolated MCP runtimes.");
   }
-  return ["playwright_parallel_isolation:verified", "playwright_third_lease:rejected", ...results.map((result) => `playwright_parallel_thread:${result.value.thread_id}`)];
+  const finalStatus = await getOrchestrationStatus(repositoryRoot);
+  if (!overlappingObserved || finalStatus.capacity.repository.playwright !== 0 || finalStatus.pending_finalizations.length !== 0) throw new Error("Concurrent status queries did not observe both Playwright executors and their complete finalization.");
+  return ["playwright_parallel_isolation:verified", "playwright_third_lease:rejected", `playwright_concurrent_status:verified:${observations}`, ...results.map((result) => `playwright_parallel_thread:${result.value.thread_id}`)];
 }
 
 async function runExecutorProbes(repositoryRoot, sessionRoots) {

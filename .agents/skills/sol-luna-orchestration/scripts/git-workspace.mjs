@@ -5,6 +5,7 @@ import {
   lstat,
   mkdir,
   readFile,
+  readlink,
   readdir,
   realpath,
   rm,
@@ -525,7 +526,13 @@ async function persistArtifacts(record, workspacePath, candidateId, inspected, o
   const state = await getRepositoryState(record.repository, options);
   const destination = join(state.artifactsDirectory, candidateId);
   if ((await getEntry(destination)) !== null) {
-    throw new GitWorkspaceError(`Artifact destination already exists: ${candidateId}`, "artifact-exists");
+    const storedNames = (await readdir(destination)).sort();
+    if (canonicalJson(storedNames) !== canonicalJson(inspected.map((item) => item.specification.name).sort())) throw new GitWorkspaceError("Saved candidate artifacts are incomplete or contain unrelated entries.", "artifact-exists");
+    for (const artifact of inspected) {
+      const stored = await inspectArtifact(destination, { ...artifact.specification, path: artifact.specification.name });
+      if (canonicalJson({ ...stored.manifest, path: artifact.specification.path }) !== canonicalJson(artifact.manifest)) throw new GitWorkspaceError("Saved candidate artifacts differ from the executor evidence.", "artifact-exists");
+    }
+    return inspected.map((artifact) => ({ ...artifact.manifest, stored_path: join(destination, artifact.specification.name) }));
   }
   await mkdir(destination, { recursive: true });
   try {
@@ -545,6 +552,28 @@ async function persistArtifacts(record, workspacePath, candidateId, inspected, o
     await rm(destination, { recursive: true, force: true });
     throw error;
   }
+}
+
+export async function captureWorkspaceFingerprint(record, workspacePath, options = {}) {
+  const results = [];
+  for (const args of [["rev-parse", "HEAD"], ["status", "--porcelain=v1", "-z", "--untracked-files=all"], ["diff", "--binary", "--full-index", "HEAD"], ["diff", "--cached", "--binary", "--full-index"]]) {
+    results.push(sha256((await runGit(args, { ...options, cwd: workspacePath })).stdout));
+  }
+  const paths = (await runGit(["ls-files", "--others", "--exclude-standard", "-z"], { ...options, cwd: workspacePath })).stdoutText.split("\0").filter(Boolean).sort();
+  for (const path of paths) {
+    const absolute = await resolveContainedPath(workspacePath, path);
+    const entry = await lstat(absolute);
+    if (!entry.isFile() && !entry.isSymbolicLink()) throw new GitWorkspaceError("Cannot fingerprint an unsupported workspace entry.", "workspace-fingerprint");
+    results.push({ path, mode: entry.mode, content: sha256(entry.isSymbolicLink() ? await readlink(absolute) : await readFile(absolute)) });
+  }
+  for (const artifact of record.artifacts) {
+    try { results.push((await inspectArtifact(workspacePath, artifact)).manifest); }
+    catch (error) {
+      if (error.code !== "artifact-missing") throw error;
+      results.push({ artifact, missing: true });
+    }
+  }
+  return sha256(canonicalJson(results));
 }
 
 export async function createCandidate(record, workspacePath, {

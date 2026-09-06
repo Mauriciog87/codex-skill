@@ -22,7 +22,9 @@ import {
   ORCHESTRATION_ROLE_ENV,
   abandonExecutorRun,
   beginExecutorRun,
-  finishExecutorRun,
+  saveExecutorFinalization,
+  closeExecutorFinalization,
+  finalizationFailure,
   getRepositoryState,
   registerExecutorProcess,
 } from "./orchestration-state.mjs";
@@ -1006,6 +1008,7 @@ async function runExecutor({
   }
 
   let playwrightRuntime = null;
+  let primaryError = null;
   if (profile.name === "playwright") {
     try {
       const configuration = await playwrightMcpVerifier({ command, cwd: options.cwd, environment });
@@ -1254,10 +1257,17 @@ async function runExecutor({
         routingVerified: result.routing_verified,
       }),
     };
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
     if (playwrightRuntime !== null) {
       try { await playwrightRuntimeCleanup(playwrightRuntime); }
-      catch (error) { throw new ExecutorConfigurationError(`Unable to clean the private Playwright runtime at ${playwrightRuntime.rootDirectory}: ${error.message}`); }
+      catch (error) {
+        const cleanupError = new ExecutorConfigurationError(`Unable to clean the private Playwright runtime at ${playwrightRuntime.rootDirectory}: ${error.message}`);
+        if (primaryError instanceof Error) primaryError.cause ??= cleanupError;
+        else if (primaryError === null) throw cleanupError;
+      }
     }
   }
 }
@@ -1311,10 +1321,20 @@ export async function invokeExecutor(input) {
       },
     });
   } catch (error) {
-    await abandonExecutorRun(lease, error, input.coordinationOptions);
+    try { await abandonExecutorRun(lease, error, input.coordinationOptions); }
+    catch (cleanupError) { if (error instanceof Error) error.cause ??= cleanupError; }
     throw error;
   }
-  await finishExecutorRun(lease, execution, input.coordinationOptions);
+  let receipt;
+  try {
+    const context = await input.finalizationContext?.() ?? {};
+    receipt = await saveExecutorFinalization(lease, execution, context);
+  } catch (error) {
+    return { ...execution, exitCode: 2, finalizationPending: true, result: { ...execution.result, status: "failed", summary: `Result for run ${lease.run_id} could not be saved: ${error.message}. The lease has not been closed.`, blockers: [...execution.result.blockers, error.message] } };
+  }
+  if (input.deferFinalization) return { ...execution, finalization: { lease, receipt } };
+  try { await closeExecutorFinalization(lease, receipt, input.coordinationOptions); }
+  catch (error) { return finalizationFailure(execution, lease, error); }
   return execution;
 }
 

@@ -8,6 +8,7 @@ import {
   readOrchestrationHistory,
   readUltraLock,
   recoverUltraLock,
+  finalizeExecutorReceipt,
 } from "./orchestration-state.mjs";
 
 const MAX_HOOK_INPUT_BYTES = 1_048_576;
@@ -29,8 +30,8 @@ function requireValue(argv, index, option) {
 
 export function parseGateArguments(argv, baseDirectory = process.cwd()) {
   const command = argv[0];
-  if (!["status", "recover", "history", "hook"].includes(command)) {
-    throw new GateInvocationError("Command must be status, recover, history, or hook.");
+  if (!["status", "recover", "history", "hook", "finalize"].includes(command)) {
+    throw new GateInvocationError("Command must be status, recover, history, finalize, or hook.");
   }
   if (command === "hook") {
     if (argv.length !== 1) {
@@ -54,7 +55,7 @@ export function parseGateArguments(argv, baseDirectory = process.cwd()) {
   const seen = new Set();
   for (let index = 1; index < argv.length; index += 1) {
     const option = argv[index];
-    if (!["--cwd", "--lock-id", "--limit", "--confirm-legacy-recovery"].includes(option)) {
+    if (!["--cwd", "--lock-id", "--limit", "--confirm-legacy-recovery", "--run-id", "--expected-revision"].includes(option)) {
       throw new GateInvocationError(`Unknown option: ${option}`);
     }
     if (seen.has(option)) {
@@ -71,6 +72,12 @@ export function parseGateArguments(argv, baseDirectory = process.cwd()) {
       parsed.cwd = resolve(baseDirectory, value);
     } else if (option === "--lock-id") {
       parsed.lockId = value;
+    } else if (option === "--run-id") {
+      if (command !== "finalize" || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(value)) throw new GateInvocationError("--run-id requires a valid finalize run id.");
+      parsed.runId = value;
+    } else if (option === "--expected-revision") {
+      if (command !== "finalize" || !/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) throw new GateInvocationError("--expected-revision requires a nonnegative finalize revision.");
+      parsed.expectedRevision = Number(value);
     } else {
       const limit = Number(value);
       if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
@@ -82,6 +89,7 @@ export function parseGateArguments(argv, baseDirectory = process.cwd()) {
   if (parsed.cwd === null) {
     throw new GateInvocationError("--cwd is required.");
   }
+  if (command === "finalize" && (!parsed.runId || parsed.lockId !== null || seen.has("--limit") || parsed.confirmLegacyRecovery)) throw new GateInvocationError("finalize requires --run-id and accepts only --cwd and --expected-revision.");
   if (command === "status" && parsed.lockId !== null) {
     throw new GateInvocationError("status does not accept --lock-id.");
   }
@@ -206,6 +214,8 @@ export async function main(argv = process.argv.slice(2)) {
       ? await getOrchestrationStatus(options.cwd)
       : options.command === "history"
         ? await readOrchestrationHistory(options.cwd, { limit: options.limit })
+        : options.command === "finalize"
+          ? await finalizeExecutorReceipt(options)
         : await recoverUltraLock({
             cwd: options.cwd,
             lockId: options.lockId,
@@ -216,7 +226,7 @@ export async function main(argv = process.argv.slice(2)) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`${JSON.stringify({ status: "failed", summary: message })}\n`);
-    return error instanceof GateInvocationError || error instanceof OrchestrationStateError ? 2 : 1;
+    return argv[0] === "finalize" || error instanceof GateInvocationError || error instanceof OrchestrationStateError ? 2 : 1;
   }
 }
 

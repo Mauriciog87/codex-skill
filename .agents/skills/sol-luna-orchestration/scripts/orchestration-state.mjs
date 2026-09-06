@@ -18,6 +18,7 @@ import {
   ProcessIdentityError,
   createProcessIdentity,
   inspectProcessIdentity,
+  inspectProcessIdentities,
   isPidAlive,
   validateProcessIdentity,
 } from "./process-identity.mjs";
@@ -205,6 +206,7 @@ function repositoryStatePaths(repository, { environment = process.env, homeDirec
     assignmentsDirectory: join(stateDirectory, "assignments"),
     controlEventsDirectory: join(stateDirectory, "control-events"),
     artifactsDirectory: join(stateDirectory, "artifacts"),
+    finalizationsDirectory: join(stateDirectory, "finalizations"),
     worktreesDirectory,
     globalStateDirectory: globalState.stateDirectory,
     globalMutexDirectory: globalState.mutexDirectory,
@@ -299,17 +301,16 @@ async function removeStaleMutex(state) {
   try {
     owner = await readJson(join(state.mutexDirectory, "owner.json"), "Orchestration mutex owner");
   } catch {}
-  if (owner !== null && isProcessAlive(owner.pid)) {
+  if (owner === null || !Number.isSafeInteger(owner.pid) || owner.pid < 1 || isProcessAlive(owner.pid)) {
     return false;
   }
   await rm(state.mutexDirectory, { recursive: true, force: true });
   return true;
 }
 
-export async function withStateMutex(state, action) {
-  await mkdir(state.stateDirectory, { recursive: true });
-  const startedAt = Date.now();
-  while (true) {
+async function tryStateMutex(state, observational) {
+  if (observational && (await getEntry(state.stateDirectory)) === null) return () => {};
+  if (!observational) await mkdir(state.stateDirectory, { recursive: true });
     try {
       await mkdir(state.mutexDirectory);
       try {
@@ -322,25 +323,97 @@ export async function withStateMutex(state, action) {
         await rm(state.mutexDirectory, { recursive: true, force: true });
         throw error;
       }
-      break;
+      return () => rm(state.mutexDirectory, { recursive: true, force: true });
     } catch (error) {
       if (error.code !== "EEXIST") {
         throw error;
       }
-      if (await removeStaleMutex(state)) {
-        continue;
-      }
-      if (Date.now() - startedAt >= MUTEX_TIMEOUT_MS) {
-        throw new OrchestrationStateError("Timed out waiting for the orchestration state mutex.");
-      }
-      await wait(25);
+      if (!observational) await removeStaleMutex(state);
+      return null;
     }
+}
+
+export async function withCoordinationMutexes(states, action, { operation = "state transition", observational = false } = {}) {
+  const startedAt = Date.now();
+  while (true) {
+    const releases = [];
+    let busy;
+    try {
+      for (const state of states) {
+        const release = await tryStateMutex(state, observational);
+        if (release === null) { busy = state; break; }
+        releases.push(release);
+      }
+      if (!busy) return await action();
+    } finally {
+      for (const release of releases.reverse()) await release();
+    }
+    const elapsed = Date.now() - startedAt;
+    if (elapsed >= MUTEX_TIMEOUT_MS) {
+      const scope = busy.key ? `repository ${busy.key}` : basename(busy.stateDirectory);
+      throw new OrchestrationStateError(`Timed out waiting for the orchestration state mutex (${scope}; ${operation}; waited ${elapsed} ms).`);
+    }
+    await wait(Math.min(25, MUTEX_TIMEOUT_MS - elapsed));
   }
-  try {
-    return await action();
-  } finally {
-    await rm(state.mutexDirectory, { recursive: true, force: true });
+}
+
+export async function withStateMutex(state, action, options = {}) {
+  return withCoordinationMutexes([state], action, options);
+}
+
+function canonicalHash(value) {
+  const canonical = (item) => Array.isArray(item) ? item.map(canonical) : item !== null && typeof item === "object"
+    ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, canonical(item[key])])) : item;
+  return createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex");
+}
+
+async function captureCoordination(states) {
+  return Promise.all(states.map(async (state) => ({
+    runs: await readRuns(state),
+    lock: state.lockPath ? await readLockFromState(state) : null,
+    metadata: state.metadataPath ? await readRepositoryMetadata(state) : null,
+    finalizations: await pendingFinalizations(state),
+  })));
+}
+
+async function preparedProcessInspector(records, options = {}) {
+  const identities = [...new Map(records.flatMap((record) => [record.lock, ...record.runs])
+    .filter(Boolean).flatMap((record) => record.processes ?? []).filter((entry) => !options.inspectionKinds || options.inspectionKinds.includes(entry.kind))
+    .map(({ identity }) => [canonicalHash(identity), identity])).values()];
+  let results;
+  if (options.processInspector || options.processAlive) {
+    const inspect = resolveProcessInspector(options);
+    results = new Array(identities.length);
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(4, identities.length) }, async () => {
+      while (next < identities.length) {
+        const index = next++;
+        try { results[index] = await inspect(identities[index]); }
+        catch { results[index] = { status: "unknown", reason: "Process inspection failed." }; }
+      }
+    }));
+  } else results = await (options.processBatchInspector ?? inspectProcessIdentities)(identities);
+  const cache = new Map(identities.map((identity, index) => [canonicalHash(identity), results[index]]));
+  return async (identity) => cache.get(canonicalHash(identity)) ?? { status: "unknown", reason: "Identity was not captured by this preflight." };
+}
+
+export async function withInspectedState(states, action, options = {}) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const snapshot = await withCoordinationMutexes(states, () => captureCoordination(states), options);
+    const inspector = await preparedProcessInspector([...snapshot, { lock: null, runs: [{ processes: options.additionalProcesses ?? [] }] }], options);
+    let changed = false;
+    const result = await withCoordinationMutexes(states, async () => {
+      if (canonicalHash(snapshot) !== canonicalHash(await captureCoordination(states))) { changed = true; return; }
+      for (const state of states.filter((entry) => entry.repository)) {
+        const canonical = state.canonicalState ?? state;
+        const identity = await resolveRepositoryIdentity(canonical.repository);
+        if (getRepositoryKey(identity.repository) !== canonical.key) throw new OrchestrationStateError("Repository identity changed during process inspection.");
+      }
+      return action(inspector);
+    }, options);
+    if (!changed) return result;
   }
+  throw new OrchestrationStateError(`Coordination conflict during ${options.operation ?? "state transition"}: records changed during all three preflight attempts.`);
 }
 
 function validateControlledProcesses(processes, label, launcherKind) {
@@ -534,7 +607,7 @@ async function readRuns(state) {
     const run = validateRun(await readJson(path, `Executor run ${entry.name}`), entry.name);
     runs.push({ ...run, path });
   }
-  return runs;
+  return runs.sort((left, right) => left.run_id.localeCompare(right.run_id));
 }
 
 function generationKey(generation) {
@@ -548,12 +621,13 @@ function isTerminalHistoryEvent(event) {
   );
 }
 
-async function readHistoryEntries(state) {
+async function readHistoryEntries(state, maximumSequence = Infinity, capturedNames) {
   if ((await getEntry(state.historyDirectory)) === null) {
-    return { events: [], warnings: [], fileCount: 0 };
+    return { events: [], warnings: capturedNames?.length ? ["History snapshot is incomplete: captured entries were removed."] : [], fileCount: capturedNames?.length ?? 0 };
   }
-  const entries = (await readdir(state.historyDirectory, { withFileTypes: true }))
+  const entries = capturedNames ? capturedNames.map((name) => ({ name })) : (await readdir(state.historyDirectory, { withFileTypes: true }))
     .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+    .filter((entry) => !Number.isFinite(Number(entry.name.split("-")[0])) || Number(entry.name.split("-")[0]) <= maximumSequence)
     .sort((left, right) => left.name.localeCompare(right.name));
   const events = [];
   const warnings = [];
@@ -571,9 +645,9 @@ async function readHistoryEntries(state) {
       ) {
         throw new OrchestrationStateError(`History event ${entry.name} is malformed.`);
       }
-      events.push({ ...event, path: join(state.historyDirectory, entry.name) });
+      if (event.sequence <= maximumSequence) events.push({ ...event, path: join(state.historyDirectory, entry.name) });
     } catch (error) {
-      warnings.push(error.message);
+      warnings.push(`History snapshot is incomplete: ${error.message}`);
     }
   }
   events.sort((left, right) => left.sequence - right.sequence);
@@ -723,6 +797,7 @@ function resolveProcessInspector({ processInspector, processAlive } = {}) {
 }
 
 export async function assertRepositoryQuiescent(state, assignmentId, options = {}) {
+  if ((await pendingFinalizations(state)).some((receipt) => receipt.assignment_id === assignmentId)) throw new OrchestrationStateError("Assignment has a pending finalization; recover the saved result before cleaning its worktree.");
   const runs = (await readRuns(state)).filter((run) => run.assignment_id === assignmentId ||
     (run.state === "active" && (run.assignment_id === undefined || run.assignment_id === null)));
   for (const run of runs) {
@@ -745,6 +820,8 @@ async function removeDeadActiveRuns(state, options = {}) {
     if (run.state !== "active") {
       continue;
     }
+    const receiptState = repositoryState ? state : { stateDirectory: join(dirname(state.stateDirectory), run.repository_key) };
+    if ((await pendingFinalizations(receiptState)).some((receipt) => receipt.run_id === run.run_id)) continue;
     let inactive;
     if (run.version === LEGACY_STATE_VERSION) {
       inactive = !isProcessAlive(run.pid);
@@ -754,6 +831,10 @@ async function removeDeadActiveRuns(state, options = {}) {
     }
     if (!inactive || (repositoryState && run.lock_id !== null)) {
       continue;
+    }
+    if (repositoryState && options.globalState) {
+      const path = join(options.globalState.runsDirectory, `${run.run_id}.json`);
+      if ((await getEntry(path)) !== null && canonicalHash(await readJson(path, "Orphan global lease")) !== canonicalHash((({ path, ...value }) => value)(run))) throw new OrchestrationStateError("Orphan lease differs between repository and machine reservations.");
     }
     if (repositoryState && run.version === ORCHESTRATION_STATE_VERSION) {
       await appendHistory(state, {
@@ -767,6 +848,7 @@ async function removeDeadActiveRuns(state, options = {}) {
       });
     }
     await rm(run.path, { force: true });
+    if (repositoryState && options.globalState) await rm(join(options.globalState.runsDirectory, `${run.run_id}.json`), { force: true });
   }
   return (await readRuns(state)).filter((run) => run.state === "active");
 }
@@ -782,6 +864,13 @@ function capacityUsage(runs) {
     total: runs.length,
     playwright: runs.filter((run) => run.profile === "playwright").length,
   };
+}
+
+async function reservedRuns(state, runs) {
+  const pending = await pendingFinalizations(state);
+  const reservations = new Map(runs.filter((run) => run.state === "active").map((run) => [run.run_id, run]));
+  for (const receipt of pending) if (!reservations.has(receipt.run_id)) reservations.set(receipt.run_id, receipt);
+  return [...reservations.values()];
 }
 
 function requireExecutorPool(model) {
@@ -880,13 +969,18 @@ export async function acquireUltraLock({
   pid = process.pid,
   lockId = randomUUID(),
   processIdentityProvider = createProcessIdentity,
+  processInspector,
 }) {
   if (typeof reason !== "string" || reason.trim().length === 0) {
     throw new OrchestrationStateError("An Ultra takeover reason is required.");
   }
   const state = await getRepositoryState(cwd, { environment, homeDirectory });
-  return withStateMutex(state, async () => {
+  const ownerIdentity = await processIdentityProvider({ pid });
+  validateProcessIdentity(ownerIdentity);
+  const globalState = getGlobalCapacityState({ environment, homeDirectory });
+  return withInspectedState([globalState, state], async (inspector) => {
     await assertNoLegacyRepositoryWork(state);
+    if ((await pendingFinalizations(state)).length > 0) throw new OrchestrationStateError("Cannot acquire Ultra takeover while a pending finalization needs explicit recovery.");
     const existingLock = await readLockFromState(state);
     if (existingLock !== null) {
       if (existingLock.version === LEGACY_STATE_VERSION) {
@@ -897,7 +991,7 @@ export async function acquireUltraLock({
         generation: existingLock.generation,
       });
     }
-    const activeRuns = await removeDeadActiveRuns(state);
+    const activeRuns = await removeDeadActiveRuns(state, { processInspector: inspector, globalState });
     const allRuns = await readRuns(state);
     assertNoLegacyState(null, allRuns);
     if (activeRuns.length > 0) {
@@ -910,8 +1004,6 @@ export async function acquireUltraLock({
         if (assignment.state === "running") throw new OrchestrationStateError("Cannot acquire Ultra takeover while an assignment is running.");
       }
     }
-    const ownerIdentity = await processIdentityProvider({ pid });
-    validateProcessIdentity(ownerIdentity);
     const metadata = await ensureRepositoryMetadata(state);
     const legacyGenerations = (await getLegacyRepositoryStates(state)).map((entry) => entry.metadata?.current_generation ?? 0);
     const generation = Math.max(metadata.current_generation, ...legacyGenerations) + 1;
@@ -956,7 +1048,7 @@ export async function acquireUltraLock({
       throw error;
     }
     return lock;
-  });
+  }, { processInspector, operation: "acquire Ultra lock" });
 }
 
 export async function updateUltraLock({
@@ -1005,14 +1097,14 @@ export async function registerUltraProcess({
   if (kind !== "app-server") {
     throw new OrchestrationStateError("Ultra process kind must be app-server.");
   }
+  const identity = processIdentity ?? await processIdentityProvider({ pid });
+  validateProcessIdentity(identity);
   const state = await getRepositoryState(cwd, { environment, homeDirectory });
   return withStateMutex(state, async () => {
     const lock = await assertActiveEpoch(state, { lockId, generation }, "register-ultra-process-stale");
     if (lock.processes.some((entry) => entry.kind === kind)) {
       throw new OrchestrationStateError(`Ultra ${kind} process is already registered.`);
     }
-    const identity = processIdentity ?? await processIdentityProvider({ pid });
-    validateProcessIdentity(identity);
     const updated = {
       ...lock,
       processes: [...lock.processes, { kind, identity }],
@@ -1050,12 +1142,13 @@ export async function beginExecutorRun({
     runsDirectory: state.globalRunsDirectory,
   };
   const pool = requireExecutorPool(model);
-  return withStateMutex(globalState, async () => {
-    const globalRuns = await removeDeadActiveRuns(globalState, { processInspector, processAlive });
+  const identity = await processIdentityProvider({ pid });
+  validateProcessIdentity(identity);
+  return withInspectedState([globalState, state], async (inspector) => {
+    const repositoryRuns = await removeDeadActiveRuns(state, { processInspector: inspector, globalState });
+    const globalRuns = await reservedRuns(globalState, await readRuns(globalState));
     assertCapacityAvailable("Machine-wide", capacityUsage(globalRuns), pool, profile);
-    return withStateMutex(state, async () => {
       await assertNoLegacyRepositoryWork(state);
-      const repositoryRuns = await removeDeadActiveRuns(state, { processInspector, processAlive });
       assertNoLegacyState(await readLockFromState(state), await readRuns(state));
       assertCapacityAvailable("Repository", capacityUsage(repositoryRuns), pool, profile);
       const lock = await readLockFromState(state);
@@ -1080,8 +1173,6 @@ export async function beginExecutorRun({
       } else if (inheritedLockId !== null || inheritedGenerationValue !== null) {
         throw new OrchestrationStateError("Executor received stale Ultra ownership variables without an active lock.");
       }
-      const identity = await processIdentityProvider({ pid });
-      validateProcessIdentity(identity);
       await ensureRepositoryMetadata(state);
       await mkdir(state.runsDirectory, { recursive: true });
       await mkdir(globalState.runsDirectory, { recursive: true });
@@ -1138,8 +1229,7 @@ export async function beginExecutorRun({
         stateDirectory: state.stateDirectory,
         globalStateDirectory: globalState.stateDirectory,
       };
-    });
-  });
+  }, { processInspector, processAlive, operation: "acquire executor lease" });
 }
 
 function statesFromLease(lease) {
@@ -1154,6 +1244,7 @@ function statesFromLease(lease) {
       lockPath: join(lease.stateDirectory, "ultra.lock", "lock.json"),
       runsDirectory: join(lease.stateDirectory, "runs"),
       historyDirectory: join(lease.stateDirectory, "history"),
+      finalizationsDirectory: join(lease.stateDirectory, "finalizations"),
     },
     global: {
       stateDirectory: lease.globalStateDirectory,
@@ -1169,6 +1260,7 @@ async function updateGlobalRun(globalPath, expectedRun, updatedRun) {
   }
   const globalRun = validateRun(await readJson(globalPath, `Global executor lease ${expectedRun.run_id}`), expectedRun.run_id);
   requireMatchingRun(globalRun, expectedRun);
+  if (canonicalHash(globalRun) !== canonicalHash(expectedRun)) throw new OrchestrationStateError("Global and repository executor records differ before registration.");
   await atomicWrite(globalPath, updatedRun);
 }
 
@@ -1182,8 +1274,9 @@ export async function registerExecutorProcess(lease, {
     throw new OrchestrationStateError("Executor process kind must be app-server.");
   }
   const states = statesFromLease(lease);
-  return withStateMutex(states.global, async () => {
-    return withStateMutex(states.repository, async () => {
+  const identity = processIdentity ?? await processIdentityProvider({ pid });
+  validateProcessIdentity(identity);
+  return withCoordinationMutexes([states.global, states.repository], async () => {
       if (lease.version === ORCHESTRATION_STATE_VERSION && lease.lock_id !== null) {
         await assertActiveEpoch(states.repository, {
           lockId: lease.lock_id,
@@ -1200,8 +1293,6 @@ export async function registerExecutorProcess(lease, {
       if (run.processes.some((entry) => entry.kind === kind)) {
         throw new OrchestrationStateError(`Executor ${kind} process is already registered.`);
       }
-      const identity = processIdentity ?? await processIdentityProvider({ pid });
-      validateProcessIdentity(identity);
       const updated = {
         ...run,
         processes: [...run.processes, { kind, identity }],
@@ -1212,8 +1303,7 @@ export async function registerExecutorProcess(lease, {
       await updateGlobalRun(lease.globalPath, run, updated);
       lease.processes = updated.processes;
       return updated;
-    });
-  });
+  }, { operation: "register executor process" });
 }
 
 function executorDescriptor(execution) {
@@ -1243,14 +1333,13 @@ async function removeGlobalLease(globalPath, run) {
   }
   const globalRun = validateRun(await readJson(globalPath, `Global executor lease ${run.run_id}`), run.run_id);
   requireMatchingRun(globalRun, run);
+  if (canonicalHash(globalRun) !== canonicalHash(run)) throw new OrchestrationStateError("Global and repository executor records differ before closure.");
   await rm(globalPath, { force: false });
 }
 
 async function transitionExecutorRun(lease, transition, options = {}) {
   const states = statesFromLease(lease);
-  const processInspector = resolveProcessInspector(options);
-  return withStateMutex(states.global, async () => {
-    return withStateMutex(states.repository, async () => {
+  return withInspectedState([states.global, states.repository], async (processInspector) => {
       if (lease.version === LEGACY_STATE_VERSION) {
         if (lease.lock_id === null) {
           await rm(lease.path, { force: true });
@@ -1307,8 +1396,7 @@ async function transitionExecutorRun(lease, transition, options = {}) {
         await atomicWrite(lease.path, updated);
       }
       await removeGlobalLease(lease.globalPath, run);
-    });
-  });
+  }, { ...options, inspectionKinds: ["app-server"], operation: "close executor lease" });
 }
 
 export async function finishExecutorRun(lease, execution, options = {}) {
@@ -1332,6 +1420,187 @@ export async function abandonExecutorRun(lease, error, options = {}) {
   });
   transition.reasonCode = "abandon-executor-stale";
   return transitionExecutorRun(lease, transition, options);
+}
+
+function finalizationPaths(state, runId) {
+  if (typeof runId !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(runId)) throw new OrchestrationStateError("Finalization run id is invalid.");
+  const directory = join(state.stateDirectory, "finalizations", runId);
+  return { directory, receipt: join(directory, "receipt.json"), confirmation: join(directory, "completed.json"), closure: join(directory, "closure.json"), publication: join(directory, "publication.json") };
+}
+
+export async function readExecutorFinalization(state, runId) {
+  const paths = finalizationPaths(state, runId);
+  const receipt = await readJson(paths.receipt, `Finalization ${runId}`);
+  const { receipt_sha256: digest, ...body } = receipt;
+  if (receipt.version !== 1 || receipt.run_id !== runId || receipt.repository_key !== basename(state.stateDirectory) || canonicalHash(body) !== digest || canonicalHash(receipt.execution) !== receipt.result_sha256) {
+    throw new OrchestrationStateError(`Finalization ${runId} failed its identity or hash verification.`);
+  }
+  validateRun(receipt.run, runId);
+  if (receipt.run.repository_key !== receipt.repository_key || receipt.run.run_id !== runId || receipt.execution.result.profile !== receipt.run.profile) throw new OrchestrationStateError("Finalization lease binding does not match.");
+  return receipt;
+}
+
+async function pendingFinalizations(state) {
+  if (basename(state.stateDirectory) === "global-capacity") {
+    const parent = dirname(state.stateDirectory);
+    if ((await getEntry(parent)) === null) return [];
+    const summaries = [];
+    for (const entry of await readdir(parent, { withFileTypes: true })) {
+      if (/^[a-f0-9]{64}$/.test(entry.name)) {
+        if (!entry.isDirectory()) throw new OrchestrationStateError("Repository state namespace is not a directory.");
+        summaries.push(...await pendingFinalizations({ stateDirectory: join(parent, entry.name) }));
+      }
+    }
+    return summaries.sort((a, b) => a.repository_key.localeCompare(b.repository_key) || a.run_id.localeCompare(b.run_id));
+  }
+  const directory = join(state.stateDirectory, "finalizations");
+  if ((await getEntry(directory)) === null) return [];
+  const summaries = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    if (entry.name.startsWith(".")) continue;
+    if (!entry.isDirectory()) throw new OrchestrationStateError("Finalization namespace contains an unexpected entry.");
+    const paths = finalizationPaths(state, entry.name);
+    if ((await getEntry(paths.confirmation)) !== null) {
+      const confirmation = await readJson(paths.confirmation, "Finalization confirmation");
+      const manifest = await readJson(join(paths.directory, "manifest.json"), "Finalization manifest");
+      if (confirmation.version !== 1 || manifest.version !== 1 || confirmation.receipt_sha256 !== manifest.receipt_sha256 || manifest.run_id !== entry.name) throw new OrchestrationStateError("Finalization confirmation does not match its receipt.");
+      continue;
+    }
+    const receipt = await readExecutorFinalization(state, entry.name);
+    summaries.push({ run_id: receipt.run_id, repository_key: receipt.repository_key, pool: receipt.run.pool, profile: receipt.run.profile, thread_id: receipt.execution.result.thread_id, lock_id: receipt.run.lock_id, generation: receipt.run.generation, assignment_id: receipt.assignment?.assignment_id ?? null, expected_revision: receipt.assignment?.state_revision ?? null, created_at: receipt.created_at });
+  }
+  return summaries.sort((a, b) => a.run_id.localeCompare(b.run_id));
+}
+
+export async function saveExecutorFinalization(lease, execution, { assignment = null, workspaceFingerprint = null } = {}) {
+  const states = statesFromLease(lease);
+  const paths = finalizationPaths(states.repository, lease.run_id);
+  const run = requireMatchingRun(validateRun(await readJson(lease.path, "Executor finalization lease"), lease.run_id), lease);
+  const storedExecution = { exitCode: execution.exitCode, result: execution.result, ...(execution.operatorRequests ? { operatorRequests: execution.operatorRequests } : {}) };
+  if (![0, 1, 2].includes(execution.exitCode) || execution.result?.profile !== run.profile) throw new OrchestrationStateError("Executor result cannot be bound to its finalization lease.");
+  const body = { version: 1, run_id: run.run_id, repository: run.repository, repository_key: run.repository_key, run, assignment, workspace_fingerprint: workspaceFingerprint, execution: storedExecution, result_sha256: canonicalHash(storedExecution), created_at: new Date().toISOString() };
+  const receipt = { ...body, receipt_sha256: canonicalHash(body) };
+  await mkdir(dirname(paths.directory), { recursive: true });
+  const temporary = join(dirname(paths.directory), `.${run.run_id}-${randomUUID()}`);
+  await mkdir(temporary);
+  try {
+    await atomicWrite(join(temporary, "receipt.json"), receipt);
+    await atomicWrite(join(temporary, "manifest.json"), { version: 1, run_id: receipt.run_id, receipt_sha256: receipt.receipt_sha256 });
+    try { await rename(temporary, paths.directory); }
+    catch (error) {
+      if ((await getEntry(paths.directory)) === null) throw error;
+      const prior = await readExecutorFinalization(states.repository, run.run_id);
+      if (prior.result_sha256 !== receipt.result_sha256 || canonicalHash(prior.run) !== canonicalHash(run) || canonicalHash(prior.assignment) !== canonicalHash(assignment) || prior.workspace_fingerprint !== workspaceFingerprint) throw new OrchestrationStateError("Finalization run id already belongs to different evidence.");
+      return prior;
+    }
+  } finally { await rm(temporary, { recursive: true, force: true }); }
+  return receipt;
+}
+
+export function finalizationFailure(execution, lease, error, revision = null) {
+  const command = `node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs finalize --cwd ${JSON.stringify(lease.repository)} --run-id ${lease.run_id}${revision === null ? "" : ` --expected-revision ${revision}`}`;
+  const message = `Result saved for run ${lease.run_id}, but finalization failed: ${error.message ?? String(error)}. Recover explicitly with: ${command}`;
+  return { ...execution, exitCode: 2, finalizationPending: true, result: { ...execution.result, status: "failed", summary: message, blockers: [...(execution.result.blockers ?? []), message] } };
+}
+
+export async function validateExecutorFinalization(lease, receipt, options = {}) {
+  const states = statesFromLease(lease);
+  return withInspectedState([states.global, states.repository], async (inspector) => {
+    const current = await readExecutorFinalization(states.repository, lease.run_id);
+    if (current.receipt_sha256 !== receipt.receipt_sha256) throw new OrchestrationStateError("Finalization receipt was replaced.");
+    if (receipt.run.lock_id !== null) {
+      await assertActiveEpoch(states.repository, { lockId: receipt.run.lock_id, generation: receipt.run.generation }, "finalization-stale");
+      const environment = options.environment ?? process.env;
+      if (environment[ORCHESTRATION_LOCK_ENV] !== receipt.run.lock_id || environment[ORCHESTRATION_GENERATION_ENV] !== String(receipt.run.generation)) throw new OrchestrationStateError("Finalization requires the active Ultra owner's lock id and generation.");
+    } else if ((await readLockFromState(states.repository)) !== null) throw new OrchestrationStateError("A normal finalization cannot cross an Ultra epoch.");
+    const inspected = await inspectProcesses(options.manual ? receipt.run.processes : receipt.run.processes.filter((entry) => entry.kind === "app-server"), inspector);
+    if (inspected.some((entry) => !["dead", "reused"].includes(entry.status))) throw new OrchestrationStateError("Finalization is blocked by live or unknown process identities.");
+    const paths = finalizationPaths(states.repository, lease.run_id);
+    for (const path of [lease.path, lease.globalPath]) {
+      if ((await getEntry(path)) === null) {
+        if ((await getEntry(paths.closure)) === null) throw new OrchestrationStateError("Finalization reservation is missing without closure evidence.");
+      } else {
+        const run = await readJson(path, "Finalization reservation");
+        requireMatchingRun(run, receipt.run);
+        if (run.state === "active" && canonicalHash(run) !== canonicalHash(receipt.run)) throw new OrchestrationStateError("Finalization reservation changed.");
+      }
+    }
+  }, { ...options, additionalProcesses: receipt.run.processes, inspectionKinds: options.manual ? undefined : ["app-server"], operation: "validate saved executor result" });
+}
+
+export async function closeExecutorFinalization(lease, receipt, options = {}) {
+  const states = statesFromLease(lease);
+  const paths = finalizationPaths(states.repository, lease.run_id);
+  return withInspectedState([states.global, states.repository], async (inspector) => {
+    const currentReceipt = await readExecutorFinalization(states.repository, lease.run_id);
+    if (currentReceipt.receipt_sha256 !== receipt.receipt_sha256) throw new OrchestrationStateError("Finalization receipt changed during coordination.");
+    if ((await getEntry(paths.confirmation)) !== null) {
+      const confirmation = await readJson(paths.confirmation, "Finalization confirmation");
+      if (confirmation.receipt_sha256 !== receipt.receipt_sha256) throw new OrchestrationStateError("Finalization confirmation mismatch.");
+      return;
+    }
+    if (receipt.run.lock_id !== null) await assertActiveEpoch(states.repository, { lockId: receipt.run.lock_id, generation: receipt.run.generation }, "finalization-stale");
+    else if ((await readLockFromState(states.repository)) !== null) throw new OrchestrationStateError("A normal finalization cannot cross an Ultra epoch.");
+    const inspections = await inspectProcesses(options.manual ? receipt.run.processes : receipt.run.processes.filter((entry) => entry.kind === "app-server"), inspector);
+    if (inspections.some((entry) => !["dead", "reused"].includes(entry.status))) throw new OrchestrationStateError("Finalization is blocked by live or unknown process identities.");
+    const completedRun = { ...receipt.run, state: "completed", exit_code: receipt.execution.exitCode, result: executorDescriptor(receipt.execution), updated_at: receipt.created_at };
+    for (const [path, allowCompleted] of [[lease.path, receipt.run.lock_id !== null], [lease.globalPath, false]]) {
+      if ((await getEntry(path)) === null) {
+        if ((await getEntry(paths.closure)) === null) throw new OrchestrationStateError("Finalization lease is missing without closure evidence.");
+      } else {
+        const run = await readJson(path, "Finalization current lease");
+        if (canonicalHash(run) !== canonicalHash(receipt.run) && !(allowCompleted && canonicalHash(run) === canonicalHash(completedRun))) throw new OrchestrationStateError("Finalization lease changed after the result was saved.");
+      }
+    }
+    let closure;
+    if ((await getEntry(paths.closure)) === null) {
+      const metadata = await ensureRepositoryMetadata(states.repository);
+      const event = { version: 2, event_id: randomUUID(), sequence: metadata.history_sequence + 1, event_type: "executor-completed", repository: receipt.repository, repository_key: receipt.repository_key, lock_id: receipt.run.lock_id, generation: receipt.run.generation, run_id: receipt.run_id, profile: receipt.run.profile, owner: historyOwner(launcherIdentity(receipt.run, "executor-launcher")), timestamp: receipt.created_at, reason_code: "verified-terminal-result", description: EVENT_DESCRIPTIONS["executor-completed"] };
+      const body = { version: 1, receipt_sha256: receipt.receipt_sha256, event };
+      closure = { ...body, closure_sha256: canonicalHash(body) };
+      await atomicWrite(states.repository.metadataPath, { ...metadata, history_sequence: event.sequence, updated_at: new Date().toISOString() });
+      await atomicCreate(paths.closure, closure);
+      await options.onFinalizationBoundary?.("closure-prepared");
+    } else closure = await readJson(paths.closure, "Finalization closure");
+    const { closure_sha256: closureHash, ...closureBody } = closure;
+    if (canonicalHash(closureBody) !== closureHash || closure.receipt_sha256 !== receipt.receipt_sha256 || closure.event?.run_id !== receipt.run_id) throw new OrchestrationStateError("Finalization closure evidence is invalid.");
+    const metadata = await ensureRepositoryMetadata(states.repository);
+    if (metadata.history_sequence < closure.event.sequence) await atomicWrite(states.repository.metadataPath, { ...metadata, history_sequence: closure.event.sequence, updated_at: new Date().toISOString() });
+    const eventPath = join(states.repository.historyDirectory, `${String(closure.event.sequence).padStart(16, "0")}-${closure.event.event_id}.json`);
+    if ((await getEntry(eventPath)) === null) await atomicCreate(eventPath, closure.event);
+    else if (canonicalHash(await readJson(eventPath, "Finalization history")) !== canonicalHash(closure.event)) throw new OrchestrationStateError("Finalization history conflicts with its receipt.");
+    await options.onFinalizationBoundary?.("history-written");
+    if (receipt.run.lock_id === null) await rm(lease.path, { force: true });
+    else await atomicWrite(lease.path, completedRun);
+    await options.onFinalizationBoundary?.("local-closed");
+    await rm(lease.globalPath, { force: true });
+    await options.onFinalizationBoundary?.("global-closed");
+    await atomicCreate(paths.confirmation, { version: 1, receipt_sha256: receipt.receipt_sha256, completed_at: new Date().toISOString() });
+    await options.onFinalizationBoundary?.("confirmed");
+  }, { ...options, additionalProcesses: receipt.run.processes, inspectionKinds: options.manual ? undefined : ["app-server"], operation: "finalize saved executor result" });
+}
+
+export async function finalizeExecutorReceipt({ cwd, runId, expectedRevision, ...options }) {
+  const state = await getRepositoryState(cwd, options);
+  const receipt = await readExecutorFinalization(state, runId);
+  const paths = finalizationPaths(state, runId);
+  return withStateMutex({ stateDirectory: paths.directory, mutexDirectory: join(paths.directory, "finalize.mutex") }, async () => {
+  if (receipt.assignment !== null && (!Number.isSafeInteger(expectedRevision) || expectedRevision !== receipt.assignment.state_revision)) throw new OrchestrationStateError("Assignment finalization requires its exact --expected-revision.");
+  if (receipt.assignment === null && expectedRevision !== undefined) throw new OrchestrationStateError("--expected-revision applies only to assignment finalizations.");
+  const lease = { ...receipt.run, path: join(state.runsDirectory, `${runId}.json`), globalPath: join(state.globalRunsDirectory, `${runId}.json`), stateDirectory: state.stateDirectory, globalStateDirectory: state.globalStateDirectory };
+  if ((await getEntry(paths.confirmation)) !== null) {
+    const confirmation = await readJson(paths.confirmation, "Finalization confirmation");
+    if (confirmation.receipt_sha256 !== receipt.receipt_sha256) throw new OrchestrationStateError("Finalization confirmation mismatch.");
+    return { status: "completed", run_id: runId, repository: state.repository };
+  }
+  await validateExecutorFinalization(lease, receipt, { ...options, manual: true });
+  if (receipt.assignment !== null) {
+    const { resumeExecutorFinalization } = await import("./durable-executor.mjs");
+    await resumeExecutorFinalization({ state, lease, receipt, expectedRevision, ...options });
+  }
+  await closeExecutorFinalization(lease, receipt, { ...options, manual: true });
+  return { status: "completed", run_id: runId, repository: state.repository };
+  }, { operation: `finalize run ${runId}` });
 }
 
 export async function listUltraExecutorResults({
@@ -1365,8 +1634,7 @@ export async function releaseUltraLock({
   processAlive,
 }) {
   const state = await getRepositoryState(cwd, { environment, homeDirectory });
-  const inspector = resolveProcessInspector({ processInspector, processAlive });
-  return withStateMutex(state, async () => {
+  return withInspectedState([state], async (inspector) => {
     const candidate = await readLockFromState(state);
     if (
       candidate?.version === ORCHESTRATION_STATE_VERSION &&
@@ -1397,7 +1665,7 @@ export async function releaseUltraLock({
     });
     await rm(state.lockDirectory, { recursive: true, force: false });
     await rm(state.runsDirectory, { recursive: true, force: true });
-  });
+  }, { processInspector, processAlive, inspectionKinds: ["app-server"], operation: "release Ultra lock" });
 }
 
 function legacyProcesses(lock, runs) {
@@ -1440,7 +1708,7 @@ export async function recoverUltraLock({
   }
   if (matches.length > 1) throw new OrchestrationStateError("Lock id exists in multiple repository namespaces.");
   const state = matches[0] ?? canonical;
-  return withStateMutex(state, async () => {
+  return withInspectedState([state], async (inspector) => {
     if (state.canonicalState) await ensureRepositoryMetadata(canonical);
     const lock = await readLockFromState(state);
     if (lock === null) {
@@ -1474,7 +1742,6 @@ export async function recoverUltraLock({
     if (metadata === null || metadata.current_generation !== lock.generation) {
       await rejectRecovery(state, lock, "generation-state-mismatch", "Ultra recovery generation does not match repository generation metadata.");
     }
-    const inspector = resolveProcessInspector({ processInspector, processAlive });
     const registered = (await inspectProcesses(lock.processes, inspector)).map((entry) => ({
       ...entry,
       scope: "Ultra",
@@ -1542,7 +1809,7 @@ export async function recoverUltraLock({
       lock_id: lockId,
       generation: lock.generation,
     };
-  });
+  }, { processInspector, processAlive, operation: "recover Ultra lock" });
 }
 
 async function decorateLegacyProcesses(record, processAlive, kind) {
@@ -1567,15 +1834,23 @@ export async function readOrchestrationHistory(
     throw new OrchestrationStateError(`History limit must be an integer between 1 and ${MAX_HISTORY_LIMIT}.`);
   }
   const state = await getRepositoryState(cwd, { environment, homeDirectory });
-  return withStateMutex(state, async () => {
-    const history = await readHistoryEntries(state);
+  const snapshot = await withStateMutex(state, async () => {
     const legacy = await getLegacyRepositoryStates(state);
-    for (const entry of legacy) {
-      const previous = await readHistoryEntries(entry.state);
+    const captures = [];
+    for (const namespace of [state, ...legacy.map((entry) => entry.state)]) {
+      const metadata = await readRepositoryMetadata(namespace);
+      const names = (await getEntry(namespace.historyDirectory)) === null ? [] : (await readdir(namespace.historyDirectory)).filter((name) => name.endsWith(".json") && (!Number.isFinite(Number(name.split("-")[0])) || Number(name.split("-")[0]) <= (metadata?.history_sequence ?? 0)));
+      captures.push({ state: namespace, sequence: metadata?.history_sequence ?? 0, names });
+    }
+    return captures;
+  }, { operation: "history snapshot", observational: true });
+    const history = { events: [], warnings: [] };
+    for (const entry of snapshot) {
+      const previous = await readHistoryEntries(entry.state, entry.sequence, entry.names);
       history.events.push(...previous.events);
       history.warnings.push(...previous.warnings);
     }
-    if (legacy.length > 0) history.events.sort((a, b) => a.timestamp.localeCompare(b.timestamp) || a.repository_key.localeCompare(b.repository_key) || a.sequence - b.sequence);
+    if (snapshot.length > 1) history.events.sort((a, b) => a.timestamp.localeCompare(b.timestamp) || a.repository_key.localeCompare(b.repository_key) || a.sequence - b.sequence);
     return {
       status: "completed",
       repository: state.repository,
@@ -1583,7 +1858,6 @@ export async function readOrchestrationHistory(
       events: history.events.slice(-limit).map(({ path, ...event }) => event),
       warnings: history.warnings,
     };
-  });
 }
 
 export async function getOrchestrationStatus(cwd, options = {}) {
@@ -1599,19 +1873,20 @@ export async function getOrchestrationStatus(cwd, options = {}) {
     mutexDirectory: state.globalMutexDirectory,
     runsDirectory: state.globalRunsDirectory,
   };
-  const inspector = resolveProcessInspector({ processInspector });
-  return withStateMutex(globalState, async () => {
-    const globalRuns = await removeDeadActiveRuns(globalState, { processInspector: inspector });
-    return withStateMutex(state, async () => {
-      const repositoryActiveRuns = await removeDeadActiveRuns(state, { processInspector: inspector });
+  const snapshot = await withCoordinationMutexes([globalState, state], async () => {
+      const globalRuns = await reservedRuns(globalState, await readRuns(globalState));
       const lock = await readLockFromState(state);
       const runs = await readRuns(state);
       const metadata = await readRepositoryMetadata(state);
-      for (const entry of await getLegacyRepositoryStates(state)) {
-        await removeDeadActiveRuns(entry.state, { processInspector: inspector });
-      }
       const legacyNamespaces = await getLegacyRepositoryStates(state);
-      const history = await readHistoryEntries(state);
+      const historyNames = (await getEntry(state.historyDirectory)) === null ? [] : (await readdir(state.historyDirectory))
+        .filter((name) => name.endsWith(".json") && (!Number.isFinite(Number(name.split("-")[0])) || Number(name.split("-")[0]) <= (metadata?.history_sequence ?? 0)));
+      const pending = await pendingFinalizations(state);
+      return { globalRuns, lock, runs, metadata, legacyNamespaces, historyNames, pending, snapshotAt: new Date().toISOString() };
+  }, { operation: "status snapshot", observational: true });
+      const { globalRuns, lock, runs, metadata, legacyNamespaces } = snapshot;
+      const inspector = await preparedProcessInspector([{ lock, runs: [...runs, ...globalRuns] }, ...legacyNamespaces], { processInspector, processBatchInspector: options.processBatchInspector });
+      const history = await readHistoryEntries(state, metadata?.history_sequence ?? 0, snapshot.historyNames);
       const statusRuns = [];
       for (const run of runs) {
         const { path, ...publicRun } = run;
@@ -1620,6 +1895,7 @@ export async function getOrchestrationStatus(cwd, options = {}) {
       const lastHistory = history.events.at(-1);
       return {
         status: "completed",
+        snapshot_at: snapshot.snapshotAt,
         repository: state.repository,
         repository_key: state.key,
         legacy_namespaces: legacyNamespaces.map((entry) => ({
@@ -1641,6 +1917,8 @@ export async function getOrchestrationStatus(cwd, options = {}) {
             : "none",
         lock: lock === null ? null : await statusRecord(lock, inspector, processAlive, "ultra-launcher"),
         runs: statusRuns,
+        pending_finalizations: snapshot.pending,
+        orphaned_run_ids: statusRuns.filter((run) => run.state === "active" && run.process_statuses.every((entry) => ["dead", "reused"].includes(entry.status))).map((run) => run.run_id),
         history: {
           count: history.fileCount,
           last_event: lastHistory === undefined
@@ -1650,10 +1928,8 @@ export async function getOrchestrationStatus(cwd, options = {}) {
         },
         capacity: {
           limits: { ...EXECUTOR_CAPACITY_LIMITS },
-          repository: capacityUsage(repositoryActiveRuns),
+          repository: capacityUsage([...new Map([...runs.filter((run) => run.state === "active"), ...snapshot.pending].map((run) => [run.run_id, run])).values()]),
           machine: capacityUsage(globalRuns),
         },
       };
-    });
-  });
 }

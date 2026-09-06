@@ -18,6 +18,9 @@ import {
   ORCHESTRATION_LOCK_ENV,
   ORCHESTRATION_ROLE_ENV,
   acquireUltraLock,
+  beginExecutorRun,
+  saveExecutorFinalization,
+  finalizeExecutorReceipt,
 } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
 
 async function createFixture() {
@@ -100,6 +103,46 @@ async function dispatch(record, op, authority, payload, fixture) {
       fixture.coordinationOptions,
     )
   ).record;
+}
+
+for (const boundary of ["publication-prepared", "result-published"]) {
+  test(`a writer resumes after ${boundary} without another model invocation`, async () => {
+    const fixture = await createFixture();
+    let invoked = 0;
+    let saved;
+    try {
+      const response = await invokeDurableExecutor({
+        briefing: "Change the scoped value.", options: options(fixture.repository), environment: fixture.environment,
+        coordinationOptions: { ...fixture.coordinationOptions, processInspector: async () => ({ status: "dead" }), onFinalizationBoundary: async (at) => { if (at === boundary) throw new Error("Controlled interruption"); } },
+        invokeLegacy: async (input) => {
+          invoked++;
+          const lease = await beginExecutorRun({ cwd: input.options.cwd, profile: "implement", model: "gpt-6-astra", environment: input.environment, processInspector: async () => ({ status: "dead" }) });
+          await writeFile(join(input.options.cwd, "src", "value.txt"), "candidate\n");
+          const result = execution("implement", ["src/value.txt"]);
+          const receipt = await saveExecutorFinalization(lease, result, await input.finalizationContext());
+          saved = { lease, receipt };
+          return { ...result, finalization: saved };
+        },
+      });
+      assert.equal(response.exitCode, 2);
+      assert.equal(response.finalizationPending, true);
+      assert.equal(response.result.routing_verified, true);
+      assert.equal(response.result.schema_version, 2);
+      const args = { cwd: fixture.repository, runId: saved.lease.run_id, expectedRevision: saved.receipt.assignment.state_revision, ...fixture.coordinationOptions, processInspector: async () => ({ status: "dead" }) };
+      await assert.rejects(finalizeExecutorReceipt({ ...args, expectedRevision: args.expectedRevision + 1 }), /expected-revision/);
+      const workspaceFile = join(saved.receipt.assignment.workspace_path, "src", "value.txt");
+      await writeFile(workspaceFile, "new work after interruption\n");
+      await assert.rejects(finalizeExecutorReceipt(args), /content or artifacts changed/);
+      await writeFile(workspaceFile, "candidate\n");
+      await finalizeExecutorReceipt(args);
+      await finalizeExecutorReceipt(args);
+      assert.equal(invoked, 1);
+      const record = await readAssignment(fixture.repository, saved.receipt.assignment.assignment_id, fixture.coordinationOptions);
+      assert.equal(record.state, "result_ready");
+      assert.equal(record.state_revision, args.expectedRevision + 1);
+      assert.equal(await readFile(join(fixture.repository, "src", "value.txt"), "utf8"), "base\n");
+    } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  });
 }
 
 test("contract briefing carries acknowledged non-sensitive answers into a retry", () => {

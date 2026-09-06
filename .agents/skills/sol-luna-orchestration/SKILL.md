@@ -137,13 +137,24 @@ The simulator is pure and deterministic: it mutates neither Git nor durable stat
 - Playwright has an additional machine-wide limit of 2 and consumes Luna capacity.
 - Root and Ultra processes do not consume executor slots. Executors delegated by Ultra do.
 - Executor capacity acquisition is atomic and fails immediately. Durable assignments may remain queued until the residual planner can start them without an overlapping resource lease.
-- Dead-process leases are pruned only after confirming that the owner PID is no longer active. Corrupt state fails closed.
+- Mutations may prune a dead lease only after revalidating every registered process identity and both capacity reservations. Pending finalization receipts keep their slots. Corrupt or unknown state fails closed.
 
 Inspect repository and machine utilization with:
 
 ```text
 node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs status --cwd <repository>
 ```
+
+`status` is a read-only snapshot, not a cleanup command. It reports the capture time, persisted capacity, potentially orphaned runs, and pending finalizations without initializing a namespace or changing metadata, leases, or history. Process inspection and history reads happen outside the coordination mutexes. Missing retained history makes the snapshot incomplete; it never authorizes a state change.
+
+Executors save a hashed receipt before closing their leases. A coordination failure returns code `2` while preserving the verified routing metadata. Do not rerun the model, start a new assignment attempt, or archive its worktree to work around that failure. Recover explicitly:
+
+```text
+node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs finalize --cwd <repository> --run-id <id>
+node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs finalize --cwd <repository> --run-id <id> --expected-revision <n>
+```
+
+The second form is required for assignments. Use the revision bound to the receipt, shown in `pending_finalizations`. Recovery checks receipt integrity, process-start fingerprints, ownership, fencing, the assignment attempt and revision, and writer content and artifacts. It stops after publishing the result; approval, integration, delivery, and acknowledgment remain separate. Live or unknown identities block recovery. Ultra receipts require the same active, authorized epoch; recovery-required and superseded epochs remain blocked. No model rerun, automatic finalization retry, or Ultra recovery occurs. Receipts and confirmations are retained without automatic deletion.
 
 ## Profile contracts
 
