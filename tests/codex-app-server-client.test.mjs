@@ -17,6 +17,8 @@ import {
   normalizeAppServerServiceTier,
   runAppServerTurn,
   readCodexConfig,
+  readCodexModelCatalog,
+  readModelCatalogPages,
 } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
 import { loadExecutorResultContract } from "../.agents/skills/sol-luna-orchestration/scripts/executor-result-contract.mjs";
 import { createPlaywrightMcpConfiguration, PLAYWRIGHT_MCP_REQUIRED_TOOLS } from "../.agents/skills/sol-luna-orchestration/scripts/playwright-mcp-configuration.mjs";
@@ -24,6 +26,24 @@ import { createPlaywrightMcpConfiguration, PLAYWRIGHT_MCP_REQUIRED_TOOLS } from 
 const TEST_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const MOCK_SERVER_PATH = join(TEST_DIRECTORY, "fixtures", "mock-codex-app-server.mjs");
 const OUTPUT_SCHEMA = (await loadExecutorResultContract()).schema;
+
+test("catalog discovery is paginated, bounded and independent of model turns", async (context) => {
+  const requests = [];
+  const pages = [{ data: [{ model: "gpt-6-astra" }], nextCursor: "page-2" }, { data: [{ model: "gpt-6-sol" }], nextCursor: null }];
+  const catalog = await readModelCatalogPages(async (method, params) => { requests.push([method, params]); return pages.shift(); });
+  assert.deepEqual(catalog.map((x) => x.model), ["gpt-6-astra", "gpt-6-sol"]);
+  assert.equal(requests[1][1].cursor, "page-2");
+  await assert.rejects(readModelCatalogPages(async () => ({ data: [], nextCursor: "loop" })), /pagination/);
+  await assert.rejects(readModelCatalogPages(async () => ({ data: null })), /collection/);
+  const root = await mkdtemp(join(tmpdir(), "model-catalog-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const capturePath = join(root, "requests.jsonl");
+  const models = await readCodexModelCatalog({ cwd: root, commandResolver: async (_command, { environment }) => ({ executable: process.execPath, environment }), spawnImplementation: spawnMock({}, capturePath) });
+  assert.ok(models.length > 0);
+  const log = await readFile(capturePath, "utf8");
+  assert.match(log, /model\/list/);
+  assert.doesNotMatch(log, /thread\/start|turn\/start/);
+});
 
 function spawnMock(scenario, capturePath) {
   return (_command, _args, options) => spawn(process.execPath, [MOCK_SERVER_PATH], {

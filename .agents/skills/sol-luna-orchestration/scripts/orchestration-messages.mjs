@@ -1,4 +1,4 @@
-const PREFIX = "Astra-Luna orchestrator";
+const PREFIX = "Orchestrator";
 const RESET = "\u001b[0m";
 
 function upper(value) {
@@ -15,8 +15,9 @@ export function executorLaunchMessage({
   reasoningEffort,
   serviceTier,
   sandboxMode,
+  selector,
 }) {
-  return `◆ ${upper(profile)} · ${upper(model)} · ${upper(reasoningEffort)} · ${upper(serviceTier)} · ${upper(sandboxMode)}`;
+  return `◆ ${upper(profile)} · ${selector ? `${upper(selector)} → ` : ""}${upper(model)} · ${upper(reasoningEffort)} · ${upper(serviceTier)} · ${upper(sandboxMode)}`;
 }
 
 export function executorResultMessage(result) {
@@ -32,8 +33,8 @@ export function executorResultMessage(result) {
   return `${PREFIX}: ${result.profile ?? "Executor"} task ${result.status}. Routing: not verified. See blockers and warnings in the JSON result.`;
 }
 
-export function ultraLaunchMessage({ model, reasoningEffort, serviceTier, sandboxMode }) {
-  return `◆ ULTRA · ${upper(model)} · ${upper(reasoningEffort)} · ${upper(serviceTier)} · ${upper(sandboxMode)}`;
+export function ultraLaunchMessage({ model, reasoningEffort, serviceTier, sandboxMode, selector }) {
+  return `◆ ULTRA · ${selector ? `${upper(selector)} → ` : ""}${upper(model)} · ${upper(reasoningEffort)} · ${upper(serviceTier)} · ${upper(sandboxMode)}`;
 }
 
 export function ultraResultMessage(result) {

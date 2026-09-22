@@ -34,7 +34,8 @@ import {
   readCodexConfig,
   runAppServerTurn,
 } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
-import { EXECUTOR_PROFILES } from "../.agents/skills/sol-luna-orchestration/scripts/executor-profiles.mjs";
+import { bindExecutorProfile } from "../.agents/skills/sol-luna-orchestration/scripts/executor-profiles.mjs";
+import { resolveConfiguredModel } from "../.agents/skills/sol-luna-orchestration/scripts/configured-models.mjs";
 import {
   invokeUltra,
 } from "../.agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs";
@@ -65,12 +66,9 @@ import {
   writeJsonOutput,
 } from "./platform-runtime.mjs";
 
-import { ROOT_CONFIG_VALUES, ROOT_POLICY } from "../.agents/skills/sol-luna-orchestration/scripts/model-policy.mjs";
+import { LEGACY_ROOT_CONFIG_VALUES, rootConfigValues } from "../.agents/skills/sol-luna-orchestration/scripts/model-policy.mjs";
 import { PLAYWRIGHT_MCP_SERVER_NAME, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_RUNTIME_VERSION, createPlaywrightMcpRuntime, removePlaywrightMcpRuntime, validatePlaywrightMcpRuntimeConfiguration } from "../.agents/skills/sol-luna-orchestration/scripts/playwright-mcp-configuration.mjs";
 
-export const ORCHESTRATOR_MODEL = ROOT_POLICY.model;
-export const ORCHESTRATOR_REASONING_EFFORT = ROOT_POLICY.reasoningEffort;
-export const ORCHESTRATOR_SERVICE_TIER = ROOT_POLICY.serviceTier;
 
 const execFileAsync = promisify(execFile);
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
@@ -165,13 +163,14 @@ async function verifySkillDiscovery(repositoryRoot) {
     throw new Error("The global skill link does not target the repository skill.");
   }
 
-  verifyRootConfiguration(await readCodexConfig({ cwd: repositoryRoot }), "Repository");
+  const rootRoute = await resolveConfiguredModel("root", { cwd: repositoryRoot });
+  verifyRootConfiguration(await readCodexConfig({ cwd: repositoryRoot }), "Repository", rootConfigValues(rootRoute));
   const globalConfigPath = join(codexHome, "config.toml");
   const globalConfig = await readFile(globalConfigPath, "utf8");
   const globalHookScript = join(globalSkill, "scripts", "orchestration-gate.mjs");
-  if (updateGlobalConfig(globalConfig, { hookScriptPath: globalHookScript }).changed) {
+  if (updateGlobalConfig(globalConfig, { hookScriptPath: globalHookScript, rootValues: rootConfigValues(rootRoute) }).changed) {
     throw new Error(
-      "The global Codex configuration does not enforce Astra high, low verbosity, and hooks.",
+      "Global Codex defaults do not match the selected root route and hooks. Refresh them with an explicitly authorized installation.",
     );
   }
   const deliveryConfiguration = await readDeliveryConfiguration({ codexHome });
@@ -330,9 +329,10 @@ function verifyUltraResultSchema(result) {
   }
 }
 
-function verifyUltraRouting(result, sandboxMode) {
+async function verifyUltraRouting(result, sandboxMode) {
+  const route = await resolveConfiguredModel("ultra");
   if (
-    result.model !== ORCHESTRATOR_MODEL ||
+    result.model !== route.model ||
     result.reasoning_effort !== "ultra" ||
     result.service_tier !== "standard" ||
     result.routing_verified !== true ||
@@ -343,8 +343,8 @@ function verifyUltraRouting(result, sandboxMode) {
   }
 }
 
-function verifyProfileRouting(result, profileName) {
-  const profile = EXECUTOR_PROFILES[profileName];
+async function verifyProfileRouting(result, profileName) {
+  const profile = bindExecutorProfile(profileName, await resolveConfiguredModel(profileName));
   if (
     result.profile !== profileName ||
     result.model !== profile.model ||
@@ -372,9 +372,9 @@ function validateRootProbePayload(value) {
   return payload;
 }
 
-export function verifyRootConfiguration(effectiveConfig, scope = "Global") {
+export function verifyRootConfiguration(effectiveConfig, scope = "Global", expectedValues = LEGACY_ROOT_CONFIG_VALUES) {
   const configuration = {};
-  for (const [key, expected] of Object.entries(ROOT_CONFIG_VALUES)) {
+  for (const [key, expected] of Object.entries(expectedValues)) {
     const actual = effectiveConfig?.[key];
     if (actual !== expected) {
       throw new Error(`${scope} root configuration did not confirm ${key}: expected ${expected}, observed ${actual ?? "missing"}.`);
@@ -388,6 +388,7 @@ export async function runGlobalRootProbe(sessionRoots, outputContract, {
   configReader = readCodexConfig,
   appServerRunner = runAppServerTurn,
   routingVerifier = verifySessionRouting,
+  modelResolver = resolveConfiguredModel,
 } = {}) {
   const temporaryRepository = await mkdtemp(join(tmpdir(), "sol-luna-global-probe-"));
   try {
@@ -395,8 +396,9 @@ export async function runGlobalRootProbe(sessionRoots, outputContract, {
       cwd: temporaryRepository,
       windowsHide: true,
     });
+    const route = await modelResolver("root", { cwd: temporaryRepository });
     const effectiveConfig = await configReader({ cwd: temporaryRepository });
-    const configuration = verifyRootConfiguration(effectiveConfig);
+    const configuration = verifyRootConfiguration(effectiveConfig, "Global", rootConfigValues(route));
     const developerInstructions = [
       "CODEX_ORCHESTRATION_PROBE=orchestrator",
       "This session exists only to verify negotiated root routing after the global defaults were checked separately.",
@@ -406,9 +408,9 @@ export async function runGlobalRootProbe(sessionRoots, outputContract, {
     const rootProcess = await appServerRunner({
       command: "codex",
       cwd: temporaryRepository,
-      model: ORCHESTRATOR_MODEL,
-      reasoningEffort: ORCHESTRATOR_REASONING_EFFORT,
-      serviceTier: ORCHESTRATOR_SERVICE_TIER,
+      model: route.model,
+      reasoningEffort: route.reasoningEffort,
+      serviceTier: route.serviceTier,
       configuredServiceTier: "default",
       fastMode: false,
       sandboxMode: "read-only",
@@ -426,8 +428,8 @@ export async function runGlobalRootProbe(sessionRoots, outputContract, {
     const payload = validateRootProbePayload(JSON.parse(rootProcess.finalResponse));
     const routing = await routingVerifier(
       rootProcess.threadId,
-      ORCHESTRATOR_MODEL,
-      ORCHESTRATOR_REASONING_EFFORT,
+      route.model,
+      route.reasoningEffort,
       { sessionRoots },
     );
     return {
@@ -590,7 +592,7 @@ async function runExploreProbe(repositoryRoot, sessionRoots) {
   if (executor.exitCode !== 0) {
     throw new Error(`The Luna explore probe failed: ${executor.result.summary}`);
   }
-  verifyProfileRouting(executor.result, "explore");
+  await verifyProfileRouting(executor.result, "explore");
   if (
     executor.result.changed_files.length !== 0 ||
     executor.result.checks.length !== 1 ||
@@ -760,7 +762,7 @@ async function runWriteProfileProbe(repository, sessionRoots, profileName) {
     if (executor.exitCode !== 0) {
       throw new Error(`The ${profileName} probe failed: ${executor.result.summary}`);
     }
-    verifyProfileRouting(executor.result, profileName);
+    await verifyProfileRouting(executor.result, profileName);
     if (
       executor.result.candidate === null ||
       JSON.stringify(executor.result.changed_files) !== JSON.stringify(["executor-probe.txt"]) ||
@@ -812,7 +814,7 @@ async function runReviewProbe(repository, sessionRoots) {
   if (executor.exitCode !== 0) {
     throw new Error(`The review probe failed: ${executor.result.summary}`);
   }
-  verifyProfileRouting(executor.result, "review");
+  await verifyProfileRouting(executor.result, "review");
   const afterStatus = await gitStatus(repository);
   if (
     !executor.result.summary.startsWith("APPROVE") ||
@@ -914,7 +916,7 @@ async function runPlaywrightProbe(repositoryRoot, sessionRoots, { onVerifiedRunt
     if (executor.exitCode !== 0) {
       throw new Error(`The Playwright probe failed: ${executor.result.summary}`);
     }
-    verifyProfileRouting(executor.result, "playwright");
+    await verifyProfileRouting(executor.result, "playwright");
     if (
       executor.result.changed_files.length !== 0 ||
       !executor.result.checks.includes("playwright_mcp:verified") ||
@@ -936,13 +938,14 @@ async function runPlaywrightProbe(repositoryRoot, sessionRoots, { onVerifiedRunt
 }
 
 async function runPlaywrightIsolationProbe(repositoryRoot, sessionRoots) {
+  const route = await resolveConfiguredModel("playwright", { cwd: repositoryRoot });
   const initial = await getOrchestrationStatus(repositoryRoot);
   if (initial.capacity.machine.total !== 0) throw new Error("Playwright isolation verification requires an idle executor pool.");
   const leases = [];
   try {
-    for (let index = 0; index < 2; index += 1) leases.push(await beginExecutorRun({ cwd: repositoryRoot, profile: "playwright", model: EXECUTOR_PROFILES.playwright.model }));
+    for (let index = 0; index < 2; index += 1) leases.push(await beginExecutorRun({ cwd: repositoryRoot, profile: "playwright", model: route.model, resolvedRoute: route }));
     let rejected = false;
-    try { leases.push(await beginExecutorRun({ cwd: repositoryRoot, profile: "playwright", model: EXECUTOR_PROFILES.playwright.model })); }
+    try { leases.push(await beginExecutorRun({ cwd: repositoryRoot, profile: "playwright", model: route.model, resolvedRoute: route })); }
     catch (error) {
       if (!/Playwright executor capacity is full/.test(error.message)) throw error;
       rejected = true;
@@ -1051,7 +1054,7 @@ async function runUltraReadOnlyProbe(repositoryRoot, sessionRoots) {
   if (execution.exitCode !== 0) {
     throw new Error(`The Ultra read-only probe failed: ${execution.result.summary}`);
   }
-  verifyUltraRouting(execution.result, "read-only");
+  await verifyUltraRouting(execution.result, "read-only");
   if (
     execution.result.changed_files.length !== 0 ||
     JSON.stringify(execution.result.checks) !== JSON.stringify(["ultra_read_only:passed"]) ||
@@ -1103,7 +1106,7 @@ async function runUltraWriteProbe(sessionRoots) {
     if (execution.exitCode !== 0) {
       throw new Error(`The Ultra workspace-write probe failed: ${execution.result.summary}`);
     }
-    verifyUltraRouting(execution.result, "workspace-write");
+    await verifyUltraRouting(execution.result, "workspace-write");
     const content = (await readFile(join(repository, "ultra-probe.txt"), "utf8")).replace(
       /\r\n/g,
       "\n",
@@ -1231,7 +1234,7 @@ async function runRepositoryIsolationProbe() {
 }
 
 function capacityExecution(lease) {
-  const profile = EXECUTOR_PROFILES[lease.profile];
+  const profile = bindExecutorProfile(lease.profile, lease.model_route);
   return {
     exitCode: 0,
     result: {
@@ -1251,6 +1254,7 @@ async function runCapacityProbe() {
   await execFileAsync("git", ["init", "--quiet"], { cwd: repository, windowsHide: true });
   const leases = [];
   try {
+    const routes = Object.fromEntries(await Promise.all(["explore", "review", "playwright"].map(async (role) => [role, await resolveConfiguredModel(role, { cwd: repository })])));
     const initial = await getOrchestrationStatus(repository);
     if (initial.capacity.machine.total !== 0) {
       throw new Error("The machine executor pool is already in use; capacity verification requires an idle pool.");
@@ -1261,7 +1265,8 @@ async function runCapacityProbe() {
         await beginExecutorRun({
           cwd: repository,
           profile: "playwright",
-          model: EXECUTOR_PROFILES.playwright.model,
+          model: routes.playwright.model,
+          resolvedRoute: routes.playwright,
         }),
       );
     }
@@ -1270,7 +1275,8 @@ async function runCapacityProbe() {
       await beginExecutorRun({
         cwd: repository,
         profile: "playwright",
-        model: EXECUTOR_PROFILES.playwright.model,
+        model: routes.playwright.model,
+        resolvedRoute: routes.playwright,
       });
     } catch (error) {
       thirdPlaywrightRejected = /Playwright executor capacity is full/.test(error.message);
@@ -1288,7 +1294,8 @@ async function runCapacityProbe() {
         await beginExecutorRun({
           cwd: repository,
           profile: "explore",
-          model: EXECUTOR_PROFILES.explore.model,
+          model: routes.explore.model,
+          resolvedRoute: routes.explore,
         }),
       );
     }
@@ -1297,7 +1304,8 @@ async function runCapacityProbe() {
         await beginExecutorRun({
           cwd: repository,
           profile: "review",
-          model: EXECUTOR_PROFILES.review.model,
+          model: routes.review.model,
+          resolvedRoute: routes.review,
         }),
       );
     }

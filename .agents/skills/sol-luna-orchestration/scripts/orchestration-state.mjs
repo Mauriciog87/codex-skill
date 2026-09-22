@@ -13,7 +13,8 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { resolveRepositoryIdentity } from "./repository-identity.mjs";
-import { ADVANCED_MODEL, ADVANCED_EXECUTOR_POOL, ULTRA_POLICY } from "./model-policy.mjs";
+import { ADVANCED_EXECUTOR_POOL, LEGACY_ULTRA_POLICY } from "./model-policy.mjs";
+import { parseConcreteModel, validateResolvedRoute } from "./model-selection.mjs";
 import {
   ProcessIdentityError,
   createProcessIdentity,
@@ -27,10 +28,10 @@ export const ORCHESTRATION_LOCK_ENV = "CODEX_ORCHESTRATION_LOCK_ID";
 export const ORCHESTRATION_GENERATION_ENV = "CODEX_ORCHESTRATION_GENERATION";
 export const ORCHESTRATION_ROLE_ENV = "CODEX_ORCHESTRATION_ROLE";
 export const ULTRA_ORCHESTRATOR_ROLE = "ultra-orchestrator";
-export const ULTRA_MODEL = ULTRA_POLICY.model;
-export const ULTRA_REASONING_EFFORT = ULTRA_POLICY.reasoningEffort;
-export const ULTRA_SERVICE_TIER = ULTRA_POLICY.serviceTier;
-export const ULTRA_CONFIGURED_SERVICE_TIER = ULTRA_POLICY.configuredServiceTier;
+export const ULTRA_MODEL = LEGACY_ULTRA_POLICY.model;
+export const ULTRA_REASONING_EFFORT = LEGACY_ULTRA_POLICY.reasoningEffort;
+export const ULTRA_SERVICE_TIER = LEGACY_ULTRA_POLICY.serviceTier;
+export const ULTRA_CONFIGURED_SERVICE_TIER = LEGACY_ULTRA_POLICY.configuredServiceTier;
 export const ORCHESTRATION_STATE_VERSION = 2;
 export const HISTORY_RETENTION_LIMIT = 1_000;
 
@@ -590,6 +591,7 @@ function validateRun(run, entryName) {
   if (launcherIdentity({ processes }, "executor-launcher").pid !== run.pid) {
     throw new OrchestrationStateError(`Executor run ${entryName} launcher PID does not match its process identity.`);
   }
+  assertRunRouting(run, run.result);
   return run;
 }
 
@@ -874,10 +876,11 @@ async function reservedRuns(state, runs) {
 }
 
 function requireExecutorPool(model) {
-  if (model === "gpt-5.6-luna") {
+  const family = parseConcreteModel(model)?.family;
+  if (family === "luna") {
     return "luna";
   }
-  if (model === ADVANCED_MODEL) {
+  if (["astra", "sol"].includes(family)) {
     return ADVANCED_EXECUTOR_POOL;
   }
   throw new OrchestrationStateError(`Unsupported executor model for capacity routing: ${model}.`);
@@ -970,7 +973,9 @@ export async function acquireUltraLock({
   lockId = randomUUID(),
   processIdentityProvider = createProcessIdentity,
   processInspector,
+  resolvedRoute,
 }) {
+  const route = resolvedRoute ? validateResolvedRoute(resolvedRoute, "ultra") : LEGACY_ULTRA_POLICY;
   if (typeof reason !== "string" || reason.trim().length === 0) {
     throw new OrchestrationStateError("An Ultra takeover reason is required.");
   }
@@ -1025,9 +1030,9 @@ export async function acquireUltraLock({
       pid,
       processes: [{ kind: "ultra-launcher", identity: ownerIdentity }],
       thread_id: null,
-      model: ULTRA_MODEL,
-      reasoning_effort: ULTRA_REASONING_EFFORT,
-      service_tier: ULTRA_SERVICE_TIER,
+      model: route.model,
+      reasoning_effort: route.reasoningEffort,
+      service_tier: route.serviceTier,
       sandbox_mode: sandboxMode,
       reason: reason.trim(),
       activation: "human-confirmed",
@@ -1127,6 +1132,7 @@ export async function beginExecutorRun({
   cwd,
   profile,
   model,
+  resolvedRoute,
   environment = process.env,
   homeDirectory = homedir(),
   pid = process.pid,
@@ -1135,6 +1141,8 @@ export async function beginExecutorRun({
   processInspector,
   processAlive,
 }) {
+  const route = resolvedRoute ? validateResolvedRoute(resolvedRoute, profile) : null;
+  if (route && route.model !== model) throw new OrchestrationStateError("Executor model contradicts its selected route.");
   const state = await getRepositoryState(cwd, { environment, homeDirectory });
   const globalState = {
     stateDirectory: state.globalStateDirectory,
@@ -1188,6 +1196,7 @@ export async function beginExecutorRun({
         processes: [{ kind: "executor-launcher", identity }],
         profile,
         model,
+        ...(route ? { model_route: route } : {}),
         pool,
         lock_id: lock?.lock_id ?? null,
         generation: lock?.generation ?? null,
@@ -1318,6 +1327,15 @@ function executorDescriptor(execution) {
   };
 }
 
+function assertRunRouting(run, result) {
+  if (run.model_route == null) return;
+  const route = validateResolvedRoute(run.model_route, run.profile);
+  if (run.model !== route.model || (result?.routing_verified === true &&
+    (result.model !== route.model || result.reasoning_effort !== route.reasoningEffort || result.service_tier !== route.serviceTier))) {
+    throw new OrchestrationStateError("Executor evidence contradicts its reserved model route.");
+  }
+}
+
 async function assertRegisteredChildrenInactive(run, processInspector, label) {
   const childProcesses = run.processes.filter((entry) => entry.kind === "app-server");
   const statuses = await inspectProcesses(childProcesses, processInspector);
@@ -1400,6 +1418,7 @@ async function transitionExecutorRun(lease, transition, options = {}) {
 }
 
 export async function finishExecutorRun(lease, execution, options = {}) {
+  assertRunRouting(lease, execution.result);
   const transition = (run) => ({
     ...run,
     state: "completed",
@@ -1473,6 +1492,7 @@ async function pendingFinalizations(state) {
 }
 
 export async function saveExecutorFinalization(lease, execution, { assignment = null, workspaceFingerprint = null } = {}) {
+  assertRunRouting(lease, execution.result);
   const states = statesFromLease(lease);
   const paths = finalizationPaths(states.repository, lease.run_id);
   const run = requireMatchingRun(validateRun(await readJson(lease.path, "Executor finalization lease"), lease.run_id), lease);
@@ -1618,6 +1638,7 @@ export async function listUltraExecutorResults({
     if (unfinished.length > 0) {
       throw new OrchestrationStateError(`Ultra takeover has ${unfinished.length} executor run(s) without a verified terminal result.`);
     }
+    for (const run of runs) assertRunRouting(run, run.result);
     return runs
       .map((run) => run.result)
       .sort((left, right) => String(left.thread_id).localeCompare(String(right.thread_id)));

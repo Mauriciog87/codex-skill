@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, readdir, rm } from "node:fs/promises";
 import { isAbsolute, join, posix, relative, resolve } from "node:path";
 import { getExecutorProfile } from "./executor-profiles.mjs";
+import { validateResolvedRoute } from "./model-selection.mjs";
 import {
   OrchestrationStateError,
   atomicCreate,
@@ -306,6 +307,7 @@ export function validateAssignmentRequest(value) {
     value,
     new Set([
       "profile",
+      "model_route",
       "base_revision",
       "priority",
       "allowed_write_roots",
@@ -372,6 +374,7 @@ export function validateAssignmentRequest(value) {
   }
   return {
     profile: profile.name,
+    model_route: value.model_route === undefined ? null : validateResolvedRoute(value.model_route, profile.name),
     writer,
     workspace_strategy: profile.workspaceStrategy,
     capabilities: [...profile.capabilities],
@@ -450,6 +453,7 @@ function validateRecord(record, assignmentId) {
   if (!ASSIGNMENT_STATES.includes(record.state) || !Number.isInteger(record.state_revision)) {
     throw new ControlPlaneError(`Assignment ${assignmentId} state is malformed.`, "invalid-state");
   }
+  if (record.model_route != null) validateResolvedRoute(record.model_route, record.profile);
   return { ...record, delivery: normalizePersistedDelivery(record) };
 }
 
@@ -556,6 +560,7 @@ export async function createAssignment({
     repository: state.repository,
     repository_key: state.key,
     profile: contract.profile,
+    model_route: contract.model_route,
     writer: contract.writer,
     workspace_strategy: contract.workspace_strategy,
     capabilities: contract.capabilities,
@@ -774,6 +779,15 @@ export function reduceAssignment(record, inputAction, timestamp = new Date().toI
     }
     if (!new Set(["completed", "blocked", "failed"]).has(payload.result.status)) {
       throw new ControlPlaneError("Published result status is invalid.", "invalid-action");
+    }
+    if (record.model_route != null && payload.result.routing_verified === true) {
+      const route = validateResolvedRoute(record.model_route, record.profile);
+      if (payload.result.model !== route.model || payload.result.reasoning_effort !== route.reasoningEffort || payload.result.service_tier !== route.serviceTier) {
+        throw new ControlPlaneError("Verified result contradicts the assignment's resolved model route.", "invalid-action");
+      }
+    }
+    if (record.model_route != null && payload.result.status === "completed" && payload.result.routing_verified !== true) {
+      throw new ControlPlaneError("Completed assignments require freshly verified routing.", "invalid-action");
     }
     if (!Array.isArray(payload.result.changed_files) || payload.result.changed_files.some((path) => typeof path !== "string")) {
       throw new ControlPlaneError("Published result changed_files is invalid.", "invalid-action");
@@ -1452,6 +1466,7 @@ function publicAssignment(record) {
     attempt: record.attempt,
     priority: record.priority,
     profile: record.profile,
+    model_route: record.model_route ?? null,
     writer: record.writer,
     base_revision: record.base_revision,
     allowed_write_roots: [...record.allowed_write_roots],

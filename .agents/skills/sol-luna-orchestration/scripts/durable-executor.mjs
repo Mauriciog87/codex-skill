@@ -13,7 +13,9 @@ import {
   canonicalJson,
   sha256,
 } from "./control-plane.mjs";
-import { getExecutorProfile } from "./executor-profiles.mjs";
+import { getExecutorProfile, bindExecutorProfile } from "./executor-profiles.mjs";
+import { resolveConfiguredModel } from "./configured-models.mjs";
+import { validateResolvedRoute } from "./model-selection.mjs";
 import {
   loadExecutorResultContract,
   validateExecutorResultContract,
@@ -173,7 +175,8 @@ function pendingExecutionResponse(execution, record, options) {
   return { ...execution, durableResult: envelope, result: options.resultFormat === "v1" ? execution.result : envelope };
 }
 
-async function createNewRecord({ briefing, options, environment, coordinationOptions }) {
+async function createNewRecord({ briefing, options, environment, coordinationOptions, modelResolver, command }) {
+  const route = validateResolvedRoute(await modelResolver(options.profile, { cwd: options.cwd, environment, command }), options.profile);
   if (options.candidateId !== null) {
     if (options.profile !== "review") {
       throw new ControlPlaneError("--candidate-id requires the review profile.", "invalid-contract");
@@ -191,6 +194,7 @@ async function createNewRecord({ briefing, options, environment, coordinationOpt
         environment,
         request: {
           profile: "review",
+          model_route: route,
           base_revision: target.candidate.candidate_revision,
           priority: options.priority,
           allowed_write_roots: [],
@@ -218,6 +222,7 @@ async function createNewRecord({ briefing, options, environment, coordinationOpt
       environment,
       request: {
         profile: options.profile,
+        model_route: route,
         base_revision: repository.head,
         priority: options.priority,
         allowed_write_roots: options.writeRoots,
@@ -259,6 +264,10 @@ async function loadOrCreateRecord(input) {
   if (record.state !== "queued") {
     throw new ControlPlaneError(`Assignment ${record.assignment_id} is ${record.state}, not queued.`, "invalid-transition");
   }
+  if (record.model_route == null) {
+    throw new ControlPlaneError("This legacy assignment has no pinned model route. Preserve its evidence and create a new assignment explicitly; it cannot be silently rerouted.", "missing-model-route");
+  }
+  validateResolvedRoute(record.model_route, record.profile);
   const briefing = await readAssignmentBriefing(
     record.repository,
     record.assignment_id,
@@ -315,9 +324,9 @@ async function publishSetupFailure(record, error, authority, options) {
     status: "failed",
     profile: current.profile,
     thread_id: null,
-    model: getExecutorProfile(current.profile).model,
-    reasoning_effort: getExecutorProfile(current.profile).reasoningEffort,
-    service_tier: getExecutorProfile(current.profile).serviceTier,
+    model: null,
+    reasoning_effort: null,
+    service_tier: null,
     routing_verified: false,
     sandbox_mode: getExecutorProfile(current.profile).sandboxMode,
     base_revision: current.base_revision,
@@ -357,6 +366,8 @@ export async function invokeDurableExecutor({
   appServerRunner,
   playwrightMcpVerifier,
   outputContractLoader = loadExecutorResultContract,
+  modelResolver = resolveConfiguredModel,
+  onRouteSelected,
 }) {
   const outputContract = validateExecutorResultContract(await outputContractLoader());
   const loaded = await loadOrCreateRecord({
@@ -364,8 +375,12 @@ export async function invokeDurableExecutor({
     options,
     environment,
     coordinationOptions,
+    modelResolver,
+    command,
   });
   let record = loaded.record;
+  const profile = bindExecutorProfile(record.profile, record.model_route);
+  await onRouteSelected?.(profile);
   assertEpochEnvironment(record, environment);
   const target = loaded.target;
   const effectiveBriefing = loaded.briefing ?? briefing;
@@ -404,7 +419,6 @@ export async function invokeDurableExecutor({
     }
     return publishSetupFailure(record, error, authority, coordinationOptions);
   }
-  const profile = getExecutorProfile(record.profile);
   if (profile.sandboxMode === "workspace-write" && resolve(workspace.path) === resolve(record.repository)) {
     return publishSetupFailure(
       record,
@@ -425,6 +439,7 @@ export async function invokeDurableExecutor({
       briefing: createContractBriefing(record, effectiveBriefing),
       options: {
         profile: record.profile,
+        resolvedRoute: record.model_route,
         cwd: workspace.path,
         coordinationCwd: record.repository,
         sandboxMode: profile.sandboxMode,
@@ -470,6 +485,13 @@ export async function invokeDurableExecutor({
 }
 
 async function continueExecutorResult({ record, workspace, execution, target = null, authority = "root", options = {}, coordinationOptions = {}, executorEnvironment = process.env, recovery = false }) {
+  if (record.model_route != null && execution.result.status === "completed") {
+    const route = validateResolvedRoute(record.model_route, record.profile);
+    if (execution.result.routing_verified !== true || execution.result.model !== route.model || execution.result.reasoning_effort !== route.reasoningEffort || execution.result.service_tier !== route.serviceTier) {
+      execution = failedExecution(execution, new ControlPlaneError("Executor result does not verify the assignment's pinned model route.", "routing-mismatch"));
+      execution.result.routing_verified = false;
+    }
+  }
   const receipt = execution.finalization?.receipt;
   const publicationPath = receipt ? join(execution.finalization.lease.stateDirectory, "finalizations", receipt.run_id, "publication.json") : null;
   let storedPublication = publicationPath && (await getEntry(publicationPath)) !== null ? await readJson(publicationPath, "Saved result publication") : null;

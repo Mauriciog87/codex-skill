@@ -706,6 +706,53 @@ export async function readCodexConfig({
   }
 }
 
+export async function readModelCatalogPages(request) {
+  const data = [];
+  let cursor;
+  const cursors = new Set();
+  do {
+    const result = await request("model/list", { includeHidden: true, limit: 100, ...(cursor ? { cursor } : {}) });
+    const models = result?.data ?? result?.models;
+    if (!Array.isArray(models)) throw new AppServerProtocolError("model/list did not return a model collection.");
+    data.push(...models);
+    cursor = result.nextCursor;
+    if (cursor != null) {
+      if (typeof cursor !== "string" || !cursor || cursors.has(cursor) || cursors.size >= 100) {
+        throw new AppServerProtocolError("model/list returned invalid or excessive pagination.");
+      }
+      cursors.add(cursor);
+    }
+  } while (cursor != null);
+  return data;
+}
+
+export async function readCodexModelCatalog({
+  cwd,
+  environment = process.env,
+  command = "codex",
+  timeoutMs = 15_000,
+  commandResolver = resolveCodexInvocation,
+  spawnImplementation = spawnChildProcess,
+} = {}) {
+  const invocation = await commandResolver(command, { platform: process.platform, architecture: process.arch, environment });
+  const child = spawnImplementation(invocation.executable, ["--strict-config", "app-server", "--listen", "stdio://"], {
+    cwd, env: invocation.environment, windowsHide: true, shell: false, stdio: ["pipe", "pipe", "pipe"],
+  });
+  const connection = new JsonRpcConnection(child, { timeoutMs, idleTimeoutMs: null });
+  try {
+    await connection.request("initialize", { clientInfo: { name: "sol-luna-model-selection", version: "1.0.0" }, capabilities: { experimentalApi: true } });
+    connection.notify("initialized", {});
+    const catalog = await readModelCatalogPages((method, params) => connection.request(method, params));
+    if (connection.blocked.settled) throw new AppServerProtocolError("Model discovery requested human interaction.");
+    return catalog;
+  } catch (error) {
+    if (error instanceof AppServerError) error.stderr ??= connection.stderr;
+    throw error;
+  } finally {
+    await connection.close();
+  }
+}
+
 async function waitForPlaywrightMcp(connection, threadId, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let timer;
@@ -929,10 +976,7 @@ export async function runAppServerTurn({
       const effectiveConfig = await connection.request("config/read", { includeLayers: false });
       validatePlaywrightMcpRuntimeConfiguration(effectiveConfig?.config, playwrightOutputDirectory, { disableUserPlaywright: playwrightDisableUserServer });
     }
-    const modelList = await connection.request("model/list", {
-      includeHidden: true,
-      limit: 100,
-    });
+    const modelList = { data: await readModelCatalogPages((method, params) => connection.request(method, params)) };
     validateModelCapability(modelList, expected);
     const started = await connection.request("thread/start", {
       model,

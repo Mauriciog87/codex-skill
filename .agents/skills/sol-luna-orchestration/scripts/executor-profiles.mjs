@@ -1,10 +1,9 @@
-import { ADVANCED_MODEL, ADVANCED_EXECUTOR_POOL } from "./model-policy.mjs";
+import { ADVANCED_EXECUTOR_POOL } from "./model-policy.mjs";
+import { DEFAULT_MODEL_CONFIGURATION, validateResolvedRoute } from "./model-selection.mjs";
 export { MODEL_VERBOSITY } from "./model-policy.mjs";
 
 const PROFILE_DEFINITIONS = {
   explore: {
-    model: "gpt-5.6-luna",
-    reasoningEffort: "max",
     serviceTier: "fast",
     configuredServiceTier: "fast",
     fastMode: true,
@@ -25,8 +24,6 @@ const PROFILE_DEFINITIONS = {
     ],
   },
   "implement-lite": {
-    model: "gpt-5.6-luna",
-    reasoningEffort: "max",
     serviceTier: "fast",
     configuredServiceTier: "fast",
     fastMode: true,
@@ -45,8 +42,6 @@ const PROFILE_DEFINITIONS = {
     ],
   },
   playwright: {
-    model: "gpt-5.6-luna",
-    reasoningEffort: "max",
     serviceTier: "standard",
     configuredServiceTier: "default",
     fastMode: false,
@@ -68,8 +63,6 @@ const PROFILE_DEFINITIONS = {
     ],
   },
   implement: {
-    model: ADVANCED_MODEL,
-    reasoningEffort: "medium",
     serviceTier: "standard",
     configuredServiceTier: "default",
     fastMode: false,
@@ -87,8 +80,6 @@ const PROFILE_DEFINITIONS = {
     ],
   },
   review: {
-    model: ADVANCED_MODEL,
-    reasoningEffort: "high",
     serviceTier: "standard",
     configuredServiceTier: "default",
     fastMode: false,
@@ -115,8 +106,8 @@ export const EXECUTOR_PROFILES = Object.freeze(
       name,
       Object.freeze({
         name,
-        model: profile.model,
-        reasoningEffort: profile.reasoningEffort,
+        modelSelector: profile.concurrencyPool === "luna" ? DEFAULT_MODEL_CONFIGURATION.economy : DEFAULT_MODEL_CONFIGURATION.advanced,
+        reasoningEffort: DEFAULT_MODEL_CONFIGURATION.efforts[name],
         serviceTier: profile.serviceTier,
         configuredServiceTier: profile.configuredServiceTier,
         fastMode: profile.fastMode,
@@ -139,4 +130,11 @@ export function getExecutorProfile(name) {
   return typeof name === "string" && Object.hasOwn(EXECUTOR_PROFILES, name)
     ? EXECUTOR_PROFILES[name]
     : null;
+}
+
+export function bindExecutorProfile(name, route) {
+  const profile = getExecutorProfile(name);
+  if (profile === null) throw new Error(`Unknown executor profile: ${name}.`);
+  const selected = validateResolvedRoute(route, name);
+  return Object.freeze({ ...profile, ...selected });
 }

@@ -7,7 +7,6 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   EXECUTOR_PROFILE_NAMES,
-  EXECUTOR_PROFILES,
   MODEL_VERBOSITY,
   getExecutorProfile,
 } from "../.agents/skills/sol-luna-orchestration/scripts/executor-profiles.mjs";
@@ -20,10 +19,10 @@ import {
   ExecutorInvocationError,
   RoutingVerificationError,
   buildProfileAppServerArguments,
-  createExecutorDeveloperInstructions,
+  createExecutorDeveloperInstructions as createExecutorDeveloperInstructionsImplementation,
   createStableResult,
   determineExitCode,
-  invokeExecutor,
+  invokeExecutor as invokeExecutorImplementation,
   parseArguments,
   runProcess,
   validateExecutorPayload,
@@ -39,6 +38,38 @@ import { loadExecutorResultContract } from "../.agents/skills/sol-luna-orchestra
 import { createPlaywrightMcpRuntimeOverrides, createPlaywrightMcpRuntime, removePlaywrightMcpRuntime } from "../.agents/skills/sol-luna-orchestration/scripts/playwright-mcp-configuration.mjs";
 
 const OUTPUT_CONTRACT = await loadExecutorResultContract();
+import { fixtureModelResolver, fixtureExecutorProfiles as EXECUTOR_PROFILES } from "./fixtures/model-routes.mjs";
+import { resolveModelRoute } from "../.agents/skills/sol-luna-orchestration/scripts/model-selection.mjs";
+import { modelCatalog } from "./fixtures/model-routes.mjs";
+const createExecutorDeveloperInstructions = (name) => {
+  const profile = EXECUTOR_PROFILES[name];
+  const route = profile ? { role: name, selector: profile.selector, model: profile.model, reasoningEffort: profile.reasoningEffort, serviceTier: profile.serviceTier } : undefined;
+  return createExecutorDeveloperInstructionsImplementation(name, route);
+};
+const invokeExecutor = (input) => invokeExecutorImplementation({ modelResolver: fixtureModelResolver, ...input });
+
+test("executors use configured Sol and current Luna routes in process, instructions and rollout verification", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "configured-executors-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const sessionsRoot = join(root, "sessions");
+  const catalog = [...modelCatalog, { ...modelCatalog[2], model: "gpt-6-luna", id: "gpt-6-luna" }];
+  for (const name of ["review", "explore"]) {
+    const route = resolveModelRoute(name, { advanced: "sol@latest" }, catalog);
+    const threadId = `configured-${name}`;
+    await writeRoutingMetadata(sessionsRoot, threadId, route.reasoningEffort, route.model);
+    const runner = createAppServerRunner(threadId, { status: "completed", summary: name === "review" ? "APPROVE: inspected." : "Inspected.", changed_files: [], checks: [], warnings: [], blockers: [] });
+    const response = await invokeExecutor({ briefing: "Read only.", options: profileOptions(root, name), coordinationOptions: { homeDirectory: root }, sessionRoots: [sessionsRoot], modelResolver: async () => route,
+      appServerRunner: async (input) => {
+        assert.equal(input.model, route.model);
+        assert.ok(input.developerInstructions.includes(route.model));
+        return runner(input);
+      },
+    });
+    assert.equal(response.exitCode, 0);
+    assert.equal(response.result.model, route.model);
+    assert.equal(response.result.routing_verified, true);
+  }
+});
 
 async function mkdtemp(prefix) {
   const directory = await createTemporaryDirectory(prefix);

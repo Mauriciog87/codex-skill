@@ -9,7 +9,9 @@ import {
   EXECUTOR_PROFILE_NAMES,
   MODEL_VERBOSITY,
   getExecutorProfile,
+  bindExecutorProfile,
 } from "./executor-profiles.mjs";
+import { resolveConfiguredModel } from "./configured-models.mjs";
 import { readDeliveryConfiguration } from "./delivery-configuration.mjs";
 import {
   AppServerError,
@@ -367,8 +369,8 @@ function requireExecutorProfile(name, sandboxMode) {
   return profile;
 }
 
-export function createExecutorDeveloperInstructions(profileName) {
-  const profile = getExecutorProfile(profileName);
+export function createExecutorDeveloperInstructions(profileName, resolvedRoute) {
+  const profile = resolvedRoute ? bindExecutorProfile(profileName, resolvedRoute) : getExecutorProfile(profileName);
   if (profile === null) {
     throw new ExecutorInvocationError(
       `Executor profile must be one of: ${EXECUTOR_PROFILE_NAMES.join(", ")}.`,
@@ -377,7 +379,7 @@ export function createExecutorDeveloperInstructions(profileName) {
   return [
     "CODEX_ORCHESTRATION_ROLE=executor",
     `CODEX_EXECUTOR_PROFILE=${profile.name}`,
-    `Act as a bounded ${profile.model} ${profile.name} executor at ${profile.reasoningEffort} reasoning on the ${profile.serviceTier} service tier, not as the root orchestrator.`,
+    `Act as a bounded ${profile.model ?? "configured-model"} ${profile.name} executor at ${profile.reasoningEffort} reasoning on the ${profile.serviceTier} service tier, not as the root orchestrator.`,
     "Do not invoke the sol-luna-orchestration skill, delegate, or launch another Codex session.",
     "Complete only the supplied briefing and preserve unrelated changes.",
     "Do not alter orchestration policy, approval policy, or sandbox configuration, and do not use bypasses.",
@@ -995,7 +997,7 @@ async function runExecutor({
   if (typeof briefing !== "string" || briefing.trim().length === 0) {
     throw new ExecutorInvocationError("An executor briefing is required.");
   }
-  const profile = requireExecutorProfile(options.profile, options.sandboxMode);
+  const profile = bindExecutorProfile(options.profile, options.resolvedRoute);
 
   let workingDirectory;
   try {
@@ -1040,7 +1042,7 @@ async function runExecutor({
         playwrightOutputDirectory: playwrightRuntime?.outputDirectory ?? null,
         playwrightDisableUserServer: playwrightRuntime?.disableUserPlaywright ?? false,
         sandboxMode: options.sandboxMode,
-        developerInstructions: createExecutorDeveloperInstructions(profile.name),
+        developerInstructions: createExecutorDeveloperInstructions(profile.name, options.resolvedRoute),
         briefing: briefing.trim(),
         outputSchema: outputContract.schema,
         timeoutMs: options.timeoutSeconds * 1000,
@@ -1274,7 +1276,7 @@ async function runExecutor({
 
 export async function invokeExecutor(input) {
   const environment = input.environment ?? process.env;
-  const profile = requireExecutorProfile(
+  requireExecutorProfile(
     input.options.profile,
     input.options.sandboxMode,
   );
@@ -1288,7 +1290,14 @@ export async function invokeExecutor(input) {
     return configurationFailure(`Executor output schema preflight failed: ${message}`, input.options);
   }
   let lease;
+  let profile;
   try {
+    const resolvedRoute = input.options.resolvedRoute ?? await (input.modelResolver ?? resolveConfiguredModel)(input.options.profile, {
+      cwd: input.options.cwd, environment, command: input.command,
+    });
+    profile = bindExecutorProfile(input.options.profile, resolvedRoute);
+    input = { ...input, options: { ...input.options, resolvedRoute } };
+    await input.onRouteSelected?.(profile);
     if (input.options.coordinationCwd !== undefined) {
       const stateOptions = { ...(input.coordinationOptions ?? {}), environment };
       const executionState = await getRepositoryState(input.options.cwd, stateOptions);
@@ -1301,6 +1310,7 @@ export async function invokeExecutor(input) {
       model: profile.model,
       ...(input.coordinationOptions ?? {}),
       environment,
+      resolvedRoute: input.options.resolvedRoute,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -1359,14 +1369,8 @@ export async function main(argv = process.argv.slice(2)) {
       deliveryExplicit: argv.includes("--delivery"),
     });
     const profile = requireExecutorProfile(options.profile, options.sandboxMode);
-    writeStatusMessage(
-      executorLaunchMessage({
-        profile: profile.name,
-        model: profile.model,
-        reasoningEffort: profile.reasoningEffort,
-        serviceTier: profile.serviceTier,
-        sandboxMode: options.sandboxMode,
-      }),
+    const onRouteSelected = (selected) => writeStatusMessage(
+      executorLaunchMessage({ ...selected, profile: selected.name }),
       process.stderr,
       { colorCode: profile.colorCode },
     );
@@ -1378,11 +1382,13 @@ export async function main(argv = process.argv.slice(2)) {
           options,
           invokeLegacy: invokeExecutor,
           signal: abortController.signal,
+          onRouteSelected,
         })
       : await invokeExecutor({
           briefing,
           options,
           signal: abortController.signal,
+          onRouteSelected,
         });
     writeStatusMessage(executorResultMessage(execution.result), process.stderr, {
       colorCode: profile.colorCode,

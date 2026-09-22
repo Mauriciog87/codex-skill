@@ -31,7 +31,7 @@ test("executor messages identify the complete verified route", () => {
       sandbox_mode: "read-only",
       routing_verified: true,
     }),
-    "Astra-Luna orchestrator: explore task completed. Routing: verified (gpt-5.6-luna, max reasoning, fast tier, read-only).",
+    "Orchestrator: explore task completed. Routing: verified (gpt-5.6-luna, max reasoning, fast tier, read-only).",
   );
 });
 
@@ -46,7 +46,7 @@ test("unverified executor messages do not claim route metadata", () => {
   });
   assert.equal(
     message,
-    "Astra-Luna orchestrator: implement task failed. Routing: not verified. See blockers and warnings in the JSON result.",
+    "Orchestrator: implement task failed. Routing: not verified. See blockers and warnings in the JSON result.",
   );
   assert.doesNotMatch(message, /gpt-6-astra|high reasoning|standard tier/);
 });
@@ -67,7 +67,7 @@ test("Ultra messages identify takeover mode and recovery state", () => {
       routing_verified: false,
       warnings: ["Ultra lock is recovery-required."],
     }),
-    "Astra-Luna orchestrator: Ultra task failed. Routing: not verified. See blockers and warnings in the JSON result. The repository lock requires recovery. Inspect it with the orchestration gate status command before attempting recovery.",
+    "Orchestrator: Ultra task failed. Routing: not verified. See blockers and warnings in the JSON result. The repository lock requires recovery. Inspect it with the orchestration gate status command before attempting recovery.",
   );
 });
 

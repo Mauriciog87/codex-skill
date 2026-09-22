@@ -1,6 +1,6 @@
 # Astra-Luna orchestration
 
-Technical identifiers retain `sol-luna-orchestration` and the historical advanced pool key `sol` for state compatibility. New advanced runs use only Astra; historical Sol records remain inspectable. Do not rename state or enable a Sol fallback.
+Technical identifiers retain `sol-luna-orchestration` and the historical advanced pool key `sol` for state compatibility. Astra is the default advanced family; the operator may select Sol explicitly. Both share the advanced pool. Do not rename state or enable an automatic family fallback.
 
 The root Codex session is the orchestrator. Invoke `$sol-luna-orchestration` at the start of every substantive task, before planning, delegating, or editing. A session with `CODEX_ORCHESTRATION_ROLE=executor` in its developer instructions is an executor; it must not invoke the skill or apply the root workflow. A session marked `CODEX_ORCHESTRATION_ROLE=ultra-orchestrator` already owns an authorized exclusive takeover and must not acquire another one.
 
@@ -8,13 +8,19 @@ The root Codex session is the orchestrator. Invoke `$sol-luna-orchestration` at 
 
 | Role | Model | Effort | Tier | Sandbox | Workspace |
 |---|---|---|---|---|---|
-| Root and planner | `gpt-6-astra` | `high` | Standard | Current session | Main checkout |
-| `explore` | `gpt-5.6-luna` | `max` | Fast | `read-only` | Shared checkout |
-| `implement-lite` | `gpt-5.6-luna` | `max` | Fast | Explicit `workspace-write` | Isolated worktree |
-| `playwright` | `gpt-5.6-luna` | `max` | Standard | `read-only` for repository files | Shared checkout |
-| `implement` | `gpt-6-astra` | `medium` | Standard | Explicit `workspace-write` | Isolated worktree |
-| `review` | `gpt-6-astra` | `high` | Standard | `read-only` | Exact candidate worktree when reviewing a candidate |
-| Exceptional takeover | `gpt-6-astra` | `ultra` | Standard | Human-confirmed repository lock | Main checkout |
+| Root and planner | Advanced | `high` | Standard | Current session | Main checkout |
+| `explore` | Luna | `max` | Fast | `read-only` | Shared checkout |
+| `implement-lite` | Luna | `max` | Fast | Explicit `workspace-write` | Isolated worktree |
+| `playwright` | Luna | `max` | Standard | `read-only` for repository files | Shared checkout |
+| `implement` | Advanced | `medium` | Standard | Explicit `workspace-write` | Isolated worktree |
+| `review` | Advanced | `high` | Standard | `read-only` | Exact candidate worktree when reviewing a candidate |
+| Exceptional takeover | Advanced | `ultra` | Standard | Human-confirmed repository lock | Main checkout |
+
+These are the default efforts. Read `models` in `$CODEX_HOME/sol-luna-orchestration/config.json`: `advanced` defaults to `astra@latest` and accepts `sol@latest`; `economy` defaults to `luna@latest`. Exact stable model ids pin a release. Optional `efforts` entries override individual roles; Ultra remains `ultra`. The aliases belong to this project, not Codex. Resolve them through runtime `model/list`, selecting the newest visible stable numeric release within that family, then require its advertised effort and Fast support. Never silently downgrade, switch families, or send an alias to Codex.
+
+Use `npm run models` to inspect routes without starting a turn and `npm run root -- --cwd <repository>` to start a root with the configured selection. Editing JSON does not change an open session. Plain Codex and the desktop app use their own selected settings or the last installed global snapshot. Verify actual root metadata before relying on it.
+
+New assignments persist `model_route` before execution. Queued work and retries retain it, while each attempt obtains fresh routing evidence. Legacy assignments without that snapshot remain inspectable but cannot resume silently; preserve their evidence and explicitly create replacement work. Do not erase state or change a stored route to upgrade a model.
 
 Every role uses `model_verbosity = "low"`. Fast profiles force `features.fast_mode = true`; Standard roles force it to `false`. Verbosity controls response length independently from reasoning effort.
 
@@ -47,7 +53,7 @@ The local dashboard is projection-only, bound to loopback, protected by a one-ti
 ## Concurrency
 
 - Luna profiles share a limit of 10 executors per repository and 10 across the PC.
-- Astra profiles share a limit of 4 executors per repository and 4 across the PC.
+- Advanced profiles share a limit of 4 executors per repository and 4 across the PC, across both Astra and Sol releases.
 - The machine-wide aggregate limit is 14.
 - Playwright consumes Luna capacity and has a separate machine-wide limit of 2.
 - Root and Ultra are excluded; executors started by Ultra are included.
@@ -62,7 +68,7 @@ Executors save immutable finalization receipts before closing their leases. A co
 
 ## Exclusive Ultra takeover
 
-Use Ultra only for a named decision that root Astra/high cannot resolve responsibly. Activation requires a nonempty `--reason` and `--confirm-exclusive-takeover`. The canonical launcher is:
+Use Ultra only for a named decision that the configured root cannot resolve responsibly. Activation requires a nonempty `--reason` and `--confirm-exclusive-takeover`. The canonical launcher is:
 
 ```text
 node .agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs

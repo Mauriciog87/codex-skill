@@ -1,10 +1,10 @@
 # Verified Astra-Luna orchestration for Codex
 
-This repository adds a dependency-free orchestration layer to Codex. GPT-6 Astra handles planning and integration; Astra and Luna executors handle assigned tasks. Task records survive interruptions, and writers work in isolated Git worktrees.
+This repository adds a dependency-free orchestration layer to Codex. Astra handles planning and integration by default; you can choose Sol instead. Luna handles bounded, lower-cost tasks. Task records survive interruptions, and writers work in isolated Git worktrees.
 
 The controller checks the model, reasoning effort, service tier, and required validation before accepting a candidate: a saved, validated snapshot of the proposed changes. It can then commit or push that candidate according to the task's delivery policy.
 
-The architecture is Astra-Luna. The skill identifier `sol-luna-orchestration`, existing commands (including `invoke-sol-ultra.mjs`), managed markers, and state namespaces keep their historical names for compatibility. There is no Sol execution fallback.
+The default architecture is Astra-Luna, with Sol available as an explicit configuration choice. The skill identifier `sol-luna-orchestration`, existing commands (including `invoke-sol-ultra.mjs`), managed markers, and state namespaces keep their historical names for compatibility. There is no automatic fallback between families.
 
 The launchers talk to the [experimental Codex App Server](https://developers.openai.com/codex/app-server) over local stdio JSON-RPC instead of using native subagent routing. App Server applies and reports each route explicitly, while native multi-agent execution stays disabled. There is no legacy fallback. An incompatible protocol fails closed with exit code `2`.
 
@@ -12,17 +12,56 @@ The launchers talk to the [experimental Codex App Server](https://developers.ope
 
 | Role | Model | Effort | Tier | Sandbox | Workspace | Best use |
 |---|---|---|---|---|---|---|
-| Root | Astra | high | Standard | Current session | Main checkout | Planning, delegation, integration, final validation |
+| Root | Advanced | high | Standard | Current session | Main checkout | Planning, delegation, integration, final validation |
 | `explore` | Luna | max | Fast | Read-only | Shared checkout | Repository discovery, documentation, contract tracing |
 | `implement-lite` | Luna | max | Fast | Workspace write | Isolated worktree | Small, low-risk, tightly bounded edits |
 | `playwright` | Luna | max | Standard | Read-only repository | Shared checkout | Browser inspection and authorized test interaction |
-| `implement` | Astra | medium | Standard | Workspace write | Isolated worktree | Changes that need stronger engineering judgment |
-| `review` | Astra | high | Standard | Read-only | Exact candidate worktree when requested | Independent plan and code review |
-| Ultra | Astra | ultra | Standard | Explicit takeover sandbox | Main checkout | Exceptional architecture, security, or concurrency decisions |
+| `implement` | Advanced | medium | Standard | Workspace write | Isolated worktree | Changes that need stronger engineering judgment |
+| `review` | Advanced | high | Standard | Read-only | Exact candidate worktree when requested | Independent plan and code review |
+| Ultra | Advanced | ultra | Standard | Explicit takeover sandbox | Main checkout | Exceptional architecture, security, or concurrency decisions |
 
 Every role uses `model_verbosity = "low"`. Fast profiles force `features.fast_mode = true`, while Standard roles force it to `false`. Reasoning effort and output verbosity are independent settings.
 
-The advanced model is `gpt-6-astra`; the economical model remains `gpt-5.6-luna`. `model-policy.mjs` defines the advanced model and root/takeover defaults, and `executor-profiles.mjs` fixes each executor route. Review stays at high effort for independent critique; implementation uses medium. Root retains planning and acceptance authority. Ultra is available only when the installed runtime advertises that effort and the operator explicitly authorizes a takeover.
+Advanced means the configured Astra or Sol family. The table shows default efforts; optional role-specific settings can change them, except Ultra, which remains `ultra`. Choosing Sol does not establish that it performs like Astra at the same effort. Root retains planning and acceptance authority. Ultra is available only when the installed runtime advertises that effort and the operator explicitly authorizes a takeover.
+
+### Choose models without editing the source
+
+Edit `$CODEX_HOME/sol-luna-orchestration/config.json` (`~/.codex/sol-luna-orchestration/config.json` when `CODEX_HOME` is unset). Preserve your delivery setting:
+
+```json
+{
+  "automatic_delivery": false,
+  "models": {
+    "advanced": "astra@latest",
+    "economy": "luna@latest",
+    "efforts": {
+      "root": "high",
+      "implement": "medium",
+      "review": "high"
+    }
+  }
+}
+```
+
+To use Sol for root, implementation, review, and takeover, change only `"advanced": "sol@latest"`. Missing model settings use the defaults above. An exact stable id such as `gpt-6-astra` pins a release for reproducibility. The remaining effort keys are `explore`, `implement-lite`, `playwright`, and `ultra`.
+
+`@latest` is a project alias, not a Codex model id. The launcher queries `model/list`, selects the newest visible stable numeric release within that family, then checks effort and Fast support. It does not scrape release pages or trust catalog order. If the selected model lacks a required capability, the run stops with code `2`; it never silently downgrades to an older model, effort, or tier. Unknown release naming still needs a resolver update.
+
+```text
+npm run models
+npm run root -- --cwd <repository>
+```
+
+The first command prints the requested aliases and resolved routes without starting a model turn. The second opens an interactive Codex root with the selected model, effort, and Plan Mode effort. Direct interfaces, including from the global skill link:
+
+```text
+node .agents/skills/sol-luna-orchestration/scripts/model-routing.mjs inspect
+node .agents/skills/sol-luna-orchestration/scripts/model-routing.mjs root --cwd <repository>
+```
+
+Editing JSON does not switch an open session. Plain `codex` and the desktop app use their own selected settings or the concrete defaults saved by the last global installation. Run the configured root command for fresh resolution, or explicitly reinstall to refresh global defaults for future sessions. Repository-specific settings may override installed defaults; the root command supplies its resolved route explicitly.
+
+Every new assignment saves its selected route before execution. Queued assignments and retries keep that model even if configuration or the catalog changes. Each attempt still needs fresh routing evidence. To upgrade existing work, explicitly create a new assignment; do not edit its state. Legacy assignments without a saved route remain inspectable but cannot resume silently.
 
 Once `turn/start` succeeds, `explore` gets 120 seconds to report `item/*` progress for the active thread. Each matching event resets this idle timer, but does not extend the overall timeout. The overall timeout defaults to 900 seconds and can be changed with `--timeout-seconds`. Other profiles use only the overall timeout.
 
@@ -56,7 +95,7 @@ The installer checks for conflicts before changing files. Running it again with 
 
 - links the canonical skill to `$HOME/.agents/skills/sol-luna-orchestration`;
 - uses a junction on Windows and a directory symlink on macOS or Linux;
-- configures the global root as Astra/high/Standard with low verbosity;
+- resolves the configured advanced family and saves that concrete root model and effort globally, with Standard tier and low verbosity;
 - preserves your existing MCP configuration; the Playwright executor supplies its own server at runtime;
 - preserves unrelated Codex configuration and instructions;
 - installs the Ultra SessionStart and PreToolUse hooks without changing an existing `hooks.json`;
@@ -90,7 +129,7 @@ npm run verify:platform
 npm run verify:platform -- --expected-codex-version 0.147.0 --output <path-outside-the-repository>
 ```
 
-It creates isolated temporary HOME and `CODEX_HOME` directories, checks strict configuration and generated App Server schemas, verifies portable process fingerprints, installs twice, verifies the native link type and target, and removes the temporary state. Its JSON result is written to stdout; diagnostics use stderr.
+It creates isolated temporary HOME and `CODEX_HOME` directories, checks strict configuration and generated App Server schemas, verifies portable process fingerprints, installs twice, verifies the native link type and target, and removes the temporary state. Installation uses an explicit offline model-catalog fixture; this does not certify account availability. Its JSON result is written to stdout; diagnostics use stderr.
 
 Live status remains `Pending` until that operating system has a successful artifact. Run live checks only from `master`, through the manual `live-cross-platform.yml` workflow, on dedicated self-hosted runners labeled `codex-live` plus `windows`, `linux`, or `macOS`.
 
@@ -128,7 +167,7 @@ Read-only profiles reject `workspace-write`. Write profiles do not enable it aut
 The launcher prints a colored route banner to stderr when the terminal supports color:
 
 ```text
-◆ PLAYWRIGHT · GPT-5.6-LUNA · MAX · STANDARD · READ-ONLY
+◆ PLAYWRIGHT · LUNA@LATEST → GPT-6-LUNA · MAX · STANDARD · READ-ONLY
 ```
 
 Machine-readable JSON remains the only stdout output. `NO_COLOR`, `TERM=dumb`, and `FORCE_COLOR` are honored.
@@ -141,7 +180,11 @@ The global installer creates `$CODEX_HOME/sol-luna-orchestration/config.json` wi
 
 ```json
 {
-  "automatic_delivery": true
+  "automatic_delivery": true,
+  "models": {
+    "advanced": "astra@latest",
+    "economy": "luna@latest"
+  }
 }
 ```
 
@@ -249,11 +292,11 @@ Exit codes are stable:
 A lease reserves an executor slot for a registered process. The launchers acquire leases atomically at both repository and machine scope, enforcing these limits:
 
 - Luna: 10 active executors per repository and 10 across the PC;
-- Astra: 4 active executors per repository and 4 across the PC;
+- Advanced (Astra and Sol combined): 4 active executors per repository and 4 across the PC;
 - total machine capacity: 14 executors;
 - Playwright: 2 across the PC, counted inside the Luna pool.
 
-The serialized advanced pool is still named `sol` in status and durable records. New Astra executors use its four slots; historical Sol records continue to count against the same capacity. This compatibility key does not allow new Sol execution or change stored generations and history.
+The serialized advanced pool is still named `sol` in status and durable records. All Astra and Sol releases share its four slots, including historical reservations. Selecting another family does not reset capacity, generations, or history.
 
 The root and Ultra process do not consume executor slots. Executors started by Ultra do. Reaching an executor pool limit fails immediately. Durable assignments may remain explicitly queued until `reconcile` can start them; the launcher does not create a second hidden queue.
 

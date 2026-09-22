@@ -4,6 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "models": "node .agents/skills/sol-luna-orchestration/scripts/model-routing.mjs inspect",
+    "root": "node .agents/skills/sol-luna-orchestration/scripts/model-routing.mjs root",
     "install:global": "node scripts/install-global-orchestration.mjs",
     "executor": "node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs",
     "control": "node .agents/skills/sol-luna-orchestration/scripts/orchestration-control.mjs",

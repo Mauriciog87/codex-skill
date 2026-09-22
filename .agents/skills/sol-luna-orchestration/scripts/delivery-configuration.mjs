@@ -1,12 +1,13 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { getCodexHome } from "./orchestration-state.mjs";
+import { validateModelConfiguration } from "./model-selection.mjs";
 
 export const DEFAULT_DELIVERY_CONFIGURATION = Object.freeze({
   automatic_delivery: true,
 });
 export const DEFAULT_DELIVERY_CONFIGURATION_CONTENT = `${JSON.stringify(
-  DEFAULT_DELIVERY_CONFIGURATION,
+  { ...DEFAULT_DELIVERY_CONFIGURATION, models: { advanced: "astra@latest", economy: "luna@latest" } },
   null,
   2,
 )}\n`;
@@ -32,7 +33,7 @@ export function validateDeliveryConfiguration(value) {
     throw new DeliveryConfigurationError("Delivery configuration must be a JSON object.");
   }
   const properties = Object.keys(value);
-  const unexpected = properties.filter((property) => property !== "automatic_delivery");
+  const unexpected = properties.filter((property) => !["automatic_delivery", "models"].includes(property));
   if (unexpected.length > 0) {
     throw new DeliveryConfigurationError(
       `Unexpected delivery configuration properties: ${unexpected.join(", ")}.`,
@@ -41,7 +42,10 @@ export function validateDeliveryConfiguration(value) {
   if (typeof value.automatic_delivery !== "boolean") {
     throw new DeliveryConfigurationError("automatic_delivery must be true or false.");
   }
-  return { automatic_delivery: value.automatic_delivery };
+  return {
+    automatic_delivery: value.automatic_delivery,
+    ...(Object.hasOwn(value, "models") ? { models: validateModelConfiguration(value.models) } : {}),
+  };
 }
 
 export function parseDeliveryConfiguration(content, path = "delivery configuration") {

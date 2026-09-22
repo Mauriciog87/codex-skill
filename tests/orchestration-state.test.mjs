@@ -967,11 +967,17 @@ test("historical Sol leases and new Astra leases share the unchanged advanced po
   assert.equal(status.capacity.machine.sol, 4);
   assert.equal(leases.every((lease) => lease.pool === "sol" && lease.model === "gpt-6-astra"), true);
   await assert.rejects(beginExecutorRun(options), /sol executor capacity is full \(4\/4\)/);
-  for (const model of ["gpt-5.6-sol", "unknown-model"]) {
+  for (const model of ["gpt-5.6-sol", "gpt-6-sol", "gpt-7-astra"]) {
+    await assert.rejects(beginExecutorRun({ ...options, model }), /sol executor capacity is full/);
+  }
+  for (const model of ["unknown-model", "astra@latest", "gpt-6-terra"]) {
     await assert.rejects(beginExecutorRun({ ...options, model }), /Unsupported executor model/);
   }
   assert.deepEqual(await readFile(historical.path), original);
   for (const lease of leases) await finishExecutorRun(lease, completedExecution("review", "high"));
+  const sol = await beginExecutorRun({ ...options, model: "gpt-6-sol" });
+  assert.equal(sol.pool, "sol");
+  await finishExecutorRun(sol, completedExecution("review", "high", sol.model));
   await finishExecutorRun({ ...historical, model: stored.model }, completedExecution("review", "high", stored.model));
   assert.equal((await getOrchestrationStatus(fixture.repository, { homeDirectory: fixture.homeDirectory })).capacity.machine.total, 0);
 });

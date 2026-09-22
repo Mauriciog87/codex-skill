@@ -3,6 +3,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getExecutorProfile } from "./executor-profiles.mjs";
 import { MODEL_VERBOSITY } from "./model-policy.mjs";
+import { resolveConfiguredModel } from "./configured-models.mjs";
+import { validateResolvedRoute, parseConcreteModel } from "./model-selection.mjs";
 import { assertEpochAssignmentsComplete } from "./control-plane.mjs";
 import {
   RoutingVerificationError,
@@ -27,8 +29,6 @@ import {
   ULTRA_MODEL,
   ULTRA_CONFIGURED_SERVICE_TIER,
   ULTRA_ORCHESTRATOR_ROLE,
-  ULTRA_REASONING_EFFORT,
-  ULTRA_SERVICE_TIER,
   acquireUltraLock,
   listUltraExecutorResults,
   registerUltraProcess,
@@ -155,12 +155,12 @@ export function parseUltraArguments(argv, baseDirectory = process.cwd()) {
   return parsed;
 }
 
-export function createUltraDeveloperInstructions(lockId, generation) {
+export function createUltraDeveloperInstructions(lockId, generation, model = ULTRA_MODEL) {
   return [
     `CODEX_ORCHESTRATION_ROLE=${ULTRA_ORCHESTRATOR_ROLE}`,
     `CODEX_ORCHESTRATION_LOCK_ID=${lockId}`,
     `CODEX_ORCHESTRATION_GENERATION=${generation}`,
-    `Act as the exclusive ${ULTRA_MODEL} Ultra root orchestrator for the supplied briefing.`,
+    `Act as the exclusive ${model} Ultra root orchestrator for the supplied briefing.`,
     "Own planning, bounded delegation, integration, verification, and the terminal result while the repository lock is active.",
     "Do not use native spawn_agent or any native multi-agent tool and do not start another Ultra takeover.",
     `Delegate only through node ${JSON.stringify(EXECUTOR_LAUNCHER_PATH)} --profile explore|implement-lite|playwright|implement|review with a bounded briefing on stdin.`,
@@ -236,8 +236,9 @@ function validateUltraExecutors(executors) {
       profile === null ||
       !["completed", "blocked", "failed"].includes(executor.status) ||
       typeof executor.thread_id !== "string" ||
-      executor.model !== profile.model ||
-      executor.reasoning_effort !== profile.reasoningEffort ||
+      !parseConcreteModel(executor.model) ||
+      (profile.concurrencyPool === "luna" ? parseConcreteModel(executor.model).family !== "luna" : !["astra", "sol"].includes(parseConcreteModel(executor.model).family)) ||
+      typeof executor.reasoning_effort !== "string" ||
       executor.service_tier !== profile.serviceTier ||
       executor.routing_verified !== true
     ) {
@@ -301,6 +302,8 @@ export async function invokeUltra({
   appServerRunner = runAppServerTurn,
   outputContractLoader = loadExecutorResultContract,
   coordinationOptions = {},
+  modelResolver = resolveConfiguredModel,
+  onRouteSelected,
 }) {
   if (typeof briefing !== "string" || briefing.trim().length === 0) {
     throw new UltraInvocationError("An Ultra takeover briefing is required.");
@@ -310,12 +313,15 @@ export async function invokeUltra({
     throw new UltraInvocationError(`Ultra cwd is not a directory: ${options.cwd}`);
   }
   const outputContract = validateExecutorResultContract(await outputContractLoader());
+  const route = validateResolvedRoute(await modelResolver("ultra", { cwd: options.cwd, environment, command }), "ultra");
+  await onRouteSelected?.(route);
   const lock = await acquireUltraLock({
     cwd: options.cwd,
     reason: options.reason,
     sandboxMode: options.sandboxMode,
     ...coordinationOptions,
     environment,
+    resolvedRoute: route,
   });
   let threadId = null;
   let actualModel = null;
@@ -332,13 +338,13 @@ export async function invokeUltra({
         [ORCHESTRATION_LOCK_ENV]: lock.lock_id,
         [ORCHESTRATION_GENERATION_ENV]: String(lock.generation),
       },
-      model: ULTRA_MODEL,
-      reasoningEffort: ULTRA_REASONING_EFFORT,
-      serviceTier: ULTRA_SERVICE_TIER,
+      model: route.model,
+      reasoningEffort: route.reasoningEffort,
+      serviceTier: route.serviceTier,
       configuredServiceTier: ULTRA_CONFIGURED_SERVICE_TIER,
       fastMode: false,
       sandboxMode: options.sandboxMode,
-      developerInstructions: createUltraDeveloperInstructions(lock.lock_id, lock.generation),
+      developerInstructions: createUltraDeveloperInstructions(lock.lock_id, lock.generation, route.model),
       briefing: briefing.trim(),
       outputSchema: outputContract.schema,
       timeoutMs: options.timeoutSeconds * 1000,
@@ -374,18 +380,18 @@ export async function invokeUltra({
       throw new UltraInvocationError("App Server did not return a thread id for Ultra takeover.");
     }
     if (
-      actualModel !== ULTRA_MODEL ||
-      actualReasoningEffort !== ULTRA_REASONING_EFFORT ||
-      actualServiceTier !== ULTRA_SERVICE_TIER
+      actualModel !== route.model ||
+      actualReasoningEffort !== route.reasoningEffort ||
+      actualServiceTier !== route.serviceTier
     ) {
       throw new UltraInvocationError(
-        `App Server routing mismatch: expected ${ULTRA_MODEL}/${ULTRA_REASONING_EFFORT}/${ULTRA_SERVICE_TIER}, received ${actualModel ?? "null"}/${actualReasoningEffort ?? "null"}/${actualServiceTier ?? "null"}.`,
+        `App Server routing mismatch: expected ${route.model}/${route.reasoningEffort}/${route.serviceTier}, received ${actualModel ?? "null"}/${actualReasoningEffort ?? "null"}/${actualServiceTier ?? "null"}.`,
       );
     }
     const routing = await verifySessionRouting(
       threadId,
-      ULTRA_MODEL,
-      ULTRA_REASONING_EFFORT,
+      route.model,
+      route.reasoningEffort,
       { sessionRoots },
     );
     actualModel = routing.model;
@@ -529,11 +535,9 @@ export async function main(argv = process.argv.slice(2)) {
   process.once("SIGTERM", interrupt);
   try {
     options = parseUltraArguments(argv);
-    writeStatusMessage(
+    const onRouteSelected = (route) => writeStatusMessage(
       ultraLaunchMessage({
-        model: ULTRA_MODEL,
-        reasoningEffort: ULTRA_REASONING_EFFORT,
-        serviceTier: ULTRA_SERVICE_TIER,
+        ...route,
         sandboxMode: options.sandboxMode,
       }),
       process.stderr,
@@ -543,6 +547,7 @@ export async function main(argv = process.argv.slice(2)) {
       briefing: await readBriefing(),
       options,
       signal: abortController.signal,
+      onRouteSelected,
     });
     writeStatusMessage(ultraResultMessage(execution.result), process.stderr, {
       colorCode: 91,

@@ -4,7 +4,8 @@ import { readFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import test from "node:test";
 import { EXECUTOR_PROFILES } from "../.agents/skills/sol-luna-orchestration/scripts/executor-profiles.mjs";
-import { ADVANCED_MODEL, ADVANCED_EXECUTOR_POOL, MODEL_VERBOSITY, ROOT_CONFIG_VALUES, ROOT_POLICY, ULTRA_POLICY } from "../.agents/skills/sol-luna-orchestration/scripts/model-policy.mjs";
+import { ADVANCED_EXECUTOR_POOL, MODEL_VERBOSITY, LEGACY_ROOT_CONFIG_VALUES, LEGACY_ROOT_POLICY, LEGACY_ULTRA_POLICY } from "../.agents/skills/sol-luna-orchestration/scripts/model-policy.mjs";
+import { DEFAULT_MODEL_CONFIGURATION } from "../.agents/skills/sol-luna-orchestration/scripts/model-selection.mjs";
 
 const execFileAsync = promisify(execFile);
 const migrationFiles = new Set([
@@ -15,15 +16,16 @@ const migrationFiles = new Set([
   "tests/static-policy.test.mjs",
 ]);
 
-test("the common policy fixes Astra roles without renaming durable capacity", () => {
-  assert.equal(ADVANCED_MODEL, "gpt-6-astra");
+test("model defaults use family selectors while legacy records keep their reference policy", () => {
+  assert.equal(DEFAULT_MODEL_CONFIGURATION.advanced, "astra@latest");
+  assert.equal(DEFAULT_MODEL_CONFIGURATION.economy, "luna@latest");
   assert.equal(ADVANCED_EXECUTOR_POOL, "sol");
-  assert.deepEqual(ROOT_POLICY, { model: "gpt-6-astra", reasoningEffort: "high", serviceTier: "standard", configuredServiceTier: "default", fastMode: false });
-  assert.deepEqual(ULTRA_POLICY, { ...ROOT_POLICY, reasoningEffort: "ultra" });
-  assert.deepEqual(ROOT_CONFIG_VALUES, { model: "gpt-6-astra", model_reasoning_effort: "high", model_verbosity: "low", service_tier: "default", plan_mode_reasoning_effort: "high" });
-  assert.equal(Object.isFrozen(ROOT_POLICY), true);
-  assert.equal(Object.isFrozen(ULTRA_POLICY), true);
-  assert.equal(Object.isFrozen(ROOT_CONFIG_VALUES), true);
+  assert.deepEqual(LEGACY_ROOT_POLICY, { model: "gpt-6-astra", reasoningEffort: "high", serviceTier: "standard", configuredServiceTier: "default", fastMode: false });
+  assert.deepEqual(LEGACY_ULTRA_POLICY, { ...LEGACY_ROOT_POLICY, reasoningEffort: "ultra" });
+  assert.deepEqual(LEGACY_ROOT_CONFIG_VALUES, { model: "gpt-6-astra", model_reasoning_effort: "high", model_verbosity: "low", service_tier: "default", plan_mode_reasoning_effort: "high" });
+  assert.equal(Object.isFrozen(LEGACY_ROOT_POLICY), true);
+  assert.equal(Object.isFrozen(LEGACY_ULTRA_POLICY), true);
+  assert.equal(Object.isFrozen(LEGACY_ROOT_CONFIG_VALUES), true);
 });
 
 test("tracked operational files contain only the Astra-Luna architecture", async () => {
@@ -56,6 +58,8 @@ test("package scripts and skill policy expose the supported interfaces", async (
   const packageJson = JSON.parse(await readFile("package.json", "utf8"));
   assert.equal(packageJson.private, true);
   assert.deepEqual(packageJson.scripts, {
+    models: "node .agents/skills/sol-luna-orchestration/scripts/model-routing.mjs inspect",
+    root: "node .agents/skills/sol-luna-orchestration/scripts/model-routing.mjs root",
     "install:global": "node scripts/install-global-orchestration.mjs",
     executor:
       "node .agents/skills/sol-luna-orchestration/scripts/invoke-profile-executor.mjs",
@@ -79,11 +83,9 @@ test("package scripts and skill policy expose the supported interfaces", async (
   );
   assert.match(metadata, /^\s*allow_implicit_invocation: false$/m);
   const config = await readFile(".codex/config.toml", "utf8");
-  assert.match(config, /^model = "gpt-6-astra"$/m);
-  assert.match(config, /^model_reasoning_effort = "high"$/m);
+  assert.doesNotMatch(config, /^(model|model_reasoning_effort|plan_mode_reasoning_effort)\s*=/m);
   assert.match(config, new RegExp(`^model_verbosity = "${MODEL_VERBOSITY}"$`, "m"));
   assert.match(config, /^service_tier = "default"$/m);
-  assert.match(config, /^plan_mode_reasoning_effort = "high"$/m);
   assert.match(config, /^max_threads = 4$/m);
 });
 
@@ -93,7 +95,7 @@ test("profile registry and operational guidance stay aligned", async () => {
       Object.entries(EXECUTOR_PROFILES).map(([name, profile]) => [
         name,
         [
-          profile.model,
+          profile.modelSelector,
           profile.reasoningEffort,
           profile.serviceTier,
           profile.sandboxMode,
@@ -104,11 +106,11 @@ test("profile registry and operational guidance stay aligned", async () => {
       ]),
     ),
     {
-      explore: ["gpt-5.6-luna", "max", "fast", "read-only", "shared-read-only", ["workspace-read", "operator-request"], 120_000],
-      "implement-lite": ["gpt-5.6-luna", "max", "fast", "workspace-write", "isolated-worktree", ["workspace-read", "workspace-write", "operator-request"], null],
-      playwright: ["gpt-5.6-luna", "max", "standard", "read-only", "shared-read-only", ["workspace-read", "browser", "operator-request"], null],
-      implement: ["gpt-6-astra", "medium", "standard", "workspace-write", "isolated-worktree", ["workspace-read", "workspace-write", "operator-request"], null],
-      review: ["gpt-6-astra", "high", "standard", "read-only", "candidate-worktree", ["workspace-read", "review"], null],
+      explore: ["luna@latest", "max", "fast", "read-only", "shared-read-only", ["workspace-read", "operator-request"], 120_000],
+      "implement-lite": ["luna@latest", "max", "fast", "workspace-write", "isolated-worktree", ["workspace-read", "workspace-write", "operator-request"], null],
+      playwright: ["luna@latest", "max", "standard", "read-only", "shared-read-only", ["workspace-read", "browser", "operator-request"], null],
+      implement: ["astra@latest", "medium", "standard", "workspace-write", "isolated-worktree", ["workspace-read", "workspace-write", "operator-request"], null],
+      review: ["astra@latest", "high", "standard", "read-only", "candidate-worktree", ["workspace-read", "review"], null],
     },
   );
   assert.match(
@@ -159,8 +161,8 @@ test("profile registry and operational guidance stay aligned", async () => {
     ".agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs",
     "utf8",
   );
-  assert.match(ultraLauncher, /ULTRA_REASONING_EFFORT/);
-  assert.match(ultraLauncher, /ULTRA_SERVICE_TIER/);
+  assert.match(ultraLauncher, /route.reasoningEffort/);
+  assert.match(ultraLauncher, /route.serviceTier/);
   assert.match(ultraLauncher, /--confirm-exclusive-takeover/);
   assert.match(ultraLauncher, /CODEX_ORCHESTRATION_LOCK_ID/);
   assert.match(ultraLauncher, /CODEX_ORCHESTRATION_GENERATION/);

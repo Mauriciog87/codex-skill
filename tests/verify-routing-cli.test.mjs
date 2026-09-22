@@ -6,12 +6,14 @@ import test from "node:test";
 import {
   main,
   parseVerifyRoutingArguments,
-  runGlobalRootProbe,
+  runGlobalRootProbe as runGlobalRootProbeImplementation,
   verifyRootConfiguration,
   verifyOutputSchemaLive,
   verifyPlaywrightOnly,
   validatePlaywrightProbeEvidence,
 } from "../scripts/verify-routing.mjs";
+import { fixtureModelResolver } from "./fixtures/model-routes.mjs";
+const runGlobalRootProbe = (roots, contract, dependencies) => runGlobalRootProbeImplementation(roots, contract, { modelResolver: fixtureModelResolver, ...dependencies });
 import { loadExecutorResultContract } from "../.agents/skills/sol-luna-orchestration/scripts/executor-result-contract.mjs";
 
 test("root configuration verification does not require global MCP settings in the repository", () => {

@@ -22,7 +22,9 @@ import { fileURLToPath } from "node:url";
 import {
   getCodexHome,
 } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
-import { ROOT_CONFIG_VALUES } from "../.agents/skills/sol-luna-orchestration/scripts/model-policy.mjs";
+import { LEGACY_ROOT_CONFIG_VALUES, rootConfigValues } from "../.agents/skills/sol-luna-orchestration/scripts/model-policy.mjs";
+import { resolveModelRoute } from "../.agents/skills/sol-luna-orchestration/scripts/model-selection.mjs";
+import { readCodexModelCatalog } from "../.agents/skills/sol-luna-orchestration/scripts/codex-app-server-client.mjs";
 import {
   DEFAULT_DELIVERY_CONFIGURATION_CONTENT,
   getDeliveryConfigurationPath,
@@ -268,10 +270,10 @@ function updateManagedHooks(lines, hookScriptPath) {
   lines.push(...block);
 }
 
-export function updateGlobalConfig(content, { hookScriptPath = null } = {}) {
+export function updateGlobalConfig(content, { hookScriptPath = null, rootValues = LEGACY_ROOT_CONFIG_VALUES } = {}) {
   const original = content ?? "";
   const shape = textShape(content);
-  setTopLevelValues(shape.lines, ROOT_CONFIG_VALUES);
+  setTopLevelValues(shape.lines, rootValues);
   setAgentsValues(shape.lines, { max_depth: 1, max_threads: 4 });
   setFeaturesValues(shape.lines, { fast_mode: false });
   if (hookScriptPath !== null) {
@@ -371,7 +373,7 @@ function uniqueLegacySpecifications(specifications, platform) {
   return [...unique.values()];
 }
 
-export async function validateConfigUpdate(original, proposed, configReader = readCodexConfig) {
+export async function validateConfigUpdate(original, proposed, configReader = readCodexConfig, rootValues = LEGACY_ROOT_CONFIG_VALUES) {
   const temporary = await mkdtemp(join(tmpdir(), "sol-luna-config-preflight-"));
   const home = join(temporary, "home");
   const codexHome = join(home, ".codex");
@@ -387,7 +389,7 @@ export async function validateConfigUpdate(original, proposed, configReader = re
       if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("Codex config/read returned no configuration.");
       if (verifyManaged) {
         const expected = {
-          ...ROOT_CONFIG_VALUES,
+          ...rootValues,
           "agents.max_depth": 1, "agents.max_threads": 4, "features.fast_mode": false, "features.hooks": true,
         };
         for (const [path, value] of Object.entries(expected)) {
@@ -411,6 +413,7 @@ export async function installGlobalOrchestration({
   codexHome = getCodexHome(process.env, homeDirectory),
   platform = process.platform,
   configReader = readCodexConfig,
+  catalogReader = readCodexModelCatalog,
 } = {}) {
   const linkType = getSkillLinkType(platform);
   const canonicalDirectory = resolve(repositoryRoot, ".agents", "skills", SKILL_NAME);
@@ -490,10 +493,14 @@ export async function installGlobalOrchestration({
   if (originalDeliveryConfig !== null) {
     parseDeliveryConfiguration(originalDeliveryConfig, deliveryConfigPath);
   }
-  const configUpdate = updateGlobalConfig(originalConfig, { hookScriptPath: globalHookScript });
+  const configuration = originalDeliveryConfig === null ? {} : parseDeliveryConfiguration(originalDeliveryConfig, deliveryConfigPath);
+  const catalog = await catalogReader({ cwd: repositoryRoot, environment: { ...process.env, HOME: homeDirectory, USERPROFILE: homeDirectory, CODEX_HOME: codexHome } });
+  const route = resolveModelRoute("root", configuration.models, catalog);
+  const rootValues = rootConfigValues(route);
+  const configUpdate = updateGlobalConfig(originalConfig, { hookScriptPath: globalHookScript, rootValues });
   const globalInstructions = await selectGlobalInstructions(codexHome);
   const instructionsUpdate = updateGlobalInstructions(globalInstructions.content);
-  await validateConfigUpdate(originalConfig, configUpdate.content, configReader);
+  await validateConfigUpdate(originalConfig, configUpdate.content, configReader, rootValues);
 
   let linkCreated = false;
   let configWritten = false;

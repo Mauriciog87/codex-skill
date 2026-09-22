@@ -265,7 +265,9 @@ export async function verifyPlatform(options = {}, dependencies = {}) {
       homeDirectory,
       codexHome,
       platform: platformCode,
+      catalogReader: async () => [{ model: "gpt-6-astra", hidden: false, supportedReasoningEfforts: [{ reasoningEffort: "high" }] }],
     };
+    result.checks.push("model_catalog:offline_fixture");
     await mkdir(codexHome, { recursive: true });
     await writeFile(join(codexHome, "config.toml"), '"model" = "gpt-5.6-sol"\ndeveloper_instructions = """\n[agents]\nmax_threads = 99\n"""\n', "utf8");
     const first = await installer(installOptions);

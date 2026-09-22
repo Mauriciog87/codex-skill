@@ -22,11 +22,31 @@ import {
   TERRA_LEGACY_SKILL_NAME,
   canonicalPathKey,
   getSkillLinkType,
-  installGlobalOrchestration,
+  installGlobalOrchestration as installGlobalOrchestrationImplementation,
   updateGlobalConfig,
   updateGlobalInstructions,
   validateConfigUpdate,
 } from "../scripts/install-global-orchestration.mjs";
+import { modelCatalog } from "./fixtures/model-routes.mjs";
+const installGlobalOrchestration = (input) => installGlobalOrchestrationImplementation({ catalogReader: async () => modelCatalog, ...input });
+
+test("installation honors Sol and per-role effort without replacing user model configuration", async (context) => {
+  const fixture = await createFixture(context, "configured-sol-install-");
+  const content = '{"automatic_delivery":false,"models":{"advanced":"sol@latest","efforts":{"root":"xhigh"}}}\n';
+  await mkdir(join(fixture.codexHome, "sol-luna-orchestration"), { recursive: true });
+  await writeFile(fixture.deliveryConfigPath, content);
+  const hooks = await readFile(fixture.hooksPath);
+  const input = { repositoryRoot: fixture.repositoryRoot, homeDirectory: fixture.homeDirectory, codexHome: fixture.codexHome };
+  await installGlobalOrchestration(input);
+  const config = await readFile(fixture.configPath, "utf8");
+  assert.match(config, /^model = "gpt-6-sol"$/m);
+  assert.match(config, /^plan_mode_reasoning_effort = "xhigh"$/m);
+  assert.equal((await installGlobalOrchestration(input)).configuration_changed, false);
+  assert.equal(await readFile(fixture.deliveryConfigPath, "utf8"), content);
+  assert.deepEqual(await readFile(fixture.hooksPath), hooks);
+  await assert.rejects(installGlobalOrchestration({ ...input, catalogReader: async () => [] }), /No stable model/);
+  assert.equal(await readFile(fixture.configPath, "utf8"), config);
+});
 
 const NEW_DISPLAY_NAME = "Astra-Luna Orchestration";
 const LEGACY_DISPLAY_NAME = "Sol-Sol Orchestration";
@@ -344,9 +364,9 @@ test("installGlobalOrchestration is idempotent and removes a validated legacy co
   assert.match(await readFile(fixture.configPath, "utf8"), /^codex_hooks = true$/m);
   assert.match(await readFile(fixture.configPath, "utf8"), /^\[\[hooks\.PreToolUse\]\]$/m);
   assert.doesNotMatch(await readFile(fixture.configPath, "utf8"), /mcp_servers\.playwright/);
-  assert.equal(
-    await readFile(fixture.deliveryConfigPath, "utf8"),
-    '{\n  "automatic_delivery": true\n}\n',
+  assert.deepEqual(
+    JSON.parse(await readFile(fixture.deliveryConfigPath, "utf8")),
+    { automatic_delivery: true, models: { advanced: "astra@latest", economy: "luna@latest" } },
   );
   assert.equal(await readFile(fixture.agentsPath, "utf8"), "# Existing global guidance\n\nPreserve this text.\n");
   assert.equal(

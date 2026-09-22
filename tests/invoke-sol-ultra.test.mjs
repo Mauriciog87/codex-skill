@@ -12,9 +12,33 @@ import {
   buildUltraAppServerArguments,
   createStableUltraResult,
   createUltraDeveloperInstructions,
-  invokeUltra,
+  invokeUltra as invokeUltraImplementation,
   parseUltraArguments,
 } from "../.agents/skills/sol-luna-orchestration/scripts/invoke-sol-ultra.mjs";
+import { fixtureModelResolver } from "./fixtures/model-routes.mjs";
+import { modelCatalog } from "./fixtures/model-routes.mjs";
+import { resolveModelRoute } from "../.agents/skills/sol-luna-orchestration/scripts/model-selection.mjs";
+const invokeUltra = (input) => invokeUltraImplementation({ modelResolver: fixtureModelResolver, ...input });
+
+test("configured Sol Ultra records and verifies the selected model before releasing its lock", async (context) => {
+  const fixture = await createFixture(context);
+  const route = resolveModelRoute("ultra", { advanced: "sol@latest" }, modelCatalog);
+  const threadId = "sol-ultra-configured";
+  await writeRoutingMetadata(fixture.sessionsRoot, threadId, "ultra", route.model);
+  const runner = createRunner(threadId, completedPayload());
+  const response = await invokeUltra({ briefing: "Inspect only.", options: ultraOptions(fixture.repository), sessionRoots: [fixture.sessionsRoot], coordinationOptions: { homeDirectory: fixture.homeDirectory }, modelResolver: async () => route,
+    appServerRunner: async (input) => {
+      assert.equal(input.model, "gpt-6-sol");
+      assert.ok(input.developerInstructions.includes("gpt-6-sol"));
+      const lock = await readUltraLock(fixture.repository, { homeDirectory: fixture.homeDirectory });
+      assert.equal(lock.model, input.model);
+      return runner(input);
+    },
+  });
+  assert.equal(response.exitCode, 0);
+  assert.equal(response.result.model, "gpt-6-sol");
+  assert.equal(await readUltraLock(fixture.repository, { homeDirectory: fixture.homeDirectory }), null);
+});
 import {
   ORCHESTRATION_GENERATION_ENV,
   ORCHESTRATION_LOCK_ENV,

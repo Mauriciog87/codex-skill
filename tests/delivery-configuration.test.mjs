@@ -40,7 +40,7 @@ function writerOptions(cwd) {
 
 test("delivery configuration defaults to automatic and preserves an explicit opt-out", async (context) => {
   const fixture = await createFixture(context);
-  assert.equal(DEFAULT_DELIVERY_CONFIGURATION_CONTENT, '{\n  "automatic_delivery": true\n}\n');
+  assert.deepEqual(JSON.parse(DEFAULT_DELIVERY_CONFIGURATION_CONTENT), { automatic_delivery: true, models: { advanced: "astra@latest", economy: "luna@latest" } });
   assert.deepEqual(await readDeliveryConfiguration({ codexHome: fixture.codexHome }), {
     automatic_delivery: true,
     path: fixture.path,

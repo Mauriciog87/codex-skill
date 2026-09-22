@@ -1,8 +1,5 @@
-model = "gpt-6-astra"
-model_reasoning_effort = "high"
 model_verbosity = "low"
 service_tier = "default"
-plan_mode_reasoning_effort = "high"
 
 [agents]
 max_depth = 1

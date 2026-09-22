@@ -10,8 +10,77 @@ import {
 } from "../.agents/skills/sol-luna-orchestration/scripts/control-plane.mjs";
 import {
   createContractBriefing,
-  invokeDurableExecutor,
+  invokeDurableExecutor as invokeDurableExecutorImplementation,
 } from "../.agents/skills/sol-luna-orchestration/scripts/durable-executor.mjs";
+import { fixtureModelResolver } from "./fixtures/model-routes.mjs";
+import { validateResolvedRoute } from "../.agents/skills/sol-luna-orchestration/scripts/model-selection.mjs";
+const invokeDurableExecutor = (input) => invokeDurableExecutorImplementation({ modelResolver: fixtureModelResolver, ...input });
+
+test("queued assignments and retries retain the selected route but require fresh verification", async () => {
+  const fixture = await createFixture();
+  try {
+    const queued = await invokeDurableExecutor({ briefing: "Inspect only.", options: { ...options(fixture.repository, "explore"), enqueueOnly: true }, environment: fixture.environment, coordinationOptions: fixture.coordinationOptions });
+    const assignmentId = queued.result.assignment_id;
+    const original = await readAssignment(fixture.repository, assignmentId, fixture.coordinationOptions);
+    validateResolvedRoute(original.model_route, "explore");
+    const modelResolver = async () => { throw new Error("Existing assignments must not resolve again."); };
+    let runs = 0;
+    const invokeLegacy = async ({ options: input }) => {
+      runs++;
+      assert.deepEqual(input.resolvedRoute, original.model_route);
+      const response = execution("explore", []);
+      response.result.thread_id = `fresh-thread-${runs}`;
+      if (runs === 1) {
+        response.result.status = "failed";
+        response.result.routing_verified = false;
+        response.result.model = "gpt-6-luna";
+        response.exitCode = 2;
+      }
+      return response;
+    };
+    const input = { briefing: "", options: { ...options(fixture.repository, "explore"), assignmentId }, environment: fixture.environment, coordinationOptions: fixture.coordinationOptions, modelResolver, invokeLegacy };
+    await invokeDurableExecutor(input);
+    let record = await readAssignment(fixture.repository, assignmentId, fixture.coordinationOptions);
+    assert.equal(record.state, "failed");
+    record = (await dispatchAssignmentAction(fixture.repository, createAction({ op: "retry_assignment", authority: "root", record }), fixture.coordinationOptions)).record;
+    assert.equal(record.result, null);
+    assert.equal(record.previous_attempts[0].result.routing_verified, false);
+    assert.deepEqual(record.model_route, original.model_route);
+    const retried = await invokeDurableExecutor(input);
+    assert.equal(retried.exitCode, 0);
+    assert.equal(retried.result.thread_id, "fresh-thread-2");
+    assert.equal(retried.result.routing_verified, true);
+    assert.equal(retried.result.model, original.model_route.model);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("a completed writer with mismatched evidence cannot create a candidate", async () => {
+  const fixture = await createFixture();
+  let record;
+  try {
+    const response = await invokeDurableExecutor({ briefing: "Change one file.", options: options(fixture.repository), environment: fixture.environment, coordinationOptions: fixture.coordinationOptions,
+      invokeLegacy: async ({ options: input }) => {
+        await writeFile(join(input.cwd, "src", "value.txt"), "unverified\n");
+        const result = execution("implement", ["src/value.txt"]);
+        result.result.model = "gpt-6-sol";
+        return result;
+      },
+    });
+    assert.equal(response.exitCode, 2);
+    assert.equal(response.result.routing_verified, false);
+    assert.equal(response.result.candidate, null);
+    record = await readAssignment(fixture.repository, response.result.assignment_id, fixture.coordinationOptions);
+    assert.equal(record.state, "failed");
+    assert.equal(await readFile(join(record.workspace.path, "src", "value.txt"), "utf8"), "unverified\n");
+    const refs = await runGit(["for-each-ref", "refs/codex-orchestration/candidates"], { cwd: fixture.repository });
+    assert.equal(refs.stdout.toString("utf8").trim(), "");
+  } finally {
+    if (record?.workspace) await cleanupAssignmentWorktree(record, fixture.coordinationOptions);
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
 import { cleanupAssignmentWorktree, runGit } from "../.agents/skills/sol-luna-orchestration/scripts/git-workspace.mjs";
 import {
   ORCHESTRATION_GENERATION_ENV,
