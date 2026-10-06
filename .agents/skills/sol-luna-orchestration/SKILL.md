@@ -39,7 +39,7 @@ Stop and ask the operator when the checkout is dirty, another Git operation is a
 
 | Profile | Model | Effort | Tier | Sandbox | Workspace | Purpose |
 |---|---|---|---|---|---|---|
-| `explore` | Luna | `max` | Fast | `read-only` | Shared checkout | Broad discovery and contract tracing |
+| `explore` | Luna | `max` | Fast | `read-only` | Committed revision worktree | Broad discovery and contract tracing |
 | `implement-lite` | Luna | `max` | Fast | `workspace-write` | Isolated worktree | Small, explicit, low-risk edits |
 | `playwright` | Luna | `max` | Standard | `read-only` | Shared checkout | Browser inspection and authorized test interaction through Playwright MCP |
 | `implement` | Advanced | `medium` | Standard | `workspace-write` | Isolated worktree | Bounded implementation requiring stronger judgment |
@@ -97,6 +97,16 @@ The launcher writes a colored route banner to stderr when the terminal supports 
 Read [the assignment schema](references/assignment-request.schema.json) when constructing a durable contract, [the executor task schema](references/executor-result.schema.json) when changing model-facing output, and [the v2 envelope schema](references/executor-result-v2.schema.json) when consuming controller results.
 
 ## Durable assignments and candidates
+
+Add `--depends-on <assignment-id>` for each prerequisite. A dependency is ready only when its result is acknowledged and verified. Its candidate paths must match committed HEAD before dependent work starts. Commit manually integrated changes first. The controller uses that HEAD as the task's base and records the dependency evidence. Never discard prerequisites to unblock execution. Finish API and schema contract changes before starting tasks that depend on them.
+
+Add `--resource-json` for each runtime resource. Each argument takes one object with `name`, `kind`, `mode`, and optional `key` and `env`. Use `exclusive` to reserve a non-secret `(kind, key)` across repositories sharing Codex home; port keys must be explicit numbers from 1 to 65535. Use `isolated` for a unique database name or temporary cache/directory path, and specify the environment variable that receives it. The controller does not create databases or start containers. Do not override process or Codex settings through resource variables. These reservations coordinate cooperating runs; they do not provide OS-level isolation. Undeclared services remain shared.
+
+The executor and its post-turn checks share resources. Checks on the combined tree and recovered finalizations use fresh resources, so each set of checks must include its own setup. After a failure, inspect `runtime_reservations` in gate status. Explicit recovery with `recover-runtime --cwd <repository> --reservation-id <id>` requires every registered process to have stopped or its PID to have been reused. Unknown process identities block recovery. Never delete reservations manually or assume they are safe to release because time has passed.
+
+`explore` reads a detached snapshot and returns `read_revision:<sha>` in its checks. Uncommitted changes are excluded; the root inspects those directly. Treat the findings as applying only to the reported revision. Durable snapshots remain until normal acknowledgment and cleanup.
+
+Before integration, combine the candidate with committed target HEAD in a temporary worktree and rerun the required checks. Commit and push require evidence for the exact delivery tree. If the target revision changes or checks modify the source, the evidence is no longer valid. Define the integration tests in `required_checks`; an empty list leaves behavior untested. Keep unrelated local changes out of the delivered tree.
 
 Assignment records and sanitized action events live outside the repository under Codex state. Every mutation carries an action id, expected state revision, and authority. Replays with the same action are idempotent; stale revisions, reused action ids with changed content, stale Ultra generations, and overlapping writer leases fail closed.
 

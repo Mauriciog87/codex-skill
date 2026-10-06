@@ -106,7 +106,7 @@ test("profile registry and operational guidance stay aligned", async () => {
       ]),
     ),
     {
-      explore: ["luna@latest", "max", "fast", "read-only", "shared-read-only", ["workspace-read", "operator-request"], 120_000],
+      explore: ["luna@latest", "max", "fast", "read-only", "revision-worktree", ["workspace-read", "operator-request"], 120_000],
       "implement-lite": ["luna@latest", "max", "fast", "workspace-write", "isolated-worktree", ["workspace-read", "workspace-write", "operator-request"], null],
       playwright: ["luna@latest", "max", "standard", "read-only", "shared-read-only", ["workspace-read", "browser", "operator-request"], null],
       implement: ["astra@latest", "medium", "standard", "workspace-write", "isolated-worktree", ["workspace-read", "workspace-write", "operator-request"], null],

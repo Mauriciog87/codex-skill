@@ -13,6 +13,8 @@ import {
 } from "./executor-profiles.mjs";
 import { resolveConfiguredModel } from "./configured-models.mjs";
 import { readDeliveryConfiguration } from "./delivery-configuration.mjs";
+import { registerRuntimeProcess, validateRuntimeResources } from "./runtime-resources.mjs";
+import { createReadSnapshotWorktree, inspectGitRepository, readWorkspaceStatus, runGit } from "./git-workspace.mjs";
 import {
   AppServerError,
   AppServerTimeoutError,
@@ -138,6 +140,8 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
     writeRoots: [],
     forbiddenRoots: [],
     requiredChecks: [],
+    runtimeResources: [],
+    dependsOn: [],
     artifacts: [],
     reviewPolicy: "root",
     operatorApprovalRequired: false,
@@ -150,7 +154,7 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
     pushBranch: null,
   };
   const seen = new Set();
-  const repeatable = new Set(["--write-root", "--forbid-root", "--check-json", "--artifact-json"]);
+  const repeatable = new Set(["--write-root", "--forbid-root", "--check-json", "--artifact-json", "--resource-json", "--depends-on"]);
   const booleanOptions = new Set([
     "--enqueue-only",
     "--require-operator-approval",
@@ -169,6 +173,8 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
     "--write-root",
     "--forbid-root",
     "--check-json",
+    "--resource-json",
+    "--depends-on",
     "--artifact-json",
     "--review-policy",
     "--candidate-id",
@@ -256,6 +262,11 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
       } catch (error) {
         throw new ExecutorInvocationError(`--check-json is invalid JSON: ${error.message}`);
       }
+    } else if (option === "--resource-json") {
+      try { parsed.runtimeResources.push(JSON.parse(value)); }
+      catch (error) { throw new ExecutorInvocationError(`--resource-json is invalid JSON: ${error.message}`); }
+    } else if (option === "--depends-on") {
+      parsed.dependsOn.push(value);
     } else if (option === "--artifact-json") {
       try {
         parsed.artifacts.push(JSON.parse(value));
@@ -292,8 +303,12 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
       `Profile ${profile.name} requires --sandbox ${profile.sandboxMode}.`,
     );
   }
+  parsed.runtimeResources = validateRuntimeResources(parsed.runtimeResources);
+  if (new Set(parsed.dependsOn).size !== parsed.dependsOn.length || parsed.dependsOn.some((id) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))) throw new ExecutorInvocationError("--depends-on requires unique assignment UUIDs.");
   if (parsed.controlPlane === "v1") {
     const durableOptions = [
+      "--resource-json",
+      "--depends-on",
       "--assignment-id",
       "--enqueue-only",
       "--priority",
@@ -318,6 +333,8 @@ export function parseArguments(argv, baseDirectory = process.cwd()) {
   }
   if (parsed.assignmentId !== null) {
     const contractOptions = [
+      "--resource-json",
+      "--depends-on",
       "--priority",
       "--write-root",
       "--forbid-root",
@@ -993,6 +1010,7 @@ async function runExecutor({
   onPlaywrightEvidence,
   onAppServerStarted,
   outputContract,
+  coordinationOptions = {},
 }) {
   if (typeof briefing !== "string" || briefing.trim().length === 0) {
     throw new ExecutorInvocationError("An executor briefing is required.");
@@ -1010,6 +1028,8 @@ async function runExecutor({
   }
 
   let playwrightRuntime = null;
+  let readSnapshot = null;
+  let readRevision = options.readRevision ?? null;
   let primaryError = null;
   if (profile.name === "playwright") {
     try {
@@ -1022,6 +1042,16 @@ async function runExecutor({
   }
 
   try {
+    if (profile.name === "explore") {
+      if (readRevision === null) {
+        const source = await inspectGitRepository(options.cwd, { ...coordinationOptions, environment });
+        readSnapshot = { ...await createReadSnapshotWorktree(source.repository, source.head, { ...coordinationOptions, environment }), repository: source.repository };
+        options = { ...options, cwd: readSnapshot.path };
+        readRevision = readSnapshot.base_revision;
+      }
+      if ((await inspectGitRepository(options.cwd, coordinationOptions)).head !== readRevision || (await readWorkspaceStatus(options.cwd, coordinationOptions)).length !== 0) throw new ExecutorConfigurationError("Explore requires a clean snapshot at the assigned revision.");
+      briefing = `Inspect only committed revision ${readRevision}. This isolated snapshot does not include uncommitted changes from the main checkout.\n\n${briefing}`;
+    }
     const executorEnvironment = {
       ...(playwrightRuntime?.environment ?? environment),
       [ORCHESTRATION_ROLE_ENV]: "executor",
@@ -1234,6 +1264,7 @@ async function runExecutor({
       }
     }
 
+    if (readRevision !== null && ((await inspectGitRepository(options.cwd, coordinationOptions)).head !== readRevision || (await readWorkspaceStatus(options.cwd, coordinationOptions)).length !== 0)) throw new ExecutorConfigurationError("The exploration snapshot changed during the run; its evidence cannot be accepted.");
     const result = createStableResult({
       status: payload.status,
       profile: profile.name,
@@ -1247,7 +1278,7 @@ async function runExecutor({
       changedFiles: payload.changed_files,
       checks: profile.name === "playwright"
         ? [...payload.checks, `playwright_mcp_version:${PLAYWRIGHT_MCP_VERSION}`, `playwright_runtime_version:${PLAYWRIGHT_RUNTIME_VERSION}`, "playwright_mcp:verified"]
-        : payload.checks,
+        : [...payload.checks.filter((check) => !readRevision || !check.trim().startsWith("read_revision:")), ...(readRevision ? [`read_revision:${readRevision}`] : [])],
       blockers: payload.blockers,
       warnings: [...payload.warnings, ...protocolWarnings],
     });
@@ -1263,6 +1294,10 @@ async function runExecutor({
     primaryError = error;
     throw error;
   } finally {
+    if (readSnapshot !== null) {
+      try { await runGit(["worktree", "remove", "--force", readSnapshot.path], { ...coordinationOptions, environment, cwd: readSnapshot.repository }); }
+      catch (error) { if (primaryError) primaryError.cause ??= error; else throw error; }
+    }
     if (playwrightRuntime !== null) {
       try { await playwrightRuntimeCleanup(playwrightRuntime); }
       catch (error) {
@@ -1323,6 +1358,7 @@ export async function invokeExecutor(input) {
       environment,
       outputContract,
       onAppServerStarted: async ({ pid }) => {
+        if (input.coordinationOptions?.runtimeContext) await registerRuntimeProcess(input.coordinationOptions.runtimeContext, pid, input.coordinationOptions);
         await registerExecutorProcess(lease, {
           kind: "app-server",
           pid,

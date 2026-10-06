@@ -20,6 +20,7 @@ import {
   reduceAssignment,
   rootsOverlap,
   validateAssignmentRequest,
+  resolveAssignmentDependencies,
 } from "../.agents/skills/sol-luna-orchestration/scripts/control-plane.mjs";
 import {
   acquireUltraLock,
@@ -107,6 +108,50 @@ test("path contracts normalize separators and compare concrete roots", () => {
   for (const invalid of ["../secret", "/absolute", "C:/absolute"] ) {
     assert.throws(() => normalizeRepositoryPath(invalid), ControlPlaneError);
   }
+});
+
+test("dependencies wait for acceptance and bind a committed revision before execution", async () => {
+  const fixture = await createFixture();
+  try {
+    await runGit(["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "--allow-empty", "-m", "base"], { cwd: fixture.repository });
+    const base = (await runGit(["rev-parse", "HEAD"], { cwd: fixture.repository })).stdoutText.trim();
+    let prerequisite = await createAssignment({ cwd: fixture.repository, request: request({ profile: "explore", allowed_write_roots: [], base_revision: base }), briefing: "Define the contract.", ...fixture.options });
+    const dependent = await createAssignment({ cwd: fixture.repository, request: request({ base_revision: base, depends_on: [prerequisite.assignment_id] }), briefing: "Use the accepted contract.", ...fixture.options });
+    await assert.rejects(resolveAssignmentDependencies(dependent, fixture.options), /acknowledged/);
+    await assert.rejects(transition(fixture, dependent, "start_assignment", "root", { workspace: { path: "not-created" } }), { code: "dependency-pending" });
+    assert.equal(planResidualActions([prerequisite, dependent]).mechanical.some((action) => action.assignment_id === dependent.assignment_id), false);
+    prerequisite = await transition(fixture, prerequisite, "start_assignment", "root", { workspace: { path: fixture.repository, shared: true, cleaned: true } });
+    prerequisite = await transition(fixture, prerequisite, "publish_result", "executor", { result: { ...result(), changed_files: [], routing_verified: true }, candidate: null, operator_requests: [] });
+    prerequisite = await transition(fixture, prerequisite, "claim_result", "root");
+    prerequisite = await transition(fixture, prerequisite, "acknowledge_assignment", "root");
+    const evidence = await resolveAssignmentDependencies(dependent, fixture.options);
+    assert.equal(evidence.base_revision, base);
+    await runGit(["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "--allow-empty", "-m", "advanced"], { cwd: fixture.repository });
+    await assert.rejects(transition(fixture, dependent, "start_assignment", "root", { workspace: { path: "not-created" }, dependency_evidence: evidence }), /changed before start/);
+    assert.equal((await readAssignment(fixture.repository, dependent.assignment_id, fixture.options)).state, "queued");
+    const current = await resolveAssignmentDependencies(dependent, fixture.options);
+    const running = await transition(fixture, dependent, "start_assignment", "root", { workspace: { path: fixture.repository }, dependency_evidence: current });
+    assert.equal(running.base_revision, current.base_revision);
+    assert.notEqual(running.base_revision, base);
+    assert.deepEqual(running.dependency_evidence, current);
+    await assert.rejects(createAssignment({ cwd: fixture.repository, request: request({ depends_on: ["00000000-0000-4000-8000-000000000000"] }), briefing: "Invalid dependency.", ...fixture.options }), /not found/);
+    assert.throws(() => validateAssignmentRequest(request({ depends_on: [prerequisite.assignment_id, prerequisite.assignment_id] })), /duplicate/);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test("residual planning serializes shared runtime identities even for disjoint paths", async () => {
+  const fixture = await createFixture();
+  try {
+    const resources = [{ name: "database", kind: "database", mode: "exclusive", key: "integration-db" }];
+    const first = await createAssignment({ cwd: fixture.repository, request: request({ runtime_resources: resources }), briefing: "First database check.", ...fixture.options });
+    const second = await createAssignment({ cwd: fixture.repository, request: request({ allowed_write_roots: ["client"], runtime_resources: resources }), briefing: "Second database check.", ...fixture.options });
+    const plan = planResidualActions([first, second]);
+    assert.equal(plan.mechanical.filter((action) => action.op === "start_assignment").length, 1);
+    assert.equal(plan.attention[0].kind, "runtime-resource-pending");
+    await transition(fixture, first, "start_assignment", "root");
+    await assert.rejects(transition(fixture, second, "start_assignment", "root"), { code: "resource-capacity" });
+    assert.equal((await readAssignment(fixture.repository, second.assignment_id, fixture.options)).state, "queued");
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
 test("check timeout errors name the field and its allowed range", () => {

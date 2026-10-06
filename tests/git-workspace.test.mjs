@@ -6,7 +6,7 @@ import { access, chmod, mkdtemp, mkdir, readFile, realpath, rename, rm, symlink,
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { createAction, createAssignment, dispatchAssignmentAction, readAssignment } from "../.agents/skills/sol-luna-orchestration/scripts/control-plane.mjs";
+import { createAction, createAssignment, dispatchAssignmentAction, readAssignment, resolveAssignmentDependencies } from "../.agents/skills/sol-luna-orchestration/scripts/control-plane.mjs";
 import { executeControlCommand } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-control.mjs";
 import { acquireUltraLock, getOrchestrationStatus, getRepositoryKey, getRepositoryState } from "../.agents/skills/sol-luna-orchestration/scripts/orchestration-state.mjs";
 import {
@@ -17,8 +17,10 @@ import {
   commitIntegratedCandidate,
   createAssignmentWorktree,
   createCandidate,
+  createReadSnapshotWorktree,
   inspectGitRepository,
   integrateCandidate,
+  prepareCandidateIntegration,
   gitArgumentsForPlatform,
   parsePorcelainV2,
   pushCommittedCandidate,
@@ -75,6 +77,40 @@ async function createWriterAssignment(fixture, overrides = {}) {
   });
 }
 
+test("writer dependencies require accepted content in committed HEAD, not just manual integration", async () => {
+  const fixture = await createRepositoryFixture();
+  let prerequisite;
+  try {
+    prerequisite = await createWriterAssignment(fixture);
+    const dependent = await createWriterAssignment(fixture, { allowed_write_roots: ["client"], depends_on: [prerequisite.assignment_id] });
+    const workspace = await createAssignmentWorktree(prerequisite, fixture.options);
+    const transition = async (op, authority, payload = {}) => {
+      prerequisite = (await dispatchAssignmentAction(fixture.repository, createAction({ op, authority, record: prerequisite, payload }), fixture.options)).record;
+    };
+    await transition("start_assignment", "root", { workspace });
+    await writeFile(join(workspace.path, "src", "value.txt"), "contract\n");
+    const created = await createCandidate(prerequisite, workspace.path, { ...fixture.options, reportedChangedFiles: ["src/value.txt"], checkResults: [] });
+    await transition("publish_result", "executor", { result: { status: "completed", routing_verified: true, changed_files: ["src/value.txt"], checks: [], blockers: [], warnings: [], summary: "Contract ready." }, candidate: created.candidate, operator_requests: [] });
+    await transition("claim_result", "root");
+    await transition("approve_candidate", "root", { candidate_id: prerequisite.candidate.candidate_id, kind: "root" });
+    const integrated = await integrateCandidate(prerequisite, fixture.repository, fixture.options);
+    await transition("integrate_candidate", "root", { candidate_id: prerequisite.candidate.candidate_id, ...integrated });
+    await transition("acknowledge_assignment", "root");
+    await assert.rejects(resolveAssignmentDependencies(dependent, fixture.options), { code: "dependency-base-missing" });
+    await runGit(["add", "src/value.txt"], { cwd: fixture.repository });
+    await runGit(["commit", "-m", "accepted contract"], { cwd: fixture.repository });
+    const evidence = await resolveAssignmentDependencies(dependent, fixture.options);
+    assert.notEqual(evidence.base_revision, dependent.base_revision);
+    assert.equal(evidence.dependencies[0].candidate_id, prerequisite.candidate.candidate_id);
+    await writeFile(join(fixture.repository, "src", "value.txt"), "different contract\n");
+    await runGit(["commit", "-am", "changed contract"], { cwd: fixture.repository });
+    await assert.rejects(resolveAssignmentDependencies(dependent, fixture.options), { code: "dependency-base-missing" });
+  } finally {
+    if (prerequisite?.workspace) await cleanupAssignmentWorktree(prerequisite, fixture.options);
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 async function prepareIntegratedCandidate(fixture, delivery) {
   let record = await createWriterAssignment(fixture, { delivery });
   const workspace = await createAssignmentWorktree(record, fixture.options);
@@ -109,6 +145,60 @@ test("porcelain v2 parser retains both sides of renames", () => {
     { kind: "rename", xy: "R.", path: "src/new.txt", original_path: "src/old.txt" },
     { kind: "untracked", xy: "??", path: "src/untracked.txt", original_path: null },
   ]);
+});
+
+test("combined checks reject disjoint changes that passed separately without touching the checkout", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    let record = await createWriterAssignment(fixture, {
+      required_checks: [{ id: "combined", argv: [process.execPath, "-e", "const f=require('node:fs');if(f.readFileSync('src/value.txt','utf8')==='candidate\\n'&&f.readFileSync('outside.txt','utf8')==='incompatible\\n')process.exit(1)"] }],
+    });
+    const workspace = await createAssignmentWorktree(record, fixture.options);
+    await writeFile(join(workspace.path, "src/value.txt"), "candidate\n");
+    const checks = await runRequiredChecks(record, workspace.path, fixture.options);
+    record = { ...record, workspace, candidate: (await createCandidate(record, workspace.path, { ...fixture.options, reportedChangedFiles: ["src/value.txt"], checkResults: checks })).candidate };
+    await writeFile(join(fixture.repository, "outside.txt"), "incompatible\n");
+    await runGit(["add", "outside.txt"], { ...fixture.options, cwd: fixture.repository });
+    await runGit(["commit", "-m", "independent change"], { ...fixture.options, cwd: fixture.repository });
+    const before = (await runGit(["worktree", "list", "--porcelain"], { ...fixture.options, cwd: fixture.repository })).stdoutText;
+    await assert.rejects(integrateCandidate(record, fixture.repository, fixture.options), (error) => error.code === "required-check-failed");
+    assert.equal(await readFile(join(fixture.repository, "src/value.txt"), "utf8"), "base\n");
+    assert.deepEqual(await readWorkspaceStatus(fixture.repository, fixture.options), []);
+    assert.equal((await runGit(["worktree", "list", "--porcelain"], { ...fixture.options, cwd: fixture.repository })).stdoutText, before);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test("exploration snapshots retain their revision while the main checkout changes", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    const snapshot = await createReadSnapshotWorktree(fixture.repository, fixture.repositoryInfo.head, fixture.options);
+    await writeFile(join(fixture.repository, "src/value.txt"), "new work\n");
+    assert.equal(await readFile(join(snapshot.path, "src/value.txt"), "utf8"), "base\n");
+    assert.equal(snapshot.base_revision, fixture.repositoryInfo.head);
+    assert.equal((await inspectGitRepository(snapshot.path, fixture.options)).head, snapshot.base_revision);
+    await runGit(["worktree", "remove", snapshot.path], { ...fixture.options, cwd: fixture.repository });
+    assert.equal(await readFile(join(fixture.repository, "src/value.txt"), "utf8"), "new work\n");
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test("integration evidence binds the target revision and rejects checks that modify source", async () => {
+  const fixture = await createRepositoryFixture();
+  try {
+    let record = await createWriterAssignment(fixture, { required_checks: [{ id: "pass", argv: [process.execPath, "-e", "process.exit(0)"] }] });
+    const workspace = await createAssignmentWorktree(record, fixture.options);
+    await writeFile(join(workspace.path, "src/value.txt"), "candidate\n");
+    record = { ...record, workspace, candidate: (await createCandidate(record, workspace.path, { ...fixture.options, reportedChangedFiles: ["src/value.txt"], checkResults: await runRequiredChecks(record, workspace.path, fixture.options) })).candidate };
+    const verification = await prepareCandidateIntegration(record, fixture.repository, fixture.options);
+    assert.equal(verification.target_revision, fixture.repositoryInfo.head);
+    assert.equal(verification.checks.length, 1);
+    await writeFile(join(fixture.repository, "outside.txt"), "later\n");
+    await runGit(["add", "outside.txt"], { ...fixture.options, cwd: fixture.repository });
+    await runGit(["commit", "-m", "advance"], { ...fixture.options, cwd: fixture.repository });
+    await assert.rejects(integrateCandidate(record, fixture.repository, { ...fixture.options, integrationVerification: verification }), (error) => error.code === "integration-verification-stale");
+    const mutating = { ...record, required_checks: [{ id: "mutates", argv: [process.execPath, "-e", "require('node:fs').writeFileSync('outside.txt','changed')"], cwd: ".", timeout_seconds: 10 }] };
+    await assert.rejects(prepareCandidateIntegration(mutating, fixture.repository, fixture.options), (error) => error.code === "integration-check-mutated-source");
+    assert.equal(await readFile(join(fixture.repository, "outside.txt"), "utf8"), "later\n");
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
 test("linked worktrees share their main repository coordination namespace", async () => {

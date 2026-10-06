@@ -10,7 +10,7 @@ const PROFILE_DEFINITIONS = {
     sandboxMode: "read-only",
     idleTimeoutMs: 120_000,
     concurrencyPool: "luna",
-    workspaceStrategy: "shared-read-only",
+    workspaceStrategy: "revision-worktree",
     capabilities: ["workspace-read", "operator-request"],
     colorCode: 36,
     instructions: [

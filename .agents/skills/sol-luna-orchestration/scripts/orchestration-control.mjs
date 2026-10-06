@@ -7,6 +7,7 @@ import {
   dispatchAssignmentAction,
   getControlPlaneStatus,
   readAssignment,
+  preflightAssignmentAction,
   validateEffectRequest,
 } from "./control-plane.mjs";
 import { getExecutorProfile } from "./executor-profiles.mjs";
@@ -17,6 +18,8 @@ import {
   GitWorkspaceError,
   inspectGitRepository,
   integrateCandidate,
+  prepareCandidateIntegration,
+  prepareDeliveryVerification,
   pushCommittedCandidate,
   runProcess,
 } from "./git-workspace.mjs";
@@ -207,6 +210,9 @@ async function applySimpleAction(options, op, payload = {}, authority = options.
 }
 
 async function commitDeliveryRecord(record, authority) {
+  const action = createAction({ op: "record_commit", authority, record, payload: { candidate_id: record.candidate?.candidate_id } });
+  await preflightAssignmentAction(record.repository, action);
+  const integrationVerification = await prepareDeliveryVerification(record, record.repository);
   return (
     await dispatchAssignmentAction(
       record.repository,
@@ -216,12 +222,15 @@ async function commitDeliveryRecord(record, authority) {
         record,
         payload: { candidate_id: record.candidate?.candidate_id },
       }),
-      { beforeTransition: async (current) => commitIntegratedCandidate(current, current.repository) },
+      { beforeTransition: async (current) => commitIntegratedCandidate(current, current.repository, { integrationVerification }) },
     )
   ).record;
 }
 
 async function pushDeliveryRecord(record, authority) {
+  const action = createAction({ op: "record_push", authority, record, payload: { candidate_id: record.candidate?.candidate_id, commit_revision: record.delivery.commit?.commit_revision } });
+  await preflightAssignmentAction(record.repository, action);
+  const integrationVerification = await prepareCandidateIntegration(record, record.repository, { verificationRevision: record.delivery.commit.commit_revision });
   return (
     await dispatchAssignmentAction(
       record.repository,
@@ -234,7 +243,7 @@ async function pushDeliveryRecord(record, authority) {
           commit_revision: record.delivery.commit?.commit_revision,
         },
       }),
-      { beforeTransition: async (current) => pushCommittedCandidate(current, current.repository) },
+      { beforeTransition: async (current) => pushCommittedCandidate(current, current.repository, { integrationVerification }) },
     )
   ).record;
 }
@@ -526,6 +535,9 @@ export async function executeControlCommand(options) {
   if (options.command === "integrate") {
     const record = await readAssignment(options.cwd, options.assignmentId);
     assertExpectedRevision(record, options.revision);
+    const action = createAction({ op: "integrate_candidate", authority: options.authority, record, payload: { candidate_id: record.candidate?.candidate_id } });
+    await preflightAssignmentAction(record.repository, action);
+    const integrationVerification = await prepareCandidateIntegration(record, options.cwd);
     return (
       await dispatchAssignmentAction(
         record.repository,
@@ -536,7 +548,7 @@ export async function executeControlCommand(options) {
           payload: { candidate_id: record.candidate?.candidate_id },
         }),
         {
-          beforeTransition: async (current) => integrateCandidate(current, options.cwd),
+          beforeTransition: async (current) => integrateCandidate(current, options.cwd, { integrationVerification }),
         },
       )
     ).record;

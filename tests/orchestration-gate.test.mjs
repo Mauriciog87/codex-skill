@@ -23,6 +23,12 @@ const ownerEnvironment = {
   [ORCHESTRATION_GENERATION_ENV]: String(lock.generation),
 };
 
+test("runtime recovery accepts only the explicit repository and reservation", () => {
+  const id = "00000000-0000-4000-8000-000000000000";
+  assert.equal(parseGateArguments(["recover-runtime", "--cwd", ".", "--reservation-id", id]).reservationId, id);
+  for (const args of [["recover-runtime", "--cwd", "."], ["recover-runtime", "--cwd", ".", "--reservation-id", id, "--lock-id", "other"], ["status", "--cwd", ".", "--reservation-id", id]]) assert.throws(() => parseGateArguments(args));
+});
+
 test("finalize accepts exact run and revision identifiers without accepting recovery flags", () => {
   const parsed = parseGateArguments(["finalize", "--cwd", ".", "--run-id", "run-1", "--expected-revision", "2"]);
   assert.equal(parsed.runId, "run-1");

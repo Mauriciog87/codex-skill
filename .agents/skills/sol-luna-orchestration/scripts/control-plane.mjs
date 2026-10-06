@@ -3,6 +3,7 @@ import { chmod, mkdir, readdir, rm } from "node:fs/promises";
 import { isAbsolute, join, posix, relative, resolve } from "node:path";
 import { getExecutorProfile } from "./executor-profiles.mjs";
 import { validateResolvedRoute } from "./model-selection.mjs";
+import { validateRuntimeResources } from "./runtime-resources.mjs";
 import {
   OrchestrationStateError,
   atomicCreate,
@@ -313,6 +314,8 @@ export function validateAssignmentRequest(value) {
       "allowed_write_roots",
       "forbidden_write_roots",
       "required_checks",
+      "runtime_resources",
+      "depends_on",
       "artifacts",
       "review_policy",
       "operator_approval_required",
@@ -383,6 +386,8 @@ export function validateAssignmentRequest(value) {
     allowed_write_roots: allowedWriteRoots,
     forbidden_write_roots: forbiddenWriteRoots,
     required_checks: requiredChecks,
+    runtime_resources: validateRuntimeResources(value.runtime_resources),
+    depends_on: validateDependencies(value.depends_on),
     artifacts,
     review_policy: reviewPolicy,
     operator_approval_required: requireBoolean(
@@ -417,6 +422,41 @@ function validateAssignmentId(value) {
     throw new ControlPlaneError("assignment_id must be a UUID.", "invalid-assignment-id");
   }
   return id.toLowerCase();
+}
+
+function validateDependencies(value = []) {
+  if (!Array.isArray(value) || value.length > 32) throw new ControlPlaneError("depends_on must contain at most 32 assignment ids.", "invalid-contract");
+  const ids = value.map(validateAssignmentId);
+  if (new Set(ids).size !== ids.length) throw new ControlPlaneError("depends_on contains duplicate assignments.", "invalid-contract");
+  return ids;
+}
+
+function dependencyEvidence(record, records) {
+  return validateDependencies(record.depends_on).map((id) => {
+    const dependency = records.find((entry) => entry.assignment_id === id);
+    if (!dependency || dependency.repository_key !== record.repository_key || dependency.state !== "acknowledged" || dependency.result?.status !== "completed" || dependency.result.routing_verified !== true) throw new ControlPlaneError(`Dependency ${id} must have an acknowledged, verified result before this assignment can start.`, "dependency-pending");
+    if (dependency.writer && !dependency.candidate) throw new ControlPlaneError(`Dependency ${id} has no candidate evidence.`, "dependency-pending");
+    return { assignment_id: id, attempt: dependency.attempt, candidate_id: dependency.candidate?.candidate_id ?? null, result_sha256: sha256(canonicalJson(dependency.result)) };
+  });
+}
+
+export async function resolveAssignmentDependencies(record, options = {}) {
+  if (!(record.depends_on ?? []).length) return null;
+  const records = await listAssignments(record.repository, options);
+  const evidence = dependencyEvidence(record, records);
+  const { inspectGitRepository, runGit } = await import("./git-workspace.mjs");
+  const target = await inspectGitRepository(record.repository, options);
+  for (const item of evidence) {
+    const dependency = records.find((entry) => entry.assignment_id === item.assignment_id);
+    if (dependency.candidate) {
+      const difference = await runGit(["diff", "--quiet", dependency.candidate.candidate_revision, target.head, "--", ...dependency.candidate.changed_paths], { ...options, cwd: record.repository, allowFailure: true });
+      if (difference.exitCode !== 0) throw new ControlPlaneError(`Dependency ${item.assignment_id} does not match committed HEAD. Commit its accepted changes or revise the plan.`, "dependency-base-missing");
+    } else {
+      const ancestor = await runGit(["merge-base", "--is-ancestor", dependency.base_revision, target.head], { ...options, cwd: record.repository, allowFailure: true });
+      if (ancestor.exitCode !== 0) throw new ControlPlaneError(`Dependency ${item.assignment_id} was read from an unrelated revision.`, "dependency-base-missing");
+    }
+  }
+  return { base_revision: target.head, dependencies: evidence };
 }
 
 function normalizePersistedDelivery(record) {
@@ -454,6 +494,8 @@ function validateRecord(record, assignmentId) {
     throw new ControlPlaneError(`Assignment ${assignmentId} state is malformed.`, "invalid-state");
   }
   if (record.model_route != null) validateResolvedRoute(record.model_route, record.profile);
+  validateDependencies(record.depends_on);
+  validateRuntimeResources(record.runtime_resources);
   return { ...record, delivery: normalizePersistedDelivery(record) };
 }
 
@@ -508,6 +550,10 @@ function recordsOverlap(left, right, platform = process.platform) {
   return left.allowed_write_roots.some((first) =>
     right.allowed_write_roots.some((second) => rootsOverlap(first, second, platform))
   );
+}
+
+function runtimeResourcesOverlap(left, right) {
+  return (left.runtime_resources ?? []).some((resource) => resource.mode === "exclusive" && (right.runtime_resources ?? []).some((other) => other.mode === "exclusive" && resource.kind === other.kind && resource.key === other.key));
 }
 
 function hasActiveOverlap(record, records, platform = process.platform) {
@@ -571,6 +617,9 @@ export async function createAssignment({
     allowed_write_roots: contract.allowed_write_roots,
     forbidden_write_roots: contract.forbidden_write_roots,
     required_checks: contract.required_checks,
+    runtime_resources: contract.runtime_resources,
+    depends_on: contract.depends_on,
+    dependency_evidence: null,
     artifacts: contract.artifacts,
     review_policy: contract.review_policy,
     operator_approval_required: contract.operator_approval_required,
@@ -619,6 +668,10 @@ export async function createAssignment({
     }
     if ((await getEntry(paths.directory)) !== null) {
       throw new ControlPlaneError(`Assignment already exists: ${assignmentId}`, "assignment-exists");
+    }
+    for (const dependencyId of contract.depends_on) {
+      const dependency = await readAssignment(state.repository, dependencyId, { environment, homeDirectory, platform });
+      if (dependency.repository_key !== state.key || dependencyId === assignmentId) throw new ControlPlaneError("Dependencies must already exist in the same repository.", "invalid-contract");
     }
     await mkdir(paths.events, { recursive: true });
     try {
@@ -768,6 +821,12 @@ export function reduceAssignment(record, inputAction, timestamp = new Date().toI
 
   if (action.op === "start_assignment") {
     requireState(record, ["queued"], action.op);
+    if ((record.depends_on ?? []).length) {
+      const evidence = payload.dependency_evidence;
+      if (!evidence || !Array.isArray(evidence.dependencies) || canonicalJson(evidence.dependencies.map((entry) => entry.assignment_id)) !== canonicalJson(record.depends_on)) throw new ControlPlaneError("This assignment cannot start without verified evidence for its dependencies.", "dependency-pending");
+      next.base_revision = requireGitRevision(evidence.base_revision, "dependency base_revision");
+      next.dependency_evidence = structuredClone(evidence);
+    }
     next.state = "running";
     next.workspace = payload.workspace ?? record.workspace;
     next.resource_lease_active = record.writer;
@@ -934,6 +993,7 @@ export function reduceAssignment(record, inputAction, timestamp = new Date().toI
       candidate_id: record.candidate.candidate_id,
       target_revision_before: requireGitRevision(payload.target_revision_before, "target_revision_before"),
       applied_diff_sha256: requireString(payload.applied_diff_sha256, "applied_diff_sha256"),
+      verification: payload.verification ?? null,
       integrated_at: timestamp,
     };
     next.state = record.delivery.mode === "manual" ? "integrated" : "commit_pending";
@@ -1068,6 +1128,7 @@ export function reduceAssignment(record, inputAction, timestamp = new Date().toI
       },
     ];
     next.attempt = record.attempt + 1;
+    if (record.dependency_evidence !== undefined) next.dependency_evidence = null;
     next.base_revision = payload.base_revision === undefined
       ? record.base_revision
       : requireGitRevision(payload.base_revision, "base_revision");
@@ -1186,6 +1247,18 @@ async function assertAssignmentEpoch(state, record, operation, options) {
   }
 }
 
+export async function preflightAssignmentAction(cwd, inputAction, options = {}) {
+  const assignmentId = validateAssignmentId(inputAction.assignment_id);
+  const state = await resolveAssignmentState(cwd, assignmentId, options);
+  return withStateMutex(state, async () => {
+    const record = await readAssignment(cwd, assignmentId, options);
+    if (record.repository_key !== state.key || resolve(record.repository) !== resolve(state.repository)) throw new ControlPlaneError("Assignment repository identity changed.", "repository-mismatch");
+    validateEffectRequest(record, inputAction);
+    await assertAssignmentEpoch(state, record, inputAction.op, options);
+    return record;
+  }, { operation: "preflight combined validation" });
+}
+
 export async function dispatchAssignmentAction(cwd, inputAction, options = {}) {
   const assignmentId = validateAssignmentId(inputAction.assignment_id);
   const state = await resolveAssignmentState(cwd, assignmentId, options);
@@ -1244,6 +1317,11 @@ export async function dispatchAssignmentAction(cwd, inputAction, options = {}) {
       const records = await listAssignments(state.repository, options);
       if (hasActiveOverlap(record, records, options.platform ?? process.platform)) {
         throw new ControlPlaneError("Assignment write roots overlap an active resource lease.", "resource-capacity");
+      }
+      if (records.some((other) => other.assignment_id !== record.assignment_id && other.state === "running" && runtimeResourcesOverlap(record, other))) throw new ControlPlaneError("A running assignment already uses one of the requested runtime resources.", "resource-capacity");
+      if ((record.depends_on ?? []).length) {
+        const current = await resolveAssignmentDependencies(record, options);
+        if (canonicalJson(current) !== canonicalJson(requestedAction.payload.dependency_evidence)) throw new ControlPlaneError("Dependency evidence or target revision changed before start.", "dependency-stale");
       }
     }
     if (record.last_action_id !== null) {
@@ -1422,12 +1500,21 @@ export function planResidualActions(records, platform = process.platform) {
       mechanical.push(reviewResidual);
     }
     if (record.state === "queued") {
+      try { dependencyEvidence(record, records); }
+      catch (error) {
+        attention.push({ kind: "dependency-pending", assignment_id: record.assignment_id, state: record.state, state_revision: record.state_revision, depends_on: record.depends_on, reason: error.message });
+        continue;
+      }
+      if ([...ordered.filter((other) => other.state === "running"), ...selected].some((other) => other.assignment_id !== record.assignment_id && runtimeResourcesOverlap(record, other))) {
+        attention.push({ kind: "runtime-resource-pending", assignment_id: record.assignment_id, state: record.state, state_revision: record.state_revision });
+        continue;
+      }
       const conflicts = [...active, ...selected].some(
         (candidate) => candidate.assignment_id !== record.assignment_id && recordsOverlap(record, candidate, platform),
       );
       if (!record.writer || !conflicts) {
         mechanical.push({ op: "start_assignment", assignment_id: record.assignment_id, state_revision: record.state_revision });
-        if (record.writer) {
+        if (record.writer || (record.runtime_resources ?? []).length > 0) {
           selected.push(record);
         }
       }
@@ -1470,6 +1557,9 @@ function publicAssignment(record) {
     writer: record.writer,
     base_revision: record.base_revision,
     allowed_write_roots: [...record.allowed_write_roots],
+    depends_on: record.depends_on ?? [],
+    dependency_evidence: record.dependency_evidence ?? null,
+    runtime_resources: record.runtime_resources ?? [],
     candidate_id: record.candidate?.candidate_id ?? null,
     candidate_revision: record.candidate?.candidate_revision ?? null,
     review_verdict: record.review?.verdict ?? null,

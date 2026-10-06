@@ -12,7 +12,9 @@ import {
   readAssignmentBriefing,
   canonicalJson,
   sha256,
+  resolveAssignmentDependencies,
 } from "./control-plane.mjs";
+import { withRuntimeResources, assertRuntimeProcessesQuiescent } from "./runtime-resources.mjs";
 import { getExecutorProfile, bindExecutorProfile } from "./executor-profiles.mjs";
 import { resolveConfiguredModel } from "./configured-models.mjs";
 import { validateResolvedRoute } from "./model-selection.mjs";
@@ -24,6 +26,7 @@ import {
   GitWorkspaceError,
   cleanupAssignmentWorktree,
   createAssignmentWorktree,
+  createReadSnapshotWorktree,
   createCandidate,
   createCandidateReviewWorktree,
   inspectGitRepository,
@@ -109,6 +112,8 @@ export function createContractBriefing(record, briefing) {
     `Base revision: ${record.base_revision}`,
     `Allowed write roots: ${roots}`,
     `Controller delivery policy: ${record.delivery.mode}`,
+    `Runtime resources: ${JSON.stringify(record.runtime_resources ?? [])}. Use the assigned values in the declared environment variables. Do not create databases or start containers automatically.`,
+    `Dependency evidence verified before this run: ${JSON.stringify(record.dependency_evidence ?? null)}.`,
     record.writer
       ? "Your cwd is an isolated worktree. Modify only the allowed roots. Do not stage, commit, change HEAD, create branches, or touch another checkout."
       : "Keep repository files unchanged.",
@@ -228,6 +233,8 @@ async function createNewRecord({ briefing, options, environment, coordinationOpt
         allowed_write_roots: options.writeRoots,
         forbidden_write_roots: options.forbiddenRoots,
         required_checks: options.requiredChecks,
+        runtime_resources: options.runtimeResources ?? [],
+        depends_on: options.dependsOn ?? [],
         artifacts: options.artifacts,
         review_policy: options.reviewPolicy,
         operator_approval_required: options.operatorApprovalRequired,
@@ -284,6 +291,7 @@ async function loadOrCreateRecord(input) {
 }
 
 async function prepareWorkspace(record, target, options) {
+  if (record.profile === "explore") return createReadSnapshotWorktree(record.repository, record.base_revision, options);
   if (record.workspace_strategy === "isolated-worktree") {
     return createAssignmentWorktree(record, options);
   }
@@ -398,9 +406,13 @@ export async function invokeDurableExecutor({
       exitCode: 0,
     };
   }
+  const dependencyEvidence = await resolveAssignmentDependencies(record, coordinationOptions);
+  return withRuntimeResources(record.runtime_resources, { ...coordinationOptions, environment, repository: record.repository }, async (runtime) => {
+  coordinationOptions = { ...coordinationOptions, runtimeContext: runtime, environment: runtime.environment };
+  environment = runtime.environment;
   let workspace;
   try {
-    workspace = await prepareWorkspace(record, target, coordinationOptions);
+    workspace = await prepareWorkspace(dependencyEvidence ? { ...record, base_revision: dependencyEvidence.base_revision } : record, target, coordinationOptions);
     record = (
       await dispatchAssignmentAction(
         record.repository,
@@ -408,15 +420,17 @@ export async function invokeDurableExecutor({
           op: "start_assignment",
           authority,
           record,
-          payload: { workspace },
+          payload: { workspace, ...(dependencyEvidence ? { dependency_evidence: dependencyEvidence } : {}) },
         }),
         coordinationOptions,
       )
     ).record;
   } catch (error) {
-    if (workspace?.path && record.writer) {
-      await cleanupAssignmentWorktree({ ...record, workspace }, coordinationOptions).catch(() => {});
+    if (workspace?.path && !workspace.shared) {
+      try { await cleanupAssignmentWorktree({ ...record, workspace }, coordinationOptions); }
+      catch (cleanupError) { error.cause ??= cleanupError; }
     }
+    if (dependencyEvidence) throw error;
     return publishSetupFailure(record, error, authority, coordinationOptions);
   }
   if (profile.sandboxMode === "workspace-write" && resolve(workspace.path) === resolve(record.repository)) {
@@ -442,6 +456,7 @@ export async function invokeDurableExecutor({
         resolvedRoute: record.model_route,
         cwd: workspace.path,
         coordinationCwd: record.repository,
+        readRevision: record.profile === "explore" ? record.base_revision : undefined,
         sandboxMode: profile.sandboxMode,
         timeoutSeconds: options.timeoutSeconds,
       },
@@ -482,9 +497,11 @@ export async function invokeDurableExecutor({
     if (!execution.finalization) throw error;
     return pendingExecutionResponse(finalizationFailure(execution, execution.finalization.lease, error, record.state_revision), record, options);
   }
+  });
 }
 
 async function continueExecutorResult({ record, workspace, execution, target = null, authority = "root", options = {}, coordinationOptions = {}, executorEnvironment = process.env, recovery = false }) {
+  if (coordinationOptions.runtimeContext) await assertRuntimeProcessesQuiescent(coordinationOptions.runtimeContext, coordinationOptions);
   if (record.model_route != null && execution.result.status === "completed") {
     const route = validateResolvedRoute(record.model_route, record.profile);
     if (execution.result.routing_verified !== true || execution.result.model !== route.model || execution.result.reasoning_effort !== route.reasoningEffort || execution.result.service_tier !== route.serviceTier) {
@@ -525,6 +542,7 @@ async function continueExecutorResult({ record, workspace, execution, target = n
       };
     }
   }
+  if (coordinationOptions.runtimeContext) await assertRuntimeProcessesQuiescent(coordinationOptions.runtimeContext, coordinationOptions);
   const operatorRequests = storedPublication?.action.payload.operator_requests ?? createOperatorRequests(record, execution.operatorRequests ?? []);
   const warnings = record.writer && workspace.excluded_dirty_paths?.length > 0
     ? [`Main checkout changes outside the assignment scope were excluded: ${workspace.excluded_dirty_paths.join(", ")}.`]
@@ -618,5 +636,5 @@ export async function resumeExecutorFinalization({ state, lease, receipt, expect
   if (record.workspace?.path !== binding.workspace_path) throw new ControlPlaneError("Assignment worktree changed after execution.", "finalization-workspace-changed");
   assertEpochEnvironment(record, environment);
   if (record.writer && await captureWorkspaceFingerprint(record, record.workspace.path, coordinationOptions) !== receipt.workspace_fingerprint) throw new ControlPlaneError("Worktree content or artifacts changed after the result was saved.", "finalization-workspace-changed");
-  return continueExecutorResult({ record, workspace: record.workspace, execution: { ...receipt.execution, finalization: { lease, receipt } }, coordinationOptions: { ...coordinationOptions, environment }, executorEnvironment: environment, recovery: true });
+  return withRuntimeResources(record.runtime_resources, { ...coordinationOptions, environment, repository: record.repository }, (runtime) => continueExecutorResult({ record, workspace: record.workspace, execution: { ...receipt.execution, finalization: { lease, receipt } }, coordinationOptions: { ...coordinationOptions, environment: runtime.environment, runtimeContext: runtime }, executorEnvironment: runtime.environment, recovery: true }));
 }

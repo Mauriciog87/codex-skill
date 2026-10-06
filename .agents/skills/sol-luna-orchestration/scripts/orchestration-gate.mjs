@@ -1,10 +1,12 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { inspectRuntimeResources, recoverRuntimeResources } from "./runtime-resources.mjs";
 import {
   ORCHESTRATION_GENERATION_ENV,
   ORCHESTRATION_LOCK_ENV,
   OrchestrationStateError,
   getOrchestrationStatus,
+  getRepositoryState,
   readOrchestrationHistory,
   readUltraLock,
   recoverUltraLock,
@@ -30,8 +32,8 @@ function requireValue(argv, index, option) {
 
 export function parseGateArguments(argv, baseDirectory = process.cwd()) {
   const command = argv[0];
-  if (!["status", "recover", "history", "hook", "finalize"].includes(command)) {
-    throw new GateInvocationError("Command must be status, recover, history, finalize, or hook.");
+  if (!["status", "recover", "recover-runtime", "history", "hook", "finalize"].includes(command)) {
+    throw new GateInvocationError("Command must be status, recover, recover-runtime, history, finalize, or hook.");
   }
   if (command === "hook") {
     if (argv.length !== 1) {
@@ -55,7 +57,7 @@ export function parseGateArguments(argv, baseDirectory = process.cwd()) {
   const seen = new Set();
   for (let index = 1; index < argv.length; index += 1) {
     const option = argv[index];
-    if (!["--cwd", "--lock-id", "--limit", "--confirm-legacy-recovery", "--run-id", "--expected-revision"].includes(option)) {
+    if (!["--cwd", "--lock-id", "--limit", "--confirm-legacy-recovery", "--run-id", "--expected-revision", "--reservation-id"].includes(option)) {
       throw new GateInvocationError(`Unknown option: ${option}`);
     }
     if (seen.has(option)) {
@@ -72,6 +74,9 @@ export function parseGateArguments(argv, baseDirectory = process.cwd()) {
       parsed.cwd = resolve(baseDirectory, value);
     } else if (option === "--lock-id") {
       parsed.lockId = value;
+    } else if (option === "--reservation-id") {
+      if (command !== "recover-runtime" || !/^[0-9a-f-]{36}$/.test(value)) throw new GateInvocationError("--reservation-id requires a recover-runtime reservation id.");
+      parsed.reservationId = value;
     } else if (option === "--run-id") {
       if (command !== "finalize" || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(value)) throw new GateInvocationError("--run-id requires a valid finalize run id.");
       parsed.runId = value;
@@ -89,6 +94,7 @@ export function parseGateArguments(argv, baseDirectory = process.cwd()) {
   if (parsed.cwd === null) {
     throw new GateInvocationError("--cwd is required.");
   }
+  if (command === "recover-runtime" && (!parsed.reservationId || [...seen].some((key) => !["--cwd", "--reservation-id"].includes(key)))) throw new GateInvocationError("recover-runtime requires --cwd and --reservation-id only.");
   if (command === "finalize" && (!parsed.runId || parsed.lockId !== null || seen.has("--limit") || parsed.confirmLegacyRecovery)) throw new GateInvocationError("finalize requires --run-id and accepts only --cwd and --expected-revision.");
   if (command === "status" && parsed.lockId !== null) {
     throw new GateInvocationError("status does not accept --lock-id.");
@@ -211,7 +217,9 @@ export async function main(argv = process.argv.slice(2)) {
       return 0;
     }
     const output = options.command === "status"
-      ? await getOrchestrationStatus(options.cwd)
+      ? { ...await getOrchestrationStatus(options.cwd), runtime_reservations: (await inspectRuntimeResources()).map(({ path, processes, ...entry }) => ({ ...entry, processes })) }
+      : options.command === "recover-runtime"
+        ? await recoverRuntimeReservation(options)
       : options.command === "history"
         ? await readOrchestrationHistory(options.cwd, { limit: options.limit })
         : options.command === "finalize"
@@ -226,8 +234,15 @@ export async function main(argv = process.argv.slice(2)) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`${JSON.stringify({ status: "failed", summary: message })}\n`);
-    return argv[0] === "finalize" || error instanceof GateInvocationError || error instanceof OrchestrationStateError ? 2 : 1;
+    return ["finalize", "recover-runtime"].includes(argv[0]) || error instanceof GateInvocationError || error instanceof OrchestrationStateError ? 2 : 1;
   }
+}
+
+export async function recoverRuntimeReservation(options, environment = process.env) {
+  const state = await getRepositoryState(options.cwd, { environment });
+  const lock = await readUltraLock(options.cwd, { environment });
+  if (lock !== null && (lock.state !== "active" || lock.version !== 2 || environment[ORCHESTRATION_LOCK_ENV] !== lock.lock_id || environment[ORCHESTRATION_GENERATION_ENV] !== String(lock.generation))) throw new OrchestrationStateError("Runtime recovery is blocked by the repository's Ultra takeover.");
+  return recoverRuntimeResources(options.reservationId, { environment, repository: state.repository, repositoryState: state });
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

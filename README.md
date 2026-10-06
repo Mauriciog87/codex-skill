@@ -13,7 +13,7 @@ The launchers talk to the [experimental Codex App Server](https://developers.ope
 | Role | Model | Effort | Tier | Sandbox | Workspace | Best use |
 |---|---|---|---|---|---|---|
 | Root | Advanced | high | Standard | Current session | Main checkout | Planning, delegation, integration, final validation |
-| `explore` | Luna | max | Fast | Read-only | Shared checkout | Repository discovery, documentation, contract tracing |
+| `explore` | Luna | max | Fast | Read-only | Committed revision worktree | Repository discovery, documentation, contract tracing |
 | `implement-lite` | Luna | max | Fast | Workspace write | Isolated worktree | Small, low-risk, tightly bounded edits |
 | `playwright` | Luna | max | Standard | Read-only repository | Shared checkout | Browser inspection and authorized test interaction |
 | `implement` | Advanced | medium | Standard | Workspace write | Isolated worktree | Changes that need stronger engineering judgment |
@@ -211,9 +211,47 @@ The residual planner starts disjoint write scopes in parallel and retains active
 
 ## Worktrees, candidates, and review
 
+`explore` reads a detached worktree at the assignment's committed `base_revision`. Changes to the main checkout do not affect that snapshot. The result includes `read_revision:<sha>` in `checks`, so you can see exactly which revision it read. Ask the root to inspect uncommitted changes; they are not part of the snapshot. Durable assignments keep their snapshots until acknowledgment and cleanup. Legacy read-only calls remove their temporary snapshots when they finish.
+
 Worktrees and sandboxing cover different risks, so both stay enabled. `workspace-write` limits the executor process. The detached worktree keeps Git changes away from the main checkout. Before publication, the controller verifies the actual changed paths, rejects executor commits or HEAD changes, checks symlink and submodule policy, runs declared commands without a shell, and copies only declared in-scope artifacts.
 
 After validation, the controller creates an immutable hidden candidate ref through Git plumbing. The executor never stages or commits. The candidate id binds the base revision, tree diff, contract, checks, and artifact manifest. Reusing an attempt with different content is rejected. A new writer assignment resolves its delivery policy once from the global configuration unless the launcher receives an explicit override.
+
+Before integration, the controller applies the candidate to the current committed target in a temporary worktree and reruns `required_checks`. Those results apply only to the candidate, target revision, check contract, and combined Git tree that were tested. If the target changes, the checks must run again. Commit and push also require evidence for the exact tree being delivered. Checks must leave the source unchanged; ignored build outputs are allowed. Unrelated staged and working changes are preserved and excluded from delivery.
+
+Put the relevant integration tests in `required_checks`, along with any setup they need in a clean checkout. An empty list leaves behavioral compatibility untested. Routing verification confirms which model ran; it does not establish that the code works.
+
+### Dependencies and runtime resources
+
+Add `--depends-on <assignment-id>` for each prerequisite, such as an API contract another task needs. Dependencies must already exist in the same repository. A resumed assignment keeps its original dependencies.
+
+The planner waits until each dependency has an acknowledged, verified result. Before the dependent task starts, the controller checks that the dependency's candidate paths match committed HEAD, records the result identities, and uses that HEAD as the task's base. If you integrated a dependency manually, commit its accepted changes first. Missing content, failed work, or evidence that changed before startup blocks the task; prerequisites are never skipped.
+
+Add `--resource-json <JSON-object>` for each resource the executor and its required checks need. Each argument takes one JSON object. The assignment contract stores them in `runtime_resources`:
+
+```json
+{
+  "runtime_resources": [
+    { "name": "api", "kind": "port", "mode": "exclusive", "key": "3081", "env": "APP_PORT" },
+    { "name": "cache", "kind": "cache", "mode": "isolated", "env": "BUILD_CACHE" },
+    { "name": "database", "kind": "database", "mode": "isolated", "env": "TEST_DATABASE" }
+  ]
+}
+```
+
+Exclusive reservations prevent cooperating runs from claiming the same `kind` and `key` across repositories that share Codex home. For ports, use an explicit number from 1 to 65535. You can also reserve identifiers for databases, caches, directories, and services. Keys must not contain connection strings or credentials.
+
+Isolated database resources get a unique name. Isolated cache and directory resources get private temporary directories. The declared environment variables are set only in child processes. Reservations do not create databases, start containers, bind OS ports, or isolate undeclared services. All existing sandbox restrictions still apply.
+
+The executor and its post-turn checks share one reservation. Checks on the combined tree and explicit result recovery use fresh resources, so they cannot depend on a cache or database left by an earlier phase. A conflicting reservation fails immediately. On normal completion, cleanup removes the run's directories and reservations only after registered child processes have stopped or their PIDs have been reused. If a process identity cannot be confirmed, cleanup is blocked. This check does not cover unregistered descendant processes.
+
+Gate `status` lists machine-wide `runtime_reservations`. After an interruption, inspect the reservation you want to recover, then use its exact id:
+
+```text
+node .agents/skills/sol-luna-orchestration/scripts/orchestration-gate.mjs recover-runtime --cwd <repository> --reservation-id <id>
+```
+
+Recovery checks that the reservation belongs to the repository and that every registered process has stopped or its PID has been reused. It never kills processes, releases Ultra, reruns a model, or creates databases or containers. Reservations do not expire automatically. Worktrees keep files separate, but Git metadata and the rest of the operating system are still shared.
 
 For commit delivery, the controller builds a temporary index from the current branch and applies only the validated candidate. It creates a candidate-bound commit, updates the checked-out branch with compare-and-swap semantics, and synchronizes only the candidate paths in the real index. Unrelated staged and unstaged work is preserved.
 

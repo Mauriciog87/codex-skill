@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { withRuntimeResources, registerRuntimeProcess } from "./runtime-resources.mjs";
 import { spawn } from "node:child_process";
 import {
   cp,
@@ -87,6 +88,7 @@ export function runProcess(executable, args, {
   spawnImplementation = spawn,
   dataOutput = false,
   maxOutputBytes = MAX_GIT_OUTPUT,
+  onProcessStarted,
 } = {}) {
   return new Promise((resolvePromise, rejectPromise) => {
     let child;
@@ -150,7 +152,11 @@ export function runProcess(executable, args, {
     child.once("error", (error) => {
       finish(() => rejectPromise(new GitWorkspaceError(`${executable} failed to start: ${error.message}`, "process-start-failed")));
     });
-    child.once("close", (code, signal) => {
+    let closed = false;
+    const registration = Promise.resolve().then(() => Number.isInteger(child.pid) ? onProcessStarted?.(child.pid) : undefined).catch((error) => { if (!closed) stop(error); });
+    child.once("close", async (code, signal) => {
+      closed = true;
+      await registration;
       finish(() => failure !== null ? rejectPromise(failure) : resolvePromise({
         exitCode: Number.isInteger(code) ? code : 1,
         signal: signal ?? null,
@@ -349,6 +355,13 @@ export async function createAssignmentWorktree(record, options = {}) {
   };
 }
 
+export async function createReadSnapshotWorktree(repository, revision, options = {}) {
+  const state = await getRepositoryState(repository, options);
+  await ensureWorktreesDirectory(state);
+  const path = join(state.worktreesDirectory, `read-${randomUUID()}`);
+  return { path: await createDetachedWorktree(repository, revision, path, options), base_revision: revision, detached: true, read_only: true, temporary: true, cleaned: false };
+}
+
 export async function createCandidateReviewWorktree(record, options = {}) {
   if (record.candidate === null) {
     throw new GitWorkspaceError("Candidate review requires a published candidate.", "candidate-not-found");
@@ -418,11 +431,14 @@ async function validateChangedPath(record, workspacePath, path, options = {}) {
 }
 
 export async function runRequiredChecks(record, workspacePath, options = {}) {
+  return withRuntimeResources(record.runtime_resources, { ...options, repository: record.repository }, async (runtime) => {
   const results = [];
   for (const check of record.required_checks) {
     const cwd = resolveContainedPath(workspacePath, check.cwd);
     const result = await runProcess(check.argv[0], check.argv.slice(1), {
       ...options,
+      environment: runtime.environment,
+      onProcessStarted: (pid) => registerRuntimeProcess(runtime, pid, options),
       cwd,
       timeoutMs: check.timeout_seconds * 1000,
     });
@@ -442,6 +458,7 @@ export async function runRequiredChecks(record, workspacePath, options = {}) {
     }
   }
   return results;
+  });
 }
 
 async function collectArtifactEntries(root, current = root, prefix = "") {
@@ -676,6 +693,8 @@ export async function createCandidate(record, workspacePath, {
       allowed_write_roots: record.allowed_write_roots,
       forbidden_write_roots: record.forbidden_write_roots,
       required_checks: record.required_checks,
+      ...(record.runtime_resources === undefined ? {} : { runtime_resources: record.runtime_resources }),
+      ...(record.depends_on === undefined ? {} : { depends_on: record.depends_on, dependency_evidence: record.dependency_evidence ?? null }),
       artifacts: record.artifacts,
       review_policy: record.review_policy,
       operator_approval_required: record.operator_approval_required,
@@ -751,6 +770,63 @@ async function assertCandidateWorkspace(record, repository, options, failureCode
   }
 }
 
+export async function prepareCandidateIntegration(record, targetCwd, options = {}) {
+  if (!record.candidate) throw new GitWorkspaceError("A candidate is required for combined validation.", "candidate-not-found");
+  const target = await inspectGitRepository(targetCwd, options);
+  if (resolve(target.repository) !== resolve(record.repository)) throw new GitWorkspaceError("Validation target belongs to another repository.", "repository-mismatch");
+  const revision = options.verificationRevision ?? target.head;
+  const patch = options.verificationRevision ? null : (await runGit(
+    ["diff", "--binary", "--full-index", record.base_revision, record.candidate.candidate_revision],
+    { ...options, cwd: target.repository },
+  )).stdout;
+  if (patch !== null && sha256(patch) !== record.candidate.diff_sha256) throw new GitWorkspaceError("The candidate diff does not match its recorded hash.", "candidate-integrity-failed");
+  const state = await getRepositoryState(record.repository, options);
+  await ensureWorktreesDirectory(state);
+  const workspace = join(state.worktreesDirectory, `validation-${randomUUID()}`);
+  await createDetachedWorktree(target.repository, revision, workspace, options);
+  try {
+    if (patch !== null) await runGit(["apply", "--binary", "-"], { ...options, cwd: workspace, input: patch });
+    await runGit(["add", "-A"], { ...options, cwd: workspace });
+    const tree = (await runGit(["write-tree"], { ...options, cwd: workspace })).stdoutText.trim();
+    const checks = await runRequiredChecks(record, workspace, options);
+    await runGit(["add", "-A"], { ...options, cwd: workspace });
+    const after = (await runGit(["write-tree"], { ...options, cwd: workspace })).stdoutText.trim();
+    if (after !== tree || (await inspectGitRepository(workspace, options)).head !== revision) {
+      throw new GitWorkspaceError("Checks changed the source or HEAD in the combined worktree; their results cannot be accepted.", "integration-check-mutated-source");
+    }
+    const evidence = {
+      candidate_id: record.candidate.candidate_id,
+      target_revision: revision,
+      combined_tree: tree,
+      checks_contract_sha256: sha256(canonicalJson({ required_checks: record.required_checks, runtime_resources: record.runtime_resources ?? [] })),
+      checks,
+    };
+    return { ...evidence, evidence_sha256: sha256(canonicalJson(evidence)) };
+  } finally {
+    await runGit(["worktree", "remove", "--force", workspace], { ...options, cwd: target.repository });
+  }
+}
+
+function assertIntegrationVerification(record, verification, revision) {
+  const { evidence_sha256, ...evidence } = verification ?? {};
+  if (evidence_sha256 !== sha256(canonicalJson(evidence)) ||
+      evidence.candidate_id !== record.candidate.candidate_id || evidence.target_revision !== revision ||
+      evidence.checks_contract_sha256 !== sha256(canonicalJson({ required_checks: record.required_checks, runtime_resources: record.runtime_resources ?? [] })) ||
+      !Array.isArray(evidence.checks) || evidence.checks.length !== record.required_checks.length ||
+      evidence.checks.some((check, index) => check.id !== record.required_checks[index].id || check.exit_code !== 0)) {
+    throw new GitWorkspaceError("Combined validation is missing, has changed, or does not match the target revision. Validate the current target again.", "integration-verification-stale");
+  }
+  return verification;
+}
+
+export async function prepareDeliveryVerification(record, targetCwd, options = {}) {
+  const existing = await runGit(["rev-parse", "--verify", deliveryPublicationRef(record)], { ...options, cwd: targetCwd, allowFailure: true });
+  if (existing.exitCode === 0) return prepareCandidateIntegration(record, targetCwd, { ...options, verificationRevision: existing.stdoutText.trim() });
+  const target = await inspectGitRepository(targetCwd, options);
+  const message = (await runGit(["show", "-s", "--format=%B", target.head], { ...options, cwd: targetCwd })).stdoutText.split(/\r?\n/);
+  return prepareCandidateIntegration(record, targetCwd, { ...options, ...(message.includes(`Codex-Assignment-ID: ${record.assignment_id}`) ? { verificationRevision: target.head } : {}) });
+}
+
 export async function integrateCandidate(record, targetCwd, options = {}) {
   if (record.candidate === null) {
     throw new GitWorkspaceError("Assignment does not have a candidate.", "candidate-not-found");
@@ -759,6 +835,9 @@ export async function integrateCandidate(record, targetCwd, options = {}) {
   if (resolve(target.repository) !== resolve(record.repository)) {
     throw new GitWorkspaceError("Integration target belongs to another repository.", "repository-mismatch");
   }
+  const verification = assertIntegrationVerification(record,
+    options.integrationVerification ?? await prepareCandidateIntegration(record, targetCwd, options), target.head);
+  if ((await inspectGitRepository(targetCwd, options)).head !== target.head) throw new GitWorkspaceError("The integration target revision changed during validation.", "integration-verification-stale");
   const patch = await runGit(
     ["diff", "--binary", "--full-index", record.base_revision, record.candidate.candidate_revision],
     { ...options, cwd: target.repository },
@@ -791,10 +870,12 @@ export async function integrateCandidate(record, targetCwd, options = {}) {
       if (error.code !== "candidate-workspace-mismatch") throw error;
     }
     if (alreadyApplied && alreadyStaged.exitCode === 0) {
+      if ((await inspectGitRepository(target.repository, options)).head !== target.head) throw new GitWorkspaceError("The integration target revision changed while reconciling the candidate.", "integration-verification-stale");
       return {
         candidate_id: record.candidate.candidate_id,
         target_revision_before: target.head,
         applied_diff_sha256: record.candidate.diff_sha256,
+        verification,
         idempotent: true,
       };
     }
@@ -835,10 +916,12 @@ export async function integrateCandidate(record, targetCwd, options = {}) {
     throw new GitWorkspaceError("Candidate integration unexpectedly staged changes.", "integration-staged");
   }
   await assertCandidateWorkspace(record, target.repository, options);
+  if ((await inspectGitRepository(target.repository, options)).head !== target.head) throw new GitWorkspaceError("The integration target revision changed while applying the candidate. Keep the applied files for inspection.", "integration-verification-stale");
   return {
     candidate_id: record.candidate.candidate_id,
     target_revision_before: target.head,
     applied_diff_sha256: patchDigest,
+    verification,
   };
 }
 
@@ -1017,6 +1100,7 @@ export async function commitIntegratedCandidate(record, targetCwd, options = {})
   if (existing.exitCode === 0) {
     const revision = existing.stdoutText.trim().toLowerCase();
     const evidence = await inspectPublicationCommit(record, revision, branchRef, options);
+    assertIntegrationVerification(record, options.integrationVerification ?? await prepareCandidateIntegration(record, targetCwd, { ...options, verificationRevision: revision }), revision);
     const branchRevision = (await runGit(["rev-parse", branchRef], {
       ...options,
       cwd: target.repository,
@@ -1046,6 +1130,7 @@ export async function commitIntegratedCandidate(record, targetCwd, options = {})
   const headMessage = (await runGit(["show", "-s", "--format=%B", target.head], { ...options, cwd: target.repository })).stdoutText.split(/\r?\n/);
   if (headMessage.includes(`Codex-Assignment-ID: ${record.assignment_id}`)) {
     const evidence = await inspectPublicationCommit(record, target.head, branchRef, options);
+    assertIntegrationVerification(record, options.integrationVerification ?? await prepareCandidateIntegration(record, targetCwd, { ...options, verificationRevision: target.head }), target.head);
     await assertDeliveryIndex(record, target.head, target.repository, options);
     await assertCandidateWorkspace(record, target.repository, options, "delivery-path-dirty");
     await publishDeliveryRefs(target.repository, [
@@ -1102,6 +1187,9 @@ export async function commitIntegratedCandidate(record, targetCwd, options = {})
       cwd: target.repository,
       environment,
     })).stdoutText.trim().toLowerCase();
+    const verification = assertIntegrationVerification(record,
+      options.integrationVerification ?? record.integration.verification ?? await prepareCandidateIntegration(record, targetCwd, options), target.head);
+    if (tree !== verification.combined_tree) throw new GitWorkspaceError("Delivery tree differs from the validated combined tree.", "delivery-tree-mismatch");
     const committedPaths = parseNullSeparatedPaths((await runGit(
       ["diff", "--name-only", "-z", target.head, tree],
       { ...options, cwd: target.repository },
@@ -1183,6 +1271,9 @@ export async function pushCommittedCandidate(record, targetCwd, options = {}) {
   const branchRef = await currentBranchRef(target.repository, options);
   await assertConfiguredPushDestination(record, target.repository, branchRef, options);
   const commitRevision = record.delivery.commit.commit_revision;
+  const verification = assertIntegrationVerification(record, options.integrationVerification ?? await prepareCandidateIntegration(record, targetCwd, { ...options, verificationRevision: commitRevision }), commitRevision);
+  const deliveryTree = (await runGit(["rev-parse", `${commitRevision}^{tree}`], { ...options, cwd: target.repository })).stdoutText.trim();
+  if (deliveryTree !== verification.combined_tree) throw new GitWorkspaceError("The tree being published does not match the validated combined tree.", "delivery-tree-mismatch");
   const localContains = await runGit(["merge-base", "--is-ancestor", commitRevision, target.head], {
     ...options,
     cwd: target.repository,

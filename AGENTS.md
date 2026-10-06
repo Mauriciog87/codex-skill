@@ -9,7 +9,7 @@ The root Codex session is the orchestrator. Invoke `$sol-luna-orchestration` at 
 | Role | Model | Effort | Tier | Sandbox | Workspace |
 |---|---|---|---|---|---|
 | Root and planner | Advanced | `high` | Standard | Current session | Main checkout |
-| `explore` | Luna | `max` | Fast | `read-only` | Shared checkout |
+| `explore` | Luna | `max` | Fast | `read-only` | Committed revision worktree |
 | `implement-lite` | Luna | `max` | Fast | Explicit `workspace-write` | Isolated worktree |
 | `playwright` | Luna | `max` | Standard | `read-only` for repository files | Shared checkout |
 | `implement` | Advanced | `medium` | Standard | Explicit `workspace-write` | Isolated worktree |
@@ -39,6 +39,16 @@ The briefing comes from stdin. The selected profile fixes the model, reasoning e
 Control plane v2 and result format v2 are the defaults. Every assignment binds the base revision, allowed and forbidden write roots, required checks, artifacts, review policy, operator approval policy, and an explicit `manual`, `commit`, or `push` delivery policy. Each state transition requires an action id, the exact state revision, and an authorized actor. Exact replays are idempotent. Stale revisions, changed replays, overlapping writer leases, and stale Ultra generations fail closed.
 
 Writer profiles run in detached worktrees created by the controller outside the repository. Executors never stage, commit, change HEAD, create branches, or push. The controller validates the actual Git changes and declared artifacts, runs required checks without a shell, and creates an immutable candidate ref.
+
+`explore` reads a detached snapshot of a committed revision and reports `read_revision:<sha>` in `checks`. The snapshot excludes uncommitted changes in the main checkout; the root must inspect those directly. Keep the snapshot until normal acknowledgment and cleanup.
+
+Add `--depends-on <assignment-id>` for each prerequisite. Before the dependent task starts, every prerequisite must have an acknowledged, verified result, and its candidate paths must match committed HEAD. The controller records that evidence and uses HEAD as the task's base. Never drop a pending dependency or edit durable state to bypass it.
+
+Declare each port or other shared resource with `--resource-json <JSON-object>`. Exclusive `(kind, key)` reservations apply across the PC within the same Codex home. Isolated database names and cache/directory paths are passed through the declared child environment variables. The controller does not create databases or start containers.
+
+Reservations cover the executor and its checks. Integration checks and recovered finalizations use fresh resources, so they must not depend on a previous phase's cache. Inspect `runtime_reservations` with `orchestration-gate.mjs status`. Use `recover-runtime --cwd <repository> --reservation-id <id>` only after every registered process has stopped or its PID has been reused. Unknown process identities block recovery. Never remove reservations manually.
+
+Before integration and delivery, run the assignment's required checks on the candidate combined with the committed target in a temporary worktree. Record the target revision and exact tree that passed. Reject stale results and checks that change the source. Define integration checks that test the affected behavior; an empty list and correct routing do not establish that the code works. Preserve unrelated staged and working changes.
 
 New writer assignments use automatic delivery by default. Set `automatic_delivery` to `false` in `$CODEX_HOME/sol-luna-orchestration/config.json` to disable it, or use an explicit `--delivery` override for one assignment. A user boundary against commits or pushes always requires the matching manual override.
 

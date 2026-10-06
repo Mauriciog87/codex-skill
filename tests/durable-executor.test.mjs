@@ -13,6 +13,7 @@ import {
   invokeDurableExecutor as invokeDurableExecutorImplementation,
 } from "../.agents/skills/sol-luna-orchestration/scripts/durable-executor.mjs";
 import { fixtureModelResolver } from "./fixtures/model-routes.mjs";
+import { inspectRuntimeResources, acquireRuntimeResources, registerRuntimeProcess } from "../.agents/skills/sol-luna-orchestration/scripts/runtime-resources.mjs";
 import { validateResolvedRoute } from "../.agents/skills/sol-luna-orchestration/scripts/model-selection.mjs";
 const invokeDurableExecutor = (input) => invokeDurableExecutorImplementation({ modelResolver: fixtureModelResolver, ...input });
 
@@ -321,6 +322,61 @@ test("durable writer executes inside sandbox worktree and publishes an immutable
     await cleanupAssignmentWorktree(record, fixture.coordinationOptions);
   } finally {
     await runGit(["worktree", "prune"], { cwd: fixture.repository, allowFailure: true });
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("runtime resources span executor and required checks, then release without changing the caller environment", async () => {
+  const fixture = await createFixture();
+  let record;
+  let cache;
+  const resources = [{ name: "cache", kind: "cache", mode: "isolated", env: "ASSIGNMENT_CACHE" }, { name: "api", kind: "port", mode: "exclusive", key: "3081", env: "APP_PORT" }];
+  try {
+    const response = await invokeDurableExecutor({
+      briefing: "Use an isolated cache without starting a service.",
+      options: { ...options(fixture.repository), runtimeResources: resources, requiredChecks: [{ id: "cache", argv: [process.execPath, "-e", "const fs=require('fs');if(fs.readFileSync(require('path').join(process.env.ASSIGNMENT_CACHE,'evidence'),'utf8')!=='model' || process.env.APP_PORT!=='3081')process.exit(1)"], cwd: ".", timeout_seconds: 30 }] },
+      environment: fixture.environment, coordinationOptions: fixture.coordinationOptions,
+      invokeLegacy: async (input) => {
+        cache = input.environment.ASSIGNMENT_CACHE;
+        assert.ok(cache);
+        assert.equal(input.environment.APP_PORT, "3081");
+        await writeFile(join(cache, "evidence"), "model");
+        await assert.rejects(acquireRuntimeResources(resources, fixture.coordinationOptions), /reserved/);
+        await writeFile(join(input.options.cwd, "src", "value.txt"), "candidate\n");
+        return execution("implement", ["src/value.txt"]);
+      },
+    });
+    assert.equal(response.exitCode, 0);
+    record = await readAssignment(fixture.repository, response.result.assignment_id, fixture.coordinationOptions);
+    assert.equal(record.runtime_resources.length, 2);
+    assert.deepEqual(await inspectRuntimeResources(fixture.coordinationOptions), []);
+    assert.equal(fixture.environment.ASSIGNMENT_CACHE, undefined);
+    await assert.rejects(readFile(join(cache, "evidence")), /ENOENT/);
+  } finally {
+    if (record?.workspace) await cleanupAssignmentWorktree(record, fixture.coordinationOptions);
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("unknown runtime children block candidate creation and result publication", async () => {
+  const fixture = await createFixture();
+  let assignmentId;
+  let record;
+  try {
+    await assert.rejects(invokeDurableExecutor({ briefing: "Keep an uncertain child as evidence.", options: { ...options(fixture.repository), runtimeResources: [{ name: "db", kind: "database", mode: "exclusive", key: "test-db" }] }, environment: fixture.environment, coordinationOptions: { ...fixture.coordinationOptions, processInspector: async (identities) => identities.map(() => ({ status: "unknown" })) }, invokeLegacy: async (input) => {
+      assignmentId = input.environment.CODEX_ORCHESTRATION_ASSIGNMENT_ID;
+      const runtime = input.coordinationOptions.runtimeContext;
+      await registerRuntimeProcess(runtime, process.pid, { processIdentityProvider: async () => runtime.processes[0] });
+      await writeFile(join(input.options.cwd, "src", "value.txt"), "candidate\n");
+      return execution("implement", ["src/value.txt"]);
+    } }), /unknown identity/);
+    record = await readAssignment(fixture.repository, assignmentId, fixture.coordinationOptions);
+    assert.equal(record.state, "running");
+    assert.equal(record.result, null);
+    assert.equal(record.candidate, null);
+    assert.equal((await runGit(["for-each-ref", "refs/codex-orchestration/candidates"], { cwd: fixture.repository })).stdoutText.trim(), "");
+  } finally {
+    if (record?.workspace) await cleanupAssignmentWorktree(record, fixture.coordinationOptions);
     await rm(fixture.root, { recursive: true, force: true });
   }
 });

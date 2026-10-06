@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { access, mkdtemp as createTemporaryDirectory, mkdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp as createTemporaryDirectory, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { runGit } from "../.agents/skills/sol-luna-orchestration/scripts/git-workspace.mjs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -74,6 +74,7 @@ test("executors use configured Sol and current Luna routes in process, instructi
 async function mkdtemp(prefix) {
   const directory = await createTemporaryDirectory(prefix);
   await runGit(["init"], { cwd: directory });
+  await runGit(["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "--allow-empty", "-m", "initial"], { cwd: directory });
   return directory;
 }
 
@@ -179,6 +180,8 @@ test("parseArguments requires a profile and applies safe defaults", () => {
     writeRoots: [],
     forbiddenRoots: [],
     requiredChecks: [],
+    runtimeResources: [],
+    dependsOn: [],
     artifacts: [],
     reviewPolicy: "root",
     operatorApprovalRequired: false,
@@ -224,6 +227,8 @@ test("parseArguments accepts supported profile-specific options", () => {
       writeRoots: ["src"],
       forbiddenRoots: [],
       requiredChecks: [],
+      runtimeResources: [],
+      dependsOn: [],
       artifacts: [],
       reviewPolicy: "root",
       operatorApprovalRequired: false,
@@ -259,6 +264,21 @@ test("parseArguments accepts explicit automatic push delivery", () => {
   assert.equal(parsed.commitMessage, "feat: publish validated candidate");
   assert.equal(parsed.pushRemote, "origin");
   assert.equal(parsed.pushBranch, "master");
+});
+
+test("runtime and dependency CLI contracts are explicit and cannot replace resumed contracts", () => {
+  const id = "00000000-0000-4000-8000-000000000000";
+  const resource = JSON.stringify({ name: "api", kind: "port", mode: "exclusive", key: "3081", env: "APP_PORT" });
+  const parsed = parseArguments(["--profile", "explore", "--depends-on", id, "--resource-json", resource]);
+  assert.deepEqual(parsed.dependsOn, [id]);
+  assert.equal(parsed.runtimeResources[0].key, "3081");
+  for (const args of [
+    ["--profile", "explore", "--depends-on", id, "--depends-on", id],
+    ["--profile", "explore", "--depends-on", "not-an-id"],
+    ["--profile", "explore", "--resource-json", "{"],
+    ["--profile", "explore", "--resource-json", resource, "--control-plane", "v1"],
+    ["--profile", "explore", "--depends-on", id, "--assignment-id", id],
+  ]) assert.throws(() => parseArguments(args));
 });
 
 test("parseArguments rejects unsafe, ambiguous, and mismatched invocations", () => {
@@ -560,6 +580,30 @@ test("invokeExecutor returns verified profile metadata and status exit codes", a
     assert.equal(execution.result.routing_verified, true);
     assert.deepEqual(execution.result.changed_files, changedFiles);
   }
+});
+
+test("explore reports its exact committed snapshot while concurrent checkout edits remain separate", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "explore-snapshot-test-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, "contract.txt"), "committed");
+  await runGit(["add", "contract.txt"], { cwd: root });
+  await runGit(["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "contract"], { cwd: root });
+  const revision = (await runGit(["rev-parse", "HEAD"], { cwd: root })).stdoutText.trim();
+  const sessionsRoot = join(root, "sessions");
+  await writeRoutingMetadata(sessionsRoot, "snapshot", "max", "gpt-5.6-luna");
+  const runner = createAppServerRunner("snapshot", { status: "completed", summary: "Read the contract.", changed_files: [], checks: [], blockers: [], warnings: [] });
+  let snapshot;
+  const response = await invokeExecutor({ briefing: "Read the contract.", options: profileOptions(root, "explore"), sessionRoots: [sessionsRoot], coordinationOptions: { homeDirectory: root }, appServerRunner: async (input) => {
+    snapshot = input.cwd;
+    assert.notEqual(snapshot, root);
+    await writeFile(join(root, "contract.txt"), "concurrent change");
+    assert.equal(await readFile(join(snapshot, "contract.txt"), "utf8"), "committed");
+    return runner(input);
+  } });
+  assert.equal(response.exitCode, 0);
+  assert.ok(response.result.checks.includes(`read_revision:${revision}`));
+  assert.equal(await readFile(join(root, "contract.txt"), "utf8"), "concurrent change");
+  await assert.rejects(access(snapshot), /ENOENT/);
 });
 
 test("review verdicts enforce status, blockers, and exit codes", async (context) => {

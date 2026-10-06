@@ -43,6 +43,35 @@
         "low"
       ]
     },
+    "depends_on": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$" }
+    },
+    "runtime_resources": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "kind", "mode"],
+        "properties": {
+          "name": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,47}$" },
+          "kind": { "enum": ["port", "database", "cache", "directory", "service"] },
+          "mode": { "enum": ["exclusive", "isolated"] },
+          "key": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$" },
+          "env": { "type": ["string", "null"], "pattern": "^[A-Z][A-Z0-9_]{0,63}$" }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "mode": { "const": "isolated" } } },
+            "then": { "required": ["env"], "properties": { "kind": { "enum": ["database", "cache", "directory"] }, "key": { "type": "null" }, "env": { "type": "string" } } },
+            "else": { "required": ["key"], "properties": { "key": { "type": "string" } } }
+          }
+        ]
+      }
+    },
     "allowed_write_roots": {
       "type": "array",
       "items": {
