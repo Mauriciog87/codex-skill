@@ -487,7 +487,9 @@ class JsonRpcConnection {
     }
     const deferred = createDeferred();
     this.notificationWaiters.push({ method, predicate, deferred });
-    return this.guard(deferred.promise);
+    const notification = this.guard(deferred.promise);
+    notification.catch(() => {});
+    return notification;
   }
 
   async guard(promise) {

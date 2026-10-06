@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -7,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   AppServerIdleTimeoutError,
+  AppServerInterruptedError,
   AppServerProtocolError,
   AppServerRoutingError,
   AppServerTimeoutError,
@@ -72,8 +74,9 @@ function runMock(scenario = {}, overrides = {}) {
     developerInstructions: "Act as a bounded executor.",
     briefing: "Complete the bounded test task.",
     outputSchema: OUTPUT_SCHEMA,
-    timeoutMs: overrides.timeoutMs ?? (overrides.playwrightOutputDirectory ? 5_000 : 2_000),
+    timeoutMs: overrides.timeoutMs ?? 15_000,
     idleTimeoutMs: overrides.idleTimeoutMs ?? null,
+    signal: overrides.signal,
     platform: overrides.platform ?? process.platform,
     architecture: overrides.architecture ?? process.arch,
     commandResolver: overrides.commandResolver
@@ -531,6 +534,56 @@ test("global timeout force-terminates an unresponsive App Server", async () => {
   );
   assert.ok(Date.now() - startedAt < 3_000);
 });
+
+for (const method of ["thread/settings/update", "turn/start"]) {
+  for (const [failureMode, ErrorType] of [
+    ["timeout", AppServerTimeoutError],
+    ["interruption", AppServerInterruptedError],
+  ]) {
+    test(`${failureMode} while awaiting ${method} handles notification rejection and closes the child`, { timeout: 30_000 }, async (context) => {
+      context.mock.timers.enable({ apis: ["setTimeout"] });
+      const controller = new AbortController();
+      let child;
+      let requestReached;
+      const pendingRequest = new Promise((resolvePromise) => { requestReached = resolvePromise; });
+      context.after(async () => {
+        if (child?.pid && child.exitCode === null && child.signalCode === null) {
+          const closed = once(child, "close");
+          child.kill("SIGKILL");
+          await closed;
+        }
+      });
+      const rejected = assert.rejects(runMock({}, {
+        timeoutMs: 60_000,
+        signal: controller.signal,
+        spawnImplementation: (command, args, options) => {
+          child = spawnMock({})(command, args, options);
+          const write = child.stdin.write.bind(child.stdin);
+          context.mock.method(child.stdin, "write", (chunk, ...rest) => {
+            if (JSON.parse(chunk.toString()).method === method) {
+              requestReached();
+              return true;
+            }
+            return write(chunk, ...rest);
+          });
+          return child;
+        },
+      }), (error) => {
+        assert.ok(error instanceof ErrorType);
+        assert.equal(error.threadId, "mock-thread");
+        assert.equal(error.settingsRoutingVerified, method === "turn/start");
+        assert.equal(error.actualModel, method === "turn/start" ? "gpt-6-astra" : null);
+        return true;
+      });
+      await pendingRequest;
+      if (failureMode === "timeout") context.mock.timers.tick(60_000);
+      else controller.abort();
+      await rejected;
+      assert.notEqual(child.exitCode ?? child.signalCode, null);
+      assert.equal(child.stdin.destroyed, true);
+    });
+  }
+}
 
 test("idle timeout stops a silent active turn and keeps the last progress details", async () => {
   const startedAt = Date.now();
